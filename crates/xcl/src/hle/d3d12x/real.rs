@@ -5078,6 +5078,15 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     // a console MS in the AS slot with no MS subobject: moved, and translated when first
     // bound (below), not on the title's thread for each of tens of thousands
     let moved = ms_slot.is_none();
+    // LOCAL: `XCL_LOCAL_REFUSE_AS_MS=1` refuses these as main does (the A/B of #541 in one build)
+    if moved && std::env::var_os("XCL_LOCAL_REFUSE_AS_MS").is_some() {
+        if let Some(a) = as_slot {
+            if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
+                note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
+                return Some(E_INVALIDARG);
+            }
+        }
+    }
     let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
     let Some(ms) = ms else { return None };
     if !is_console(ms) {

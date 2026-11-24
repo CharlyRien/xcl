@@ -1069,6 +1069,14 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let n = u32::from_le_bytes(pc[4..8].try_into().unwrap()) as usize;
     let args = u64::from_le_bytes(pc[8..16].try_into().unwrap()) as *const [u32; 4];
     let mut list: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
+    // LOCAL: the console's argument types of each signature (first 32), to tell which a title uses
+    {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let types: Vec<u32> = list.iter().map(|a| a[0]).collect();
+            crate::xlog_info!("D3D12.X: CreateCommandSignature stride {} console argument types {types:?} root {root:#x}", u32::from_le_bytes(pc[0..4].try_into().unwrap()));
+        }
+    }
     for a in list.iter_mut() {
         a[0] = pc_argument_type(a[0]);
     }

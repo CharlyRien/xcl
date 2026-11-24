@@ -48,6 +48,21 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // LOCAL: mesh draws in these 2 s (`bind::LOCAL_MESH`)
+                {
+                    use std::sync::atomic::Ordering;
+                    static LAST: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+                    let m: Vec<u64> = crate::hle::d3d12x::bind::LOCAL_MESH.iter().zip(LAST.iter()).map(|(a, l)| {
+                        let v = a.load(Ordering::Relaxed);
+                        v - l.swap(v, Ordering::Relaxed)
+                    }).collect();
+                    if m.iter().any(|&v| v != 0) {
+                        crate::xlog_info!(
+                            "mesh (2 s): two-pass DispatchMesh {} ({} skipped), two-pass ExecuteIndirect(DispatchMesh) {} ({} skipped, {} commands), DispatchMesh-signature EI without a two-pass pipeline {}, two-pass pipeline with another signature {}, DispatchMesh without a two-pass pipeline {}; two-pass pipelines {}",
+                            m[0], m[1], m[2], m[3], m[7], m[4], m[5], m[6], crate::hle::d3d12x::real::two_pass_count()
+                        );
+                    }
+                }
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};

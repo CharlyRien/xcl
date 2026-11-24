@@ -95,6 +95,17 @@ const DRAWS_PC: usize = 2;
 const DISPATCHES: usize = 3;
 const DISPATCHES_SKIPPED: usize = 4;
 
+/// LOCAL: mesh draws (`XCL_ACTIVITY`'s "mesh (2 s)" line): two-pass DispatchMesh run / skipped,
+/// two-pass ExecuteIndirect(DispatchMesh) run / skipped, ExecuteIndirect with a DispatchMesh
+/// signature whose pipeline is not a two-pass one (not built yet, refused, stand-in), a
+/// two-pass pipeline with a signature that is not a DispatchMesh one, DispatchMesh without a
+/// two-pass pipeline, and the indirect commands (max) of the run two-pass ExecuteIndirects
+pub static LOCAL_MESH: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn local_mesh(k: usize, n: u64) {
+    LOCAL_MESH[k].fetch_add(n, Ordering::Relaxed);
+}
+
 fn count(k: usize) {
     let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() && n >= 64 {
@@ -448,10 +459,16 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
 /// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
 /// argument table at `table_at`, and the high dword of unified memory's base, as the other binds
 /// write it (the translated pair picks each access's memory window from it).
+/// LOCAL: with the heaps' addresses after the arguments (#1803's `with_heaps`) when the layout
+/// says its shaders index the heaps themselves (veyn-sudo's measurement on #724).
 fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize) -> Vec<u32> {
+    two_pass_io_heaps(layout, args, table_at, compute_pass, uma_base, [0; 2])
+}
+
+fn two_pass_io_heaps(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> Vec<u32> {
     let mut io = match layout {
-        Some(l) if compute_pass => console_list::user_data_ms(l, args, table_at),
-        Some(l) => console_list::user_data_gfx(l, args, table_at),
+        Some(l) if compute_pass => console_list::with_heaps(l, None, console_list::user_data_ms(l, args, table_at), heaps),
+        Some(l) => console_list::with_heaps(l, None, console_list::user_data_gfx(l, args, table_at), heaps),
         None if compute_pass => {
             let mut v = vec![0u32; 16];
             v[8] = table_at as u32;
@@ -476,7 +493,7 @@ unsafe fn bind_two_pass_stage(
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -487,7 +504,8 @@ unsafe fn bind_two_pass_stage(
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)
         .min(args.len());
     let table_at = copy(&args[inline..])?;
-    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base());
+    let heaps = if std::env::var_os("XCL_LOCAL_TWO_PASS_NO_HEAPS").is_some() { [0; 2] } else { heaps };
+    let io = two_pass_io_heaps(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
@@ -682,6 +700,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         match run {
             Ok(()) => {
                 count(DRAWS);
+                local_mesh(0, 1);
                 static LOGGED: AtomicU64 = AtomicU64::new(0);
                 let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
@@ -690,6 +709,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             }
             Err(e) => {
                 count(DRAWS_SKIPPED);
+                local_mesh(1, 1);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
                     crate::xlog_warn!("D3D12.X: two-pass DispatchMesh skipped: {e}");
@@ -698,6 +718,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         }
         return;
     }
+    local_mesh(6, 1);
     if super::pso_async::is_pending(raw_pso) {
         count(DRAWS_SKIPPED);
         return;
@@ -763,6 +784,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             match run {
                 Ok(()) => {
                     count(DRAWS);
+                    local_mesh(2, 1);
+                    local_mesh(7, max as u64);
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
                     let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 8 || n.is_power_of_two() {
@@ -771,6 +794,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 Err(e) => {
                     count(DRAWS_SKIPPED);
+                    local_mesh(3, 1);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {e}");
@@ -779,6 +803,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         }
+        local_mesh(5, 1);
+    } else if dispatch_mesh_sig_of(sig).is_some() {
+        local_mesh(4, 1);
     }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     if !gfx && !compute {
