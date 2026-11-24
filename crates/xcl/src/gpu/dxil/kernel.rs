@@ -396,7 +396,8 @@ impl Lw {
         let mut s = Shader::new(stage, (6, 6));
         let io = s.raw_uav(0, 0);
         let res = if kernel || ms.is_some() || matches!(entry, Entry::Geometry(_)) { Some(s.raw_uav(1, 0)) } else { None };
-        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
+        let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
+        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, coherent);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
