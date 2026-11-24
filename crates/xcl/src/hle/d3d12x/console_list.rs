@@ -978,6 +978,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         }
     }
     drop(guard);
+    // LOCAL
+    for _ in 0..out.dispatches {
+        super::rtsum::count(super::rtsum::CONSOLE_DISPATCH);
+    }
+    for _ in 0..out.skipped_dispatches {
+        super::rtsum::count(super::rtsum::CONSOLE_DISPATCH_SKIPPED);
+    }
     if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
         crate::xlog_info!(
             "console list: {} dispatches, {} skipped (PSO without a translation), {} barriers, {} clears, {} copies, {} skipped records",

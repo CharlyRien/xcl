@@ -125,7 +125,9 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
+    let due = super::rtsum::on() && frame_dump_due(); // LOCAL
     present_now(Duration::ZERO, Some((queue as usize, res)));
+    super::rtsum::on_present(queue, res, due); // LOCAL
 }
 
 thread_local! {

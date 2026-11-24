@@ -951,7 +951,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 real::note_title_address(*ppv as usize, va as usize);
                 return hr;
             }
-            Err(e) if once(&M, 4) => {
+            Err(e) if { super::rtsum::count(super::rtsum::TEXTURE_NOT_KEPT); once(&M, 4) } => {
                 let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
                 crate::xlog_warn!(
                     "D3D12.X: CreatePlacedResourceX texture at {va:#x} (dimension {} {}x{}x{}, {} mips, format {}, {} samples, layout {:#x}, flags {:#x}): not kept in step with the memory ({e})",
@@ -1093,6 +1093,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     }
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_signature(*ppv as usize, list.last().map(|a| a[0]));
+        super::rtsum::note_signature(*ppv as usize, list.last().map(|a| a[0])); // LOCAL
         if needs_root {
             super::bind::note_root_changing_signature(*ppv as usize);
         } else if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {

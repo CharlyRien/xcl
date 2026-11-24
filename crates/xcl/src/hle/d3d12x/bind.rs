@@ -701,6 +701,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             Ok(()) => {
                 count(DRAWS);
                 local_mesh(0, 1);
+                super::rtsum::draw(this, super::rtsum::DRAW_TR); // LOCAL
                 static LOGGED: AtomicU64 = AtomicU64::new(0);
                 let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
@@ -785,6 +786,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 Ok(()) => {
                     count(DRAWS);
                     local_mesh(2, 1);
+                    super::rtsum::indirect(this, sig, "two-pass mesh"); // LOCAL
                     local_mesh(7, max as u64);
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
                     let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -795,6 +797,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 Err(e) => {
                     count(DRAWS_SKIPPED);
                     local_mesh(3, 1);
+                    super::rtsum::indirect(this, sig, "two-pass mesh skipped"); // LOCAL
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {e}");
@@ -806,6 +809,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         local_mesh(5, 1);
     } else if dispatch_mesh_sig_of(sig).is_some() {
         local_mesh(4, 1);
+        if super::real::two_pass_of(pso).is_none() && pso != 0 && !super::pso_async::is_pending(raw_pso) && !super::real::is_translated_graphics(pso) {
+            // LOCAL: a DispatchMesh signature with a pipeline that is neither two-pass nor pending
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: (LOCAL) ExecuteIndirect(DispatchMesh) with pipeline {pso:#x} that is not a two-pass one – PC call");
+            }
+        }
     }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     if !gfx && !compute {
@@ -816,6 +826,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(with(this, |s| s.pso)) {
             count(DRAWS_SKIPPED);
+            super::rtsum::indirect(this, sig, "skipped (pending)"); // LOCAL
             super::culprit::skipped(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -836,6 +847,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             return;
         }
         // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
+        super::rtsum::indirect(this, sig, if with(this, |s| s.pso) == 0 { "PC call, no pipeline" } else { "PC/stand-in pipeline" }); // LOCAL
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
@@ -845,6 +857,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return super::culprit::end(this, mark);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        super::rtsum::indirect(this, sig, "skipped (root-changing)"); // LOCAL
         super::culprit::skipped(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -856,6 +869,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
+            super::rtsum::indirect(this, sig, if gfx { "translated gfx" } else { "translated compute" }); // LOCAL
             // its draws or groups are in the argument buffer (`max` records)
             let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
@@ -863,6 +877,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            super::rtsum::indirect(this, sig, "skipped (bind failed)"); // LOCAL
             super::culprit::skipped(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1058,6 +1073,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
     if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
         count(DRAWS_PC);
+        super::rtsum::draw(this, super::rtsum::DRAW_PC); // LOCAL
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
             static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -1088,10 +1104,12 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
             count(DRAWS);
+            super::rtsum::draw(this, super::rtsum::DRAW_TR); // LOCAL
             Some(list)
         }
         Err(e) => {
             count(DRAWS_SKIPPED);
+            super::rtsum::draw(this, super::rtsum::DRAW_SKIP); // LOCAL
             let (_, n, instances, _, _) = DRAW_ARGS.with(|d| d.get());
             super::culprit::skipped(this, || super::culprit::draw_op("draw", this, n, instances));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1373,13 +1391,18 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
+        super::rtsum::count(super::rtsum::DISPATCH_SKIPPED); // LOCAL
         super::culprit::skipped(this, || super::culprit::compute_op("Dispatch", with(this, |s| s.pso), pso, [x, y, z]));
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            super::rtsum::count(super::rtsum::DISPATCH_TR); // LOCAL
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
+            super::rtsum::count(super::rtsum::DISPATCH_SKIPPED); // LOCAL
             super::culprit::skipped(this, || super::culprit::compute_op("Dispatch", with(this, |s| s.pso), pso, [x, y, z]));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {

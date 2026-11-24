@@ -1909,6 +1909,7 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
 }
 
 fn note_buffer_view() {
+    super::rtsum::count(super::rtsum::NON_UMA_BUFFER_VIEW); // LOCAL
     if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)");
     }
@@ -2050,7 +2051,8 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
-    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::rtsum::note_dsv(cpu as usize, res); // LOCAL
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2344,6 +2346,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
             }
+            super::rtsum::count(super::rtsum::NULL_DEPTH_UAV); // LOCAL
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
             f(this, res, counter, desc, at)
@@ -3516,6 +3519,7 @@ fn note_translation_error(e: String) {
     // so later refusals (each mesh pipeline with its MS in the AS slot has its own) stay visible
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let cap = *CAP.get_or_init(|| std::env::var("XCL_LOCAL_TRANSLATE_ERRORS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100_000));
+    super::rtsum::count(super::rtsum::TRANSLATION_REFUSED); // LOCAL
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
     if g.len() < cap && !g.contains(&e) {
         crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
@@ -5599,6 +5603,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    super::rtsum::clear_rtv(rtv); // LOCAL
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -5637,6 +5642,7 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
+    super::rtsum::bind(this, n, rtvs, single, dsv); // LOCAL
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {

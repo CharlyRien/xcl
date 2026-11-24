@@ -28,6 +28,8 @@ pub mod layout;
 pub mod list_x;
 /// LOCAL diagnostic: `XCL_LOCAL_QJOURNAL`
 pub mod qjournal;
+/// LOCAL diagnostic: `XCL_LOCAL_RTSUM`
+pub mod rtsum;
 pub mod null;
 pub mod present;
 pub mod pso_async;

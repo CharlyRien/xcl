@@ -131,6 +131,7 @@ unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: u
 }
 
 fn warn(counter: &AtomicU64, what: &str, why: std::fmt::Arguments) {
+    super::rtsum::not_done(what); // LOCAL
     if once(counter, 4) {
         crate::xlog_warn!("D3D12.X: {what}: {why} – not done");
     }
@@ -4005,6 +4006,7 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
+    super::rtsum::clear_dsv(dsv); // LOCAL
     let mark = super::culprit::begin(this, || super::culprit::bulk_op("ClearDepthStencilView", dsv, 0, 0));
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects);
     super::culprit::end(this, mark);
