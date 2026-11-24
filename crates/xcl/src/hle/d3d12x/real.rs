@@ -597,6 +597,10 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        // (before `adopt`: the fence is XCL's, not one of the title's)
+        if let Err(e) = watch_removal(&device, stop_if_device_removed) {
+            crate::xlog_warn!("D3D12: no watch for a device removal ({e}) – it is seen at the next submission or present");
+        }
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -2589,6 +2593,10 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::Fence => v.push(("Signal", fence_signal as usize)),
         _ => {}
     }
+    // `XCL_GPU_CULPRIT`: UAV clears marked too (the title's #53 / #54 reach them)
+    if kind == Kind::CommandList && super::culprit::enabled() {
+        v.extend_from_slice(&[("ClearUnorderedAccessViewUint", cl_clear_uav_uint as usize), ("ClearUnorderedAccessViewFloat", cl_clear_uav_float as usize)]);
+    }
     v
 }
 
@@ -3921,6 +3929,20 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
+    // LOCAL DIAGNOSTIC, not for upstream (the idea is from a comment on #1269): with
+    // XCL_LOCAL_SKIP_CS_KB=n, a compute program of n KB of DXIL or more that has no driver blob
+    // yet is not handed to the driver (minutes and tens of GB of commit on NVIDIA for the
+    // giants): the title gets the fallback pipeline and its dispatches are skipped.
+    {
+        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        static SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let limit = *LIMIT.get_or_init(|| std::env::var("XCL_LOCAL_SKIP_CS_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |kb| kb << 10));
+        if cached.is_none() && dxil.len() >= limit {
+            let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            crate::xlog_info!("local: compute program of {} B of DXIL not built (XCL_LOCAL_SKIP_CS_KB), {n} so far", dxil.len());
+            return Some(Err(()));
+        }
+    }
     // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
     let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
@@ -4600,7 +4622,11 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    graphics_pso(this, desc, riid, ppv, false)
+    let hr = graphics_pso(this, desc, riid, ppv, false);
+    if hr >= 0 && !ppv.is_null() {
+        super::culprit::note_graphics(*ppv as usize, desc);
+    }
+    hr
 }
 
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
@@ -5285,7 +5311,13 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
+        StreamPipeline::Graphics(d) => {
+            let hr = graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true);
+            if hr >= 0 && !ppv.is_null() {
+                super::culprit::note_graphics(*ppv as usize, &*d as *const _ as *const c_void);
+            }
+            return hr;
+        }
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }
@@ -5381,7 +5413,28 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::present::note_use(r, super::present::USE_CLEAR);
         }
     }
-    f(this, rtv, color, n, rects)
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op("ClearRenderTargetView", rtv, 0, 0));
+    f(this, rtv, color, n, rects);
+    super::culprit::end(this, mark);
+}
+
+/// ClearUnorderedAccessViewUint / Float(gpu handle, cpu handle, resource, values, rects): as
+/// on the PC, marked (`XCL_GPU_CULPRIT` only: `overrides`)
+#[allow(clippy::too_many_arguments)]
+unsafe fn clear_uav(this: *mut c_void, name: &'static str, gpu: u64, cpu: usize, res: usize, values: *const c_void, n: u32, rects: *const c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, u64, usize, usize, *const c_void, u32, *const c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, name)));
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op(name, res, 0, 0));
+    f(this, gpu, cpu, res, values, n, rects);
+    super::culprit::end(this, mark);
+}
+
+unsafe extern "system" fn cl_clear_uav_uint(this: *mut c_void, gpu: u64, cpu: usize, res: usize, values: *const c_void, n: u32, rects: *const c_void) {
+    clear_uav(this, "ClearUnorderedAccessViewUint", gpu, cpu, res, values, n, rects)
+}
+
+unsafe extern "system" fn cl_clear_uav_float(this: *mut c_void, gpu: u64, cpu: usize, res: usize, values: *const c_void, n: u32, rects: *const c_void) {
+    clear_uav(this, "ClearUnorderedAccessViewFloat", gpu, cpu, res, values, n, rects)
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
@@ -5434,14 +5487,18 @@ unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icou
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
+    let mark = super::culprit::begin(this, || super::culprit::draw_op("DrawInstanced", this, vcount, icount));
     f(this, vcount, icount, sv, si);
+    super::culprit::end(this, mark);
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
+    let mark = super::culprit::begin(this, || super::culprit::draw_op("DrawIndexedInstanced", this, icount, inst));
     f(this, icount, inst, si, bv, sinst);
+    super::culprit::end(this, mark);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5457,7 +5514,9 @@ unsafe extern "system" fn cl_execute_indirect(
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
+    let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig as usize, max_count, !cnt_buf.is_null()));
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
+    super::culprit::end(this, mark);
 }
 
 unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
@@ -5594,7 +5653,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 if older == 14 {
                     super::fence_x::note_queue_signal(a1, a2 as u64);
                     super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
+                    super::qjournal::note_raw(this, super::qjournal::Kind::Signal, a1, a2 as u64, "title fence"); // LOCAL
                 } else {
+                    super::qjournal::note_raw(this, super::qjournal::Kind::Wait, a1, a2 as u64, "title fence"); // LOCAL
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
                 }
@@ -5687,6 +5748,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+        super::qjournal::note_raw(this, super::qjournal::Kind::Signal, fence as usize, value, "title fence"); // LOCAL
     }
     hr
 }
@@ -5724,6 +5786,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        // LOCAL
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&this) {
+            super::qjournal::note(q, super::qjournal::Kind::Exec, None, chunk.len() as u64, || format!("lists {:x?}", &chunk[..chunk.len().min(3)]));
+        }
+        super::culprit::note_submit(this, chunk);
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
@@ -5739,6 +5806,12 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
 /// used (before the process ends on purpose).
 pub fn drain_gpu() {
+    drain_gpu_queues();
+    // LOCAL: the last `GPU times` report, with the drained work in it
+    super::culprit::times_at_exit();
+}
+
+fn drain_gpu_queues() {
     use crate::gpu::fence::{self, FenceError};
 
     let raw = device_raw();
@@ -5845,6 +5918,8 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    super::culprit::on_device_removed();
+    super::local_inputs::on_device_removed();
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
@@ -5886,6 +5961,66 @@ pub fn stop_if_device_removed() {
         crate::log::flush();
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
+        }
+    }
+}
+
+/// `on_removed` on a thread of its own as soon as the device is removed (D3D12 then signals
+/// every fence of the device to UINT64_MAX). A title that submits and presents nothing more
+/// after a GPU hang (its recording thread held by pipeline builds) never reaches the checks at
+/// `ExecuteCommandLists` and PresentX: a retail title went on for minutes on a removed device.
+fn watch_removal(dev: &ID3D12Device, on_removed: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    unsafe {
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| format!("CreateFence: {e}"))?;
+        let event = CreateEventW(None, true, false, None).map_err(|e| format!("CreateEventW: {e}"))?;
+        if let Err(e) = fence.SetEventOnCompletion(u64::MAX, event) {
+            let _ = CloseHandle(event);
+            return Err(format!("SetEventOnCompletion: {e}"));
+        }
+        // the fence is kept until the removal: its wait goes with it
+        let (fence, event) = (fence.into_raw() as usize, event.0 as usize);
+        std::thread::Builder::new()
+            .name("xcl-device-removal".into())
+            .spawn(move || {
+                let _fence = ID3D12Fence::from_raw(fence as *mut c_void);
+                WaitForSingleObject(HANDLE(event as *mut c_void), INFINITE);
+                on_removed();
+            })
+            .map(|_| ())
+            .map_err(|e| format!("thread: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod removal_watch_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Nothing happens while the device is fine; its removal calls `on_removed`, with no
+    /// submission or present after it.
+    #[test]
+    fn a_device_removal_is_seen_without_a_submission() {
+        unsafe {
+            // WARP: the removal is the test's own device's, not a GPU's
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            let dev = dev.expect("D3D12 device");
+            let Ok(dev5) = dev.cast::<ID3D12Device5>() else {
+                return crate::gpu::recomp::runner::skip_test("no ID3D12Device5 (RemoveDevice)");
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            watch_removal(&dev, move || {
+                let _ = tx.send(());
+            })
+            .expect("watch");
+            assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "the device is fine: nothing called");
+            dev5.RemoveDevice();
+            rx.recv_timeout(Duration::from_secs(10)).expect("the removal is seen");
+            assert!(dev.GetDeviceRemovedReason().is_err());
         }
     }
 }

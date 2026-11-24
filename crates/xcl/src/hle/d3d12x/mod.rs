@@ -19,10 +19,15 @@ pub mod dxgi_device;
 mod cpu_writes;
 mod fence_x;
 pub mod frame;
+pub mod gpu_times;
 pub mod guard;
 mod late_release;
+/// LOCAL diagnostic: `XCL_LOCAL_DUMP_CS_INPUTS`
+pub mod local_inputs;
 pub mod layout;
 pub mod list_x;
+/// LOCAL diagnostic: `XCL_LOCAL_QJOURNAL`
+pub mod qjournal;
 pub mod null;
 pub mod present;
 pub mod pso_async;

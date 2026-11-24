@@ -70,7 +70,11 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
             crate::xlog_info!("D3D12.X: command queue flags {:#x} (type {}) – the console-only bits are dropped", d[2], d[0]);
         }
     }
-    [pc_list_type(d[0]), priority, d[2] & 1, if d[3] == 0 { 0 } else { 1 }]
+    // LOCAL diagnostic: XCL_LOCAL_NO_GPU_TIMEOUT=1 asks for D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT on
+    // every title queue (does the driver reset at world load go away?)
+    static NO_TIMEOUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let force = *NO_TIMEOUT.get_or_init(|| std::env::var("XCL_LOCAL_NO_GPU_TIMEOUT").is_ok_and(|v| v == "1")) as u32;
+    [pc_list_type(d[0]), priority, d[2] & 1 | force, if d[3] == 0 { 0 } else { 1 }]
 }
 
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
@@ -1046,6 +1050,9 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     let needs_root = list.iter().any(|a| (5..=8).contains(&a[0]));
     pc[8..16].copy_from_slice(&(if list.is_empty() { 0 } else { list.as_ptr() as u64 }).to_le_bytes());
     let hr = real::dev_create_command_signature(this, pc.as_ptr() as usize, if needs_root { root } else { 0 }, riid, ppv);
+    if hr >= 0 && !ppv.is_null() {
+        super::culprit::note_signature(*ppv as usize, list.last().map(|a| a[0]));
+    }
     if hr >= 0 && !ppv.is_null() && needs_root {
         super::bind::note_root_changing_signature(*ppv as usize);
     }

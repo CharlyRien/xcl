@@ -752,7 +752,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+        // LOCAL diagnostic: XCL_LOCAL_FRAME_DUMP_WAIT_MS=<ms> waits longer for the copy (a GPU that is minutes behind)
+        static WAIT_MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let wait_ms = *WAIT_MS.get_or_init(|| std::env::var("XCL_LOCAL_FRAME_DUMP_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000));
+        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), wait_ms) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
@@ -782,6 +785,16 @@ fn frame_dump_due() -> bool {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
+    // LOCAL diagnostic: XCL_LOCAL_FRAME_DUMP_AFTER_S=<s>: every frame shown later than <s> seconds after the
+    // first one is written (the few frames of a world that takes minutes a frame)
+    static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let first = *FIRST.get_or_init(std::time::Instant::now);
+    if let Some(after) = *AFTER.get_or_init(|| std::env::var("XCL_LOCAL_FRAME_DUMP_AFTER_S").ok().and_then(|v| v.trim().parse().ok())) {
+        if first.elapsed().as_secs() >= after {
+            return true;
+        }
+    }
     every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
 }
 

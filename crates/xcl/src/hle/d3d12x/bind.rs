@@ -264,6 +264,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(with(this, |s| s.pso)) {
             count(DRAWS_SKIPPED);
+            super::culprit::skipped(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -287,9 +288,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
+        fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        return super::culprit::end(this, mark);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        super::culprit::skipped(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -300,13 +304,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            // an indirect dispatch: its groups are in the argument buffer (`max` of them)
-            let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
+            // its draws or groups are in the argument buffer (`max` records)
+            let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
-            super::culprit::after_dispatch(list, mark)
+            super::culprit::end(this, mark)
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            super::culprit::skipped(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
@@ -535,6 +540,8 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         }
         Err(e) => {
             count(DRAWS_SKIPPED);
+            let (_, n, instances, _, _) = DRAW_ARGS.with(|d| d.get());
+            super::culprit::skipped(this, || super::culprit::draw_op("draw", this, n, instances));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: draw with a translated pipeline skipped: {e}");
@@ -814,12 +821,14 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
+        super::culprit::skipped(this, || super::culprit::compute_op("Dispatch", with(this, |s| s.pso), pso, [x, y, z]));
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
+            super::culprit::skipped(this, || super::culprit::compute_op("Dispatch", with(this, |s| s.pso), pso, [x, y, z]));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
@@ -938,9 +947,25 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    // LOCAL diagnostic (`XCL_LOCAL_DUMP_CS_INPUTS`): what the title feeds this program; its GPU
+    // read passes (before and after the dispatch) change the list's compute state, bound again
+    let probe = if super::local_inputs::active() {
+        let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+        let user_sgprs = super::real::pso_user_sgprs(super::pso_async::resolve_wait(pso));
+        let (probe, changed) = super::local_inputs::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z], layout.as_deref(), &args, user_sgprs, "the title's D3D12 Dispatch call (x, y, z as it passed them)");
+        if changed {
+            bind_abi(this, list, pso, false)?;
+        }
+        probe
+    } else {
+        None
+    };
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     list.Dispatch(x, y, z);
     super::culprit::after_dispatch(list, mark);
+    if super::local_inputs::after_dispatch(list, probe) {
+        bind_abi(this, list, pso, false)?;
+    }
     Ok(())
 }
 
@@ -1011,7 +1036,7 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
     std::array::from_fn(|k| COUNTS[k].load(Ordering::Relaxed))
 }
 
-#[cfg(test)]
+/// the pipeline the title bound on `list` (its object; 0: none known)
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
     STATES
         .lock()

@@ -61,6 +61,12 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
 /// cleanly without prematurely breaking synchronization.
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// LOCAL (as upstream PR #1046): `XCL_GPU_WAIT_RELEASE_MS=<ms>` replaces the 5 s.
+fn gpu_wait_watchdog_timeout() -> Duration {
+    static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("XCL_GPU_WAIT_RELEASE_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&v| v > 0).map(Duration::from_millis).unwrap_or(GPU_WAIT_WATCHDOG_TIMEOUT))
+}
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -119,7 +125,9 @@ unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
 }
 
 unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    let mark = super::culprit::begin(list, || super::culprit::bulk_op("CopyBufferRegion (console memory operation)", dst, src, n));
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION)(list, dst, dst_off, src, src_off, n);
+    super::culprit::end(list, mark);
 }
 
 fn warn(counter: &AtomicU64, what: &str, why: std::fmt::Arguments) {
@@ -1107,7 +1115,7 @@ static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-fn queue_id(q: usize) -> usize {
+pub(super) fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
         pos
@@ -1413,7 +1421,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout() {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1455,6 +1463,10 @@ fn wake_sync_watchdog() {
                 }
             }
             let had_expired = !expired.is_empty();
+            // LOCAL: where every queue stands, before the CPU releases anything
+            if had_expired {
+                super::qjournal::dump("watchdog");
+            }
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
                 unsafe {
                     let _ = fence.Signal(val);
@@ -1463,7 +1475,7 @@ fn wake_sync_watchdog() {
                 let pq = prod_q.map(queue_id);
                 crate::xlog_warn!(
                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                    gpu_wait_watchdog_timeout().as_millis()
                 );
             }
             if had_expired {
@@ -1666,6 +1678,9 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 if let Err(e) = q.Signal(&fence, val) {
                     crate::xlog_warn!("D3D12.X: Write64 fence Signal({va:#x}, {val:#x}) failed ({e}) – signalling on CPU");
                     let _ = fence.Signal(val);
+                } else {
+                    // LOCAL
+                    super::qjournal::note(q, super::qjournal::Kind::Signal, Some(&fence), val, || format!("cell {va:#x}"));
                 }
             }
             SignalAction::CpuCycleBreak(waiters) => {
@@ -1830,6 +1845,8 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::FallbackCpu;
     }
 
+    // LOCAL
+    super::qjournal::note(q, super::qjournal::Kind::Wait, Some(&fence), w.value, || format!("cell {:#x}", w.va));
     wake_sync_watchdog();
     if unsubmitted {
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1862,7 +1879,26 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
-        if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
+        let t_cpu = Instant::now(); // LOCAL
+        let ok = w.wait_until_satisfied(timeout);
+        super::qjournal::cpu_wait(&super::qjournal::CPU_W64, t_cpu); // LOCAL
+        // LOCAL: what video memory holds there (a synchronous copy back), and whether that
+        // satisfies the wait
+        if !ok && super::qjournal::enabled() {
+            static PROBES: AtomicU64 = AtomicU64::new(0);
+            if PROBES.fetch_add(1, Ordering::Relaxed) < 40 {
+                let before = w.read_value();
+                super::sparse::readback_now(w.va as usize, w.width as usize);
+                crate::xlog_warn!(
+                    "qjournal: CPU wait at {:#x} want {:#x} timed out with memory {before:x?}; after a copy back from video memory it holds {:x?} (satisfied: {})",
+                    w.va,
+                    w.value,
+                    w.read_value(),
+                    w.is_satisfied()
+                );
+            }
+        }
+        if !ok && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
                 g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
@@ -2981,6 +3017,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                super::culprit::note_submit(q_raw, chunk);
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
@@ -3000,6 +3037,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    super::culprit::note_submit(q_raw, &one);
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -3820,7 +3858,9 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
         }
     }
     note_copy_into(this as usize, dst, dst_off, n);
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op("CopyBufferRegion", dst, src, n));
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n);
+    super::culprit::end(this, mark);
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
@@ -3926,7 +3966,9 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         note_copy_into(this as usize, transmute_copy::<_, usize>(&l.pResource), f.Offset, n);
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op("CopyTextureRegion", transmute_copy(&d.pResource), transmute_copy(&s.pResource), 0));
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    super::culprit::end(this, mark);
     std::mem::forget((d, s)); // borrowed resource pointers
 }
 
@@ -3952,7 +3994,9 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op("ClearDepthStencilView", dsv, 0, 0));
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects);
+    super::culprit::end(this, mark);
 }
 
 const PC_RESOLVE_SUBRESOURCE: usize = 19;
@@ -3987,7 +4031,9 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op("ResolveSubresource", dst, src, 0));
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format);
+    super::culprit::end(this, mark);
 }
 
 /// command list #108 ResolveSubresourceRegion(dst, dst sub, x, y, src, src sub, rect, format,
@@ -3998,7 +4044,9 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op("ResolveSubresourceRegion", dst, src, 0));
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode);
+    super::culprit::end(this, mark);
 }
 
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
@@ -4012,7 +4060,9 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         note_copy_into(this as usize, dst, 0, u64::MAX);
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        let mark = super::culprit::begin(this, || super::culprit::bulk_op("CopyResource", dst, src, 0));
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        return super::culprit::end(this, mark);
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);
@@ -4072,7 +4122,9 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
     note_copy_into(this as usize, dest, offset, count as u64 * if ty == D3D12_QUERY_TYPE_PIPELINE_STATISTICS { 88 } else { 8 });
     let pc_offset = offset.saturating_add(real::buffer_delta(dest));
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
+    let mark = super::culprit::begin(this, || super::culprit::bulk_op("ResolveQueryData", dest, heap, 0));
     pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);
+    super::culprit::end(this, mark);
     if !is_occlusion(ty) {
         return;
     }

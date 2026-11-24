@@ -846,17 +846,40 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                                 heaps_set = true;
                             }
                         }
-                        list.SetComputeRootUnorderedAccessView(0, va(io_at));
-                        list.SetComputeRootUnorderedAccessView(1, va(res_at));
-                        for k in 0..4 {
-                            list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
-                        }
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
-                        list.SetPipelineState(pc);
+                        // the root signature, root arguments and pipeline of this dispatch (again
+                        // after the LOCAL read passes of `local_inputs`)
+                        let bind = |list: &ID3D12GraphicsCommandList| -> Result<(), String> {
+                            match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
+                                Some(r) => list.SetComputeRootSignature(r),
+                                None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
+                            }
+                            list.SetComputeRootUnorderedAccessView(0, va(io_at));
+                            list.SetComputeRootUnorderedAccessView(1, va(res_at));
+                            for k in 0..4 {
+                                list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
+                            }
+                            list.SetPipelineState(pc);
+                            Ok(())
+                        };
+                        bind(&list)?;
+                        // LOCAL diagnostic (`XCL_LOCAL_DUMP_CS_INPUTS`)
+                        let probe = if super::local_inputs::active() {
+                            let (probe, changed) = super::local_inputs::before_dispatch(&list, (*p).pc, real, [x, y, z], layout.as_deref(), &table, user_sgprs, "the dispatch packet in the title's console command stream (words its own code wrote; replayed at Close)");
+                            if changed {
+                                bind(&list)?;
+                            }
+                            probe
+                        } else {
+                            None
+                        };
                         let mark = super::culprit::before_dispatch(&list, (*p).pc, real, [x, y, z]);
                         list.Dispatch(x, y, z);
                         super::culprit::after_dispatch(&list, mark);
+                        if super::local_inputs::after_dispatch(&list, probe) {
+                            bind(&list)?;
+                        }
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,

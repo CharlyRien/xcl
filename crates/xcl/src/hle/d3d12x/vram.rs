@@ -553,6 +553,7 @@ impl Pages {
         }
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        super::qjournal::note(&self.queue, super::qjournal::Kind::Signal, Some(&self.fence), self.value, || "vram pages".into()); // LOCAL
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -578,6 +579,7 @@ impl Pages {
         );
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        super::qjournal::note(&self.queue, super::qjournal::Kind::Signal, Some(&self.fence), self.value, || "vram pages".into()); // LOCAL
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1041,6 +1043,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
         let _ = queue.Wait(&pages.fence, pages.value);
+        super::qjournal::note(queue, super::qjournal::Kind::Wait, Some(&pages.fence), pages.value, || "vram pages".into()); // LOCAL
         pages.waited.insert(key, pages.value);
     }
 }
