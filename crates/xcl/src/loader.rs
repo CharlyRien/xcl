@@ -331,6 +331,36 @@ unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
     f(peb() as *mut c_void)
 }
 
+/// LOCAL DIAGNOSTIC, never for upstream: with `XCL_LOCAL_NO_WATCHDOG=1`, one retail build's
+/// stall watchdog no longer takes its two abort branches (they become NOPs), so a run shows what
+/// comes after a 30 s stall. Applied only where the six bytes are the expected ones.
+unsafe fn local_no_watchdog(base: usize) {
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    if std::env::var_os("XCL_LOCAL_NO_WATCHDOG").is_none() {
+        return;
+    }
+    // (rva of the context, expected bytes, offset of the 2-byte conditional jump inside it):
+    // the per-thread heartbeat compare's `jae` to the abort, and the 30-tick countdown's `je` to it
+    let sites: [(usize, [u8; 6], usize); 2] =
+        [(0x2215BD8, [0xC5, 0x78, 0x2E, 0xC7, 0x73, 0x2E], 4), (0x2215C6E, [0xFF, 0xCD, 0x74, 0x04, 0x89, 0xEB], 2)];
+    for (rva, want, off) in sites {
+        let at = (base + rva) as *mut u8;
+        if std::slice::from_raw_parts(at, 6) != want {
+            crate::xlog_info!("local: watchdog bytes at +{rva:#x} differ - not patched");
+            continue;
+        }
+        let mut old = 0u32;
+        if VirtualProtect(at.add(off) as *const c_void, 2, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            crate::xlog_info!("local: watchdog page at +{rva:#x} could not be made writable - not patched");
+            continue;
+        }
+        *at.add(off) = 0x90;
+        *at.add(off + 1) = 0x90;
+        VirtualProtect(at.add(off) as *const c_void, 2, old, &mut old);
+        crate::xlog_info!("local: watchdog abort branch at +{:#x} replaced by NOPs (XCL_LOCAL_NO_WATCHDOG)", rva + off);
+    }
+}
+
 /// Make the game the "main image" of the process and run its entry point on a thread
 /// with the stack size its PE header asks for. Usually never returns (the game calls
 /// ExitProcess); if the entry returns, its value is returned.
@@ -347,6 +377,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
             *(peb().add(0x10) as *mut usize) = m.base;
         }
         run_tls_callbacks(m, 1);
+        local_no_watchdog(m.base);
     }
     READY.store(true, Ordering::Release);
     let stack = (m.stack_reserve as usize).max(1 << 20);
