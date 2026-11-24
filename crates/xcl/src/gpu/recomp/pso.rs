@@ -321,6 +321,7 @@ mod translated {
         compact: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
+        super::local_skip_blob(blob)?;
         if ident == 0 {
             return translate();
         }
@@ -721,6 +722,39 @@ fn compact_form(blob: &[u8]) -> bool {
     f.programs.first().and_then(|p| f.data.get(p.offset..p.offset + p.len)).is_some_and(|code| cs.takes(code))
 }
 
+/// LOCAL DIAGNOSTIC, not for upstream: `XCL_LOCAL_SKIP_CS=<hash>,<hash>` – the programs with these
+/// code hashes (as the `[SHADER] compact backend, compute program <hash>` lines print them) are
+/// not translated at all, so neither DXC nor the driver sees them (the title gets the fallback).
+fn local_skip(code: &[u8]) -> Result<(), String> {
+    static LIST: OnceLock<Vec<u64>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("XCL_LOCAL_SKIP_CS").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default()
+    });
+    if !list.is_empty() && list.contains(&crate::gpu::shader::fnv64(code)) {
+        return Err("local: program skipped (XCL_LOCAL_SKIP_CS)".into());
+    }
+    // `XCL_LOCAL_SKIP_CS_BYTES=n`: also every program of n bytes of console code or more (the
+    // handful of giants whose DXC or driver compile takes tens of GB of commit)
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    let limit = *BYTES.get_or_init(|| std::env::var("XCL_LOCAL_SKIP_CS_BYTES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(usize::MAX));
+    if code.len() >= limit {
+        crate::xlog_info!("local: program {:016x} of {} B of console code skipped (XCL_LOCAL_SKIP_CS_BYTES)", crate::gpu::shader::fnv64(code), code.len());
+        return Err("local: program skipped (XCL_LOCAL_SKIP_CS_BYTES)".into());
+    }
+    Ok(())
+}
+
+/// LOCAL diagnostic: XCL_LOCAL_SKIP_BLOB=<hash,…> refuses the containers with these `fnv64` (the names of the
+/// files in `dxil	ranslated`, the `cs` of the GPU culprit lines), before the caches are asked.
+fn local_skip_blob(blob: &[u8]) -> Result<(), String> {
+    static LIST: OnceLock<Vec<u64>> = OnceLock::new();
+    let list = LIST.get_or_init(|| std::env::var("XCL_LOCAL_SKIP_BLOB").map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()).unwrap_or_default());
+    if !list.is_empty() && list.contains(&crate::gpu::shader::fnv64(blob)) {
+        return Err("local: container skipped (XCL_LOCAL_SKIP_BLOB)".into());
+    }
+    Ok(())
+}
+
 /// The translation, its profile and whether it is the compact form (`CompactCs` `form`).
 pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, form: CompactCs) -> Result<(super::Translation, &'static str, bool), String> {
     if let Some(f) = fspx(blob) {
@@ -728,6 +762,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
+        local_skip(f.code)?;
         let (t, compact) = translate_as(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form)?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
@@ -756,6 +791,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    local_skip(code)?;
     let (t, compact) = translate_as(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form)?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
