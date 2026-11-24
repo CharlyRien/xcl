@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -490,6 +490,7 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
 
 unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -> windows::core::Result<State> {
     let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+    super::qjournal::name(queue.as_raw() as usize, "upload"); // LOCAL
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
@@ -848,6 +849,7 @@ impl State {
     unsafe fn signal(&mut self) {
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+        super::qjournal::note(&self.queue, super::qjournal::Kind::Signal, Some(&self.fence), self.value, || "upload fence".into()); // LOCAL
     }
 
     #[inline]
@@ -856,7 +858,9 @@ impl State {
             return;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
+        let t_cpu = std::time::Instant::now(); // LOCAL
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        super::qjournal::cpu_wait(&super::qjournal::CPU_SPARSE, t_cpu); // LOCAL
         if self.fence.GetCompletedValue() < target {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
         }
@@ -903,6 +907,7 @@ impl State {
                 super::title_textures::own_work(|| {
                     self.queue.ExecuteCommandLists(&[Some(l)]);
                 });
+                super::qjournal::note(&self.queue, super::qjournal::Kind::Exec, None, 1, || "upload slot".into()); // LOCAL
             }
         }
         self.signal();
@@ -1286,6 +1291,11 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
+    if async_readback() {
+        // a shadowed committed window: no CPU wait here (see `AsyncRb`)
+        s.readback_async(queue, &merged);
+        return;
+    }
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
@@ -1293,6 +1303,362 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     s.readback_ranges(&merged);
 }
+
+/// Whether GPU writes go back to the CPU view without a CPU wait (`AsyncRb`): with a shadowed
+/// committed window (`Uma::shadowed`), unless `XCL_SPARSE_SYNC_READBACK=1`. Without one (the
+/// host-memory path: only the sparse windows have copies) the readback stays as it was.
+fn async_readback() -> bool {
+    static SYNC: OnceLock<bool> = OnceLock::new();
+    !*SYNC.get_or_init(|| std::env::var("XCL_SPARSE_SYNC_READBACK").is_ok_and(|v| v.trim() == "1")) && crate::gpu::uma::get().is_some_and(|u| u.shadowed())
+}
+
+/// bytes of the ring the asynchronous readbacks copy into (a bigger one gets its own buffer)
+const ASYNC_RB_RING: usize = 16 << 20;
+
+/// GPU writes into a window's video memory copied back to the CPU view without a CPU wait.
+///
+/// `readback_after_execute` used to wait on the CPU, inside the title's ExecuteCommandLists, for
+/// the lists just submitted to finish, then copy their memory writes back. With the committed
+/// window shadowed, nearly every list writes there (the title's sync cells: Write64, end-of-list
+/// memory writes), and its lists often wait on the GPU for work the same CPU thread submits
+/// only after this call returns (a later list's write, a bridged `queue.Wait`): the wait ran
+/// out after 5 s (`sparse: the queue has not reached fence value N after 5 s (at N-1)`, N the
+/// readback's own signal) and the copy then gave the CPU what the GPU had not written yet. The
+/// copy also went through the upload queue, which every title queue waits on before its
+/// next lists: all queues stalled behind the one that waited.
+///
+/// Now the copy has a queue of its own that GPU-waits for the title's queue, and
+/// nothing waits for that queue but this: a thread copies each finished job into the CPU view
+/// (`drain`), so a CPU poll (`Wait64BitValueX`) sees the value once the GPU wrote it. Invariant:
+/// a 64-byte chunk with a GPU write still in flight is not uploaded (`defer_pending`), so an
+/// upload of the CPU's older bytes never overwrites the GPU's newer ones in video memory; the
+/// chunk goes up merged at the next submit after its readback landed.
+///
+/// One per title queue, each with a fence that only that title queue signals (`src`). With one
+/// fence signalled by every title queue (each with the next value of one counter) a copy's GPU
+/// wait for value N was already met when another queue had signalled N + 1: the copy ran before
+/// its own queue had run the lists, the CPU view got the bytes from before them, and nothing
+/// copied them again – a CPU `Wait64BitValueX` poll on the title's submit thread then ran its
+/// whole 2 s timeout for a value the GPU had written. One copy queue for all title queues let a
+/// copy waiting for a stalled queue hold back the others' copies behind it.
+struct AsyncRb {
+    /// signalled by the title queue after the lists whose writes a job copies
+    src: ID3D12Fence,
+    src_value: u64,
+    queue: ID3D12CommandQueue,
+    done: ID3D12Fence,
+    value: u64,
+    event: HANDLE,
+    ring: Option<(ID3D12Resource, *mut u8)>,
+    ring_write: u64,
+    ring_free: u64,
+    jobs: VecDeque<RbJob>,
+    idle: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+}
+
+struct RbJob {
+    /// `done` reaches it when the copies ran
+    value: u64,
+    /// the ring's free cursor once the job is drained (None: its own buffer)
+    ring_end: Option<u64>,
+    cmd: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// (address, offset in the destination, bytes)
+    items: Vec<(usize, usize, usize)>,
+    own: Option<(ID3D12Resource, *mut u8)>,
+}
+
+// D3D12 objects are free-threaded; the mapped pointers are used under `ASYNC_RB`
+unsafe impl Send for AsyncRb {}
+
+/// Per title queue (its raw pointer). Locked after `STATE` (never the other way round).
+static ASYNC_RB: Mutex<Option<std::collections::HashMap<usize, AsyncRb>>> = Mutex::new(None);
+
+/// `f` on every title queue's `AsyncRb`.
+fn each_async_rb(mut f: impl FnMut(&mut AsyncRb)) {
+    if let Some(m) = ASYNC_RB.lock().unwrap().as_mut() {
+        m.values_mut().for_each(&mut f);
+    }
+}
+
+unsafe fn readback_heap_buffer(dev: &ID3D12Device, bytes: usize) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut r: Option<ID3D12Resource> = None;
+    let mut d = buffer_desc(bytes as u64);
+    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r).ok()?;
+    let r = r?;
+    let mut p = std::ptr::null_mut();
+    r.Map(0, None, Some(&mut p)).ok()?;
+    Some((r, p as *mut u8))
+}
+
+impl AsyncRb {
+    unsafe fn new(dev: &ID3D12Device, key: usize) -> windows::core::Result<AsyncRb> {
+        let src: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+        let _ = queue.SetName(windows::core::w!("xcl window readback queue"));
+        super::qjournal::name(queue.as_raw() as usize, Box::leak(format!("rbq-q{}", super::list_x::queue_id(key)).into_boxed_str())); // LOCAL
+        let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
+        let ev = event.0 as usize;
+        // the thread that copies finished jobs into the CPU view
+        let _ = std::thread::Builder::new().name("xcl-window-readback".into()).spawn(move || loop {
+            windows::Win32::System::Threading::WaitForSingleObject(HANDLE(ev as _), 20);
+            let mut g = STATE.lock().unwrap();
+            let Some(s) = g.as_mut() else { continue };
+            let mut a = ASYNC_RB.lock().unwrap();
+            if let Some(a) = a.as_mut().and_then(|m| m.get_mut(&key)) {
+                a.drain(s);
+            }
+        });
+        Ok(AsyncRb { src, src_value: 0, queue, done, value: 0, event, ring: None, ring_write: 0, ring_free: 0, jobs: VecDeque::new(), idle: Vec::new() })
+    }
+
+    /// Copy every finished job into the CPU view.
+    unsafe fn drain(&mut self, s: &mut State) {
+        let completed = self.done.GetCompletedValue();
+        while self.jobs.front().is_some_and(|j| j.value <= completed) {
+            let j = self.jobs.pop_front().unwrap();
+            let base = match (&j.own, &self.ring) {
+                (Some((_, p)), _) => *p,
+                (None, Some((_, p))) => *p,
+                (None, None) => continue,
+            };
+            for &(va, off, len) in &j.items {
+                s.copy_back(va, base.add(off), len);
+            }
+            if let Some(end) = j.ring_end {
+                self.ring_free = end;
+            }
+            self.idle.push(j.cmd);
+        }
+    }
+
+    /// The 64-byte chunks of the GPU writes still in flight, as sorted `[start, end)` runs.
+    fn pending(&self) -> Vec<(usize, usize)> {
+        let mut v: Vec<(usize, usize)> = self.jobs.iter().flat_map(|j| j.items.iter().map(|&(a, _, n)| (a & !(CHUNK - 1), (a + n + CHUNK - 1) & !(CHUNK - 1)))).collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+/// `runs` less the parts in `pending` (both sorted by start; `pending` chunk-aligned), and the
+/// parts taken out.
+fn subtract_runs(runs: &[(usize, usize)], pending: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let (mut keep, mut cut) = (Vec::new(), Vec::new());
+    for &(a, n) in runs {
+        let (mut at, end) = (a, a + n);
+        for &(ps, pe) in pending.iter().filter(|&&(ps, pe)| ps < end && pe > a) {
+            if ps > at {
+                keep.push((at, ps - at));
+            }
+            let (cs, ce) = (ps.max(at), pe.min(end));
+            if ce > cs {
+                cut.push((cs, ce - cs));
+            }
+            at = at.max(pe);
+            if at >= end {
+                break;
+            }
+        }
+        if at < end {
+            keep.push((at, end - at));
+        }
+    }
+    (keep, cut)
+}
+
+impl State {
+    /// Queue the copy of `ranges` back to the CPU view once `title` has run the lists it was
+    /// just given (`AsyncRb` of that queue).
+    unsafe fn readback_async(&mut self, title: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
+        // LOCAL: `XCL_LOCAL_RB_SHARED=1` = as before (one fence and one copy queue for all title queues), for A/B runs
+        static SHARED: OnceLock<bool> = OnceLock::new();
+        let key = if *SHARED.get_or_init(|| std::env::var("XCL_LOCAL_RB_SHARED").is_ok_and(|v| v.trim() == "1")) { 0 } else { title.as_raw() as usize };
+        let mut g = ASYNC_RB.lock().unwrap();
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        if !m.contains_key(&key) {
+            match AsyncRb::new(&self.dev, key) {
+                Ok(a) => {
+                    m.insert(key, a);
+                }
+                Err(e) => {
+                    crate::xlog_warn!("sparse: no queue for asynchronous readbacks ({e}): GPU writes in the windows do not reach the CPU");
+                    return;
+                }
+            }
+        }
+        let a = m.get_mut(&key).unwrap();
+        a.drain(self);
+        // (address, window, bytes): within a tile and a window, mapped tiles only
+        let mut parts: Vec<(usize, usize, usize)> = Vec::new();
+        for &(addr, n) in ranges {
+            let mut done = 0usize;
+            while done < n {
+                let cur = addr + done;
+                let tile = cur & !(TILE - 1);
+                let Some(wi) = self.window_index(cur) else { break };
+                let to_tile_end = (tile + TILE) - cur;
+                let to_win_end = (self.windows[wi].0 + crate::gpu::uma::WINDOW) - cur;
+                let chunk = (n - done).min(to_tile_end).min(to_win_end);
+                if self.mapped.contains_key(&tile) {
+                    parts.push((cur, wi, chunk));
+                }
+                done += chunk;
+            }
+        }
+        let total: usize = parts.iter().map(|p| p.2.next_multiple_of(16)).sum();
+        if total == 0 {
+            return;
+        }
+        // the ring, or a buffer of its own
+        let mut ring_at = None;
+        if total <= ASYNC_RB_RING / 2 {
+            if a.ring.is_none() {
+                a.ring = readback_heap_buffer(&self.dev, ASYNC_RB_RING);
+            }
+            if a.ring.is_some() {
+                let mut pos = (a.ring_write + 255) & !255;
+                if (pos as usize % ASYNC_RB_RING) + total > ASYNC_RB_RING {
+                    pos += (ASYNC_RB_RING - pos as usize % ASYNC_RB_RING) as u64;
+                }
+                if pos + total as u64 - a.ring_free <= ASYNC_RB_RING as u64 {
+                    ring_at = Some(pos);
+                }
+            }
+        }
+        let own = if ring_at.is_none() { readback_heap_buffer(&self.dev, total) } else { None };
+        let dst = match (&own, ring_at, &a.ring) {
+            (Some((r, _)), _, _) => r.clone(),
+            (None, Some(_), Some((r, _))) => r.clone(),
+            _ => {
+                crate::xlog_warn!("sparse: no readback buffer of {total} B: GPU writes not copied back");
+                return;
+            }
+        };
+        let start = ring_at.map_or(0, |p| p as usize % ASYNC_RB_RING);
+        let cmd = match a.idle.pop() {
+            Some(c) => c,
+            None => {
+                let made = (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+                    let alloc: ID3D12CommandAllocator = self.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = self.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+                    list.Close()?;
+                    Ok((alloc, list))
+                })();
+                match made {
+                    Ok(c) => c,
+                    Err(e) => {
+                        crate::xlog_warn!("sparse: no readback list ({e})");
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = cmd.0.Reset();
+        let _ = cmd.1.Reset(&cmd.0, None);
+        let mut items = Vec::with_capacity(parts.len());
+        let mut off = start;
+        for &(cur, wi, n) in &parts {
+            cmd.1.CopyBufferRegion(&dst, off as u64, &self.windows[wi].1, (cur - self.windows[wi].0) as u64, n as u64);
+            items.push((cur, off, n));
+            off += n.next_multiple_of(16);
+        }
+        if cmd.1.Close().is_err() {
+            a.idle.push(cmd);
+            return;
+        }
+        a.src_value += 1;
+        let v = a.src_value;
+        if title.Signal(&a.src, v).is_err() {
+            a.idle.push(cmd);
+            return;
+        }
+        super::qjournal::note(title, super::qjournal::Kind::Signal, Some(&a.src), v, || "rb src".into()); // LOCAL
+        let _ = a.queue.Wait(&a.src, v);
+        super::qjournal::note(&a.queue, super::qjournal::Kind::Wait, Some(&a.src), v, || "rb src".into()); // LOCAL
+        if let Ok(l) = cmd.1.cast::<ID3D12CommandList>() {
+            super::title_textures::own_work(|| a.queue.ExecuteCommandLists(&[Some(l)]));
+            super::qjournal::note(&a.queue, super::qjournal::Kind::Exec, None, 1, || "readback copy".into()); // LOCAL
+        }
+        a.value += 1;
+        let _ = a.queue.Signal(&a.done, a.value);
+        let _ = a.done.SetEventOnCompletion(a.value, a.event);
+        if let Some(p) = ring_at {
+            a.ring_write = p + total as u64;
+        }
+        let ring_end = ring_at.map(|p| p + total as u64);
+        a.jobs.push_back(RbJob { value: a.value, ring_end, cmd, items, own });
+        if a.value.is_power_of_two() && a.value >= 16 {
+            crate::xlog_info!("sparse: {} asynchronous readbacks of GPU writes, {} in flight, {} chunk runs kept out of uploads meanwhile", a.value, a.jobs.len(), DEFERRED.load(Ordering::Relaxed));
+        }
+    }
+
+    /// The GPU's bytes `[va, va + len)` (at `src`) into the CPU view, committed pages only. A
+    /// 64-byte chunk the CPU had not changed since it was last sent gets the new bytes' hash
+    /// (not uploaded again); one it changed keeps its old hash, so the next submit uploads the
+    /// chunk as it is now, the GPU's bytes and the CPU's together.
+    unsafe fn copy_back(&mut self, va: usize, src: *const u8, len: usize) {
+        let mut at = va;
+        let end = va + len;
+        while at < end {
+            let pg = at & !(PAGE - 1);
+            let t = pg & !(TILE - 1);
+            let idx = (pg - t) / PAGE;
+            let step = (pg + PAGE).min(end) - at;
+            if let Some(entry) = self.mapped.get_mut(&t).filter(|e| e.holes & (1u16 << idx) == 0) {
+                let (c0, c1) = ((at - pg) / CHUNK, (at + step - pg).div_ceil(CHUNK));
+                let synced: Vec<bool> = (c0..c1)
+                    .map(|k| {
+                        let h = chunk_hash(std::slice::from_raw_parts((pg + k * CHUNK) as *const u8, CHUNK));
+                        entry.sent[idx].as_ref().map_or(h == ZERO_HASH, |s| s[k] == h)
+                    })
+                    .collect();
+                std::ptr::copy_nonoverlapping(src.add(at - va), at as *mut u8, step);
+                let sent = entry.sent[idx].get_or_insert_with(|| Box::new(ZERO_HASHES));
+                for (i, k) in (c0..c1).enumerate() {
+                    if synced[i] {
+                        sent[k] = chunk_hash(std::slice::from_raw_parts((pg + k * CHUNK) as *const u8, CHUNK));
+                    }
+                }
+            }
+            at += step;
+        }
+    }
+
+    /// Take out of `runs` (to upload) the 64-byte chunks with a GPU write still on its way back
+    /// (`AsyncRb`): their hashes are spoilt so they are uploaded at a later submit, merged.
+    unsafe fn defer_pending(&mut self, runs: &mut Vec<(usize, usize)>) {
+        let mut pending = Vec::new();
+        each_async_rb(|a| {
+            a.drain(self);
+            pending.extend(a.pending());
+        });
+        if pending.is_empty() {
+            return;
+        }
+        pending.sort_unstable();
+        let (keep, cut) = subtract_runs(runs, &pending);
+        if cut.is_empty() {
+            return;
+        }
+        for &(c, n) in &cut {
+            let mut x = c & !(CHUNK - 1);
+            while x < c + n {
+                let pg = x & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                if let Some(s) = self.mapped.get_mut(&t).and_then(|e| e.sent[(pg - t) / PAGE].as_mut()) {
+                    s[(x - pg) / CHUNK] ^= 0x5A5A_5A5A_5A5A_5A5A;
+                }
+                x += CHUNK;
+            }
+        }
+        DEFERRED.fetch_add(cut.len() as u64, Ordering::Relaxed);
+        *runs = keep;
+    }
+}
+
+/// chunks runs kept out of an upload while a GPU write there was on its way back
+static DEFERRED: AtomicU64 = AtomicU64::new(0);
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
@@ -1307,6 +1673,8 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if s.window_index(va).is_none() {
         return;
     }
+    // the GPU writes that came back since (`AsyncRb`)
+    each_async_rb(|a| a.drain(s));
     let zeroed = std::mem::take(&mut s.to_zero);
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
@@ -1333,6 +1701,9 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             }
         }
         pg = tile_end;
+    }
+    if !dirty_runs.is_empty() && async_readback() {
+        s.defer_pending(&mut dirty_runs);
     }
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
@@ -1536,6 +1907,10 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
+    // (a GPU write on its way back keeps its chunk out of this upload: `AsyncRb`)
+    if !dirty_runs.is_empty() && async_readback() {
+        s.defer_pending(&mut dirty_runs);
+    }
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     if !zero_runs.is_empty() {
@@ -1572,6 +1947,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
         let _ = queue.Wait(&s.fence, s.value);
+        super::qjournal::note(queue, super::qjournal::Kind::Wait, Some(&s.fence), s.value, || "upload fence".into()); // LOCAL
         s.waited.insert(q, s.value);
     }
 }
@@ -1637,6 +2013,17 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upload runs lose the chunks with a GPU write on its way back, and only those.
+    #[test]
+    fn runs_with_a_readback_in_flight_are_cut_out() {
+        let pending = [(0x1040, 0x1080), (0x2000, 0x2040)];
+        let (keep, cut) = subtract_runs(&[(0x1000, 0x100), (0x1800, 0x40), (0x1fc0, 0x100)], &pending);
+        assert_eq!(keep, vec![(0x1000, 0x40), (0x1080, 0x80), (0x1800, 0x40), (0x1fc0, 0x40), (0x2040, 0x80)]);
+        assert_eq!(cut, vec![(0x1040, 0x40), (0x2000, 0x40)]);
+        assert_eq!(subtract_runs(&[(0x1040, 0x40)], &pending), (vec![], vec![(0x1040, 0x40)]));
+        assert_eq!(subtract_runs(&[(0x3000, 0x40)], &pending), (vec![(0x3000, 0x40)], vec![]));
+    }
 
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
