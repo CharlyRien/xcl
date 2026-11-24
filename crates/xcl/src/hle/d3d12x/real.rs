@@ -3508,8 +3508,12 @@ fn note_translation_error(e: String) {
     }
     // each different reason once (the first five only hid a retail game's "mesh pipeline with
     // AS" behind five earlier ones)
+    // LOCAL: the cap of 40 different reasons is `XCL_LOCAL_TRANSLATE_ERRORS` (default 100000),
+    // so later refusals (each mesh pipeline with its MS in the AS slot has its own) stay visible
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cap = *CAP.get_or_init(|| std::env::var("XCL_LOCAL_TRANSLATE_ERRORS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100_000));
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
-    if g.len() < 40 && !g.contains(&e) {
+    if g.len() < cap && !g.contains(&e) {
         crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
         g.push(e);
     }
