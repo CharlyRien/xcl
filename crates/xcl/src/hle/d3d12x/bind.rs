@@ -30,6 +30,8 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    /// 32-bit addresses of the view heap and the sampler heap set (0: none)
+    heaps: [u32; 2],
     /// the PC allocator this recording is on
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
@@ -134,6 +136,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
         let mut res_bufs = std::mem::take(&mut s.res_retired);
@@ -156,6 +159,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.heaps = [0; 2];
     });
 }
 
@@ -163,8 +167,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.heaps)
     });
     let allocator = recording_allocator(to, allocator);
     let (old, blocks) = with(to, |s| {
@@ -176,6 +180,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
         s.pso = pso;
+        s.heaps = heaps;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -213,6 +218,16 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
     STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+}
+
+/// SetDescriptorHeaps: the console addresses of `heaps`, for shaders that index them themselves
+/// (`Layout::heaps`).
+pub(super) fn set_heaps(list: *mut c_void, heaps: &[usize]) {
+    let mut bases = [0u32; 2];
+    for (sampler, base) in heaps.iter().filter_map(|&h| super::console_heap::base(h)) {
+        bases[sampler as usize] = base;
+    }
+    with(list, |s| s.heaps = bases);
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -1492,7 +1507,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     if first == 0 && u.shadowed() {
         return Err("window 0 of unified memory has no buffer on the GPU".into());
     }
-    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let (layout, args, heaps) = with(this, |s| {
+        let (layout, args) = if gfx { (&s.layout_gfx, &s.args_gfx) } else { (&s.layout, &s.args) };
+        (layout.clone(), args.clone(), s.heaps)
+    });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -1506,8 +1524,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
-        Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
+        Some(l) if gfx => console_list::with_heaps(l, None, console_list::user_data_gfx(l, &args, table_at as u64), heaps),
+        Some(l) => console_list::with_heaps(l, user_sgprs, console_list::user_data_for(l, user_sgprs, &args, table_at as u64), heaps),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
