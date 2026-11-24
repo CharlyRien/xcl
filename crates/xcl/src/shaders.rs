@@ -1146,7 +1146,7 @@ impl Pipelines {
     }
 
     /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
+    fn make(&self, c: &recomp::pso::Compiled, name: &str) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -1170,6 +1170,20 @@ impl Pipelines {
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
             ..Default::default()
         };
+        // LOCAL DIAGNOSTIC, not for upstream: `XCL_LOCAL_SKIP_CS_KB=n` as at run time
+        // (`real.rs`): a program of n KB of DXIL or more without a driver blob is not handed to
+        // the driver (minutes and tens of GB of commit each on NVIDIA)
+        {
+            use crate::hle::d3d12x::real::driver_cache;
+            static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let limit = *LIMIT.get_or_init(|| std::env::var("XCL_LOCAL_SKIP_CS_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(usize::MAX, |kb| kb << 10));
+            if c.dxil.len() >= limit && driver_cache::path(&c.dxil, desc.Flags.0).as_deref().and_then(driver_cache::load).is_none() {
+                eprintln!("  local: pipeline of {name} ({} B of DXIL) not made (XCL_LOCAL_SKIP_CS_KB)", c.dxil.len());
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         {
             let mut n = self.running.0.lock().unwrap();
             while *n >= self.most {
@@ -1267,7 +1281,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                p.make(&c, &name);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
