@@ -297,6 +297,19 @@ impl TilePool {
         h
     }
 
+    /// Tiles free now or once cooled (page budget: what an eviction round gave back).
+    fn spare(&self) -> usize {
+        self.free_total + self.cooling.len()
+    }
+
+    /// Page budget: every tile given back is free now, cooled or not (at the budget a tile is
+    /// reused before it cooled: a draw still in flight may read the newer texels there for a frame).
+    fn drain_all_cooling(&mut self) {
+        while let Some((tile, _)) = self.cooling.pop_front() {
+            self.return_tiles(&[tile]);
+        }
+    }
+
     fn push_cooling(&mut self, tile: Tile, now: std::time::Instant) {
         self.cooling.push_back((tile, now));
     }
@@ -604,7 +617,7 @@ impl Pages {
     /// tiles came back (pages other mapped textures still share stay). Each goes to `EVICTED`.
     unsafe fn evict_lru(&mut self, want: usize) -> usize {
         let now = std::time::Instant::now();
-        let before = self.free.len() + self.cooling.len();
+        let before = self.pool.spare();
         let mut order: Vec<(std::time::Instant, usize)> = self
             .targets
             .iter()
@@ -614,7 +627,7 @@ impl Pages {
         order.sort_unstable();
         let mut evicted = Vec::new();
         for (_, key) in order {
-            if self.free.len() + self.cooling.len() - before >= want {
+            if self.pool.spare() - before >= want {
                 break;
             }
             let Some(t) = self.targets.get_mut(&key) else { continue };
@@ -631,7 +644,7 @@ impl Pages {
         }
         if !evicted.is_empty() {
             let n = EVICTIONS.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed) + evicted.len() as u64;
-            let freed = self.free.len() + self.cooling.len() - before;
+            let freed = self.pool.spare() - before;
             static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let step = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
             if n >= step {
@@ -643,7 +656,7 @@ impl Pages {
             s.extend(evicted);
             EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
         }
-        self.free.len() + self.cooling.len() - before
+        self.pool.spare() - before
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
@@ -667,6 +680,18 @@ impl Pages {
             }
         }
 
+        // page budget: at the cap, one eviction round gives back a batch of tiles, which the
+        // following placements take first; a round that found nothing to evict is not repeated
+        // for a second (each one walks every target), and the pools grow past the budget then
+        if self.cap > 0 && missing > 0 && self.pools.len() >= self.cap {
+            self.pool.drain_cooling(now);
+            if self.pool.spare() < missing && self.evict_idle_until.is_none_or(|t| now >= t) && self.evict_lru(EVICT_BATCH.max(missing)) == 0 {
+                self.evict_idle_until = Some(now + EVICT_IDLE);
+            }
+            if self.pool.free_total < missing {
+                self.pool.drain_all_cooling();
+            }
+        }
         let pools = &mut self.pools;
         let pool = &mut self.pool;
         let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
@@ -843,7 +868,7 @@ unsafe fn place_on_pages(
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
             if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now() });
                 true
             } else {
                 false
@@ -1727,7 +1752,10 @@ mod tests {
                 // at the cap with no spare tile: the next tile has to come from an eviction
                 pages.cap = pages.pools.len();
                 pages.evict_idle_until = None;
-                (std::mem::take(&mut pages.free), std::mem::take(&mut pages.cooling))
+                let heaps = pages.pool.free_by_heap.len();
+                let free = std::mem::replace(&mut pages.pool.free_by_heap, vec![Vec::new(); heaps]);
+                pages.pool.free_total = 0;
+                (free, std::mem::take(&mut pages.pool.cooling))
             };
             let new = place_at(0x61_8000_0000);
             let mapped: Vec<bool> = {
@@ -1735,8 +1763,12 @@ mod tests {
                 let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
                 let mapped = old.iter().map(|r| pages.targets[&key(r)].mapped).collect();
                 pages.cap = 0;
-                pages.free.extend(saved_free);
-                pages.cooling.extend(saved_cooling);
+                for (h, tiles) in saved_free.into_iter().enumerate() {
+                    pages.pool.free_total += tiles.len();
+                    pages.pool.free_by_heap[h].extend(tiles);
+                    pages.pool.dirty_sort[h] = true;
+                }
+                pages.pool.cooling.extend(saved_cooling);
                 mapped
             };
             assert!(new.is_some(), "placed from the evicted tiles");
