@@ -236,6 +236,12 @@ mod translated {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
+            // LOCAL: `XCL_LOCAL_TRANSLATED_ID=<16 hex>` uses another build's entries – only for a
+            // build whose translator differs from it in what this cache does not hold (w22: the
+            // mesh pass-through of #304/#541, which is never stored here)
+            if let Some(id) = std::env::var("XCL_LOCAL_TRANSLATED_ID").ok().and_then(|v| u64::from_str_radix(v.trim(), 16).ok()) {
+                return id;
+            }
             let id =             identity_with(
                 env!("XCL_TRANSLATOR_SOURCE_ID"),
                 super::dxc::toolchain_identity(),
