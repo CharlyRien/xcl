@@ -179,7 +179,7 @@ pub fn base_for(va: usize, len: usize) -> Option<usize> {
     let srcs: HashMap<usize, usize> = (t0..t1).step_by(TILE).map(|t| (t, super::super::title_textures::mirror_source(t))).collect();
     let src_of = |a: usize| srcs.get(&(a & !(TILE - 1))).map_or(a, |&s| s + (a & (TILE - 1)));
     // (held: STATE, then MIRRORS, as in `sync`)
-    let mut g = lock_state();
+    let mut g = STATE.lock().unwrap();
     let s = g.as_mut()?;
     let mut mg = MIRRORS.lock().unwrap();
     let m = mg.get_or_insert_with(Mirrors::default);
