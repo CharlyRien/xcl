@@ -1088,6 +1088,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !gfx {
         super::depth_uav::local_before_dispatch(this); // LOCAL agent I
+        super::lcap::note_groups([0, 0, 0]); // LOCAL agent Li: groups in the argument buffer (`lcap::cs_args`)
     }
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
@@ -1097,7 +1098,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
             super::rtsum::after_indirect(this, sig, max, args, args_off, count_buf, count_off, gfx, with(this, |s| s.pso)); // LOCAL
-            if gfx { super::lcap::after_ei(this, args, args_off, max, super::rtsum::stride_of(sig), count_buf, count_off) } else { super::lcap::after_dispatch(this) } // LOCAL (agent H)
+            if gfx { super::lcap::after_ei(this, args, args_off, max, super::rtsum::stride_of(sig), count_buf, count_off) } else { super::lcap::cs_args(this, args, args_off, max); super::lcap::after_dispatch(this) } // LOCAL (agent H; cs_args: agent Li)
             if !gfx {
                 super::depth_uav::local_after_dispatch(this, raw_pso); // LOCAL agent I (the title's handle)
             }

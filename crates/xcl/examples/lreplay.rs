@@ -266,6 +266,15 @@ fn load(dir: &Path) -> Capture {
                 c.rec_info.push(format!("draw {} stride {stride} max {max} count {count:?} records {nrec}", it[1]));
                 recs.insert(it[1].parse().unwrap(), v);
             }
+            // LOCAL (agent Li): an ExecuteIndirect dispatch (`groups 0 0 0`): its first argument record
+            "csargs" => {
+                let n = hex(tok(l, "bytes").unwrap()) as usize;
+                let Some(b) = f.try_get(tok(l, "file").unwrap(), n) else { continue };
+                if let Some((_, g, _)) = c.dispatch.as_mut().filter(|d| d.1 == [0, 0, 0] && env("XCL_LREPLAY_GROUPS").is_none() && n >= 12) {
+                    *g = std::array::from_fn(|k| u32::from_le_bytes(b[4 * k..4 * k + 4].try_into().unwrap()));
+                    c.rec_info.push(format!("dispatch groups from its argument record: {g:?}"));
+                }
+            }
             _ => {}
         }
     }

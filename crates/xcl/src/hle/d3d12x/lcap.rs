@@ -52,6 +52,52 @@ fn cs_set() -> &'static [String] {
 }
 
 // ---------------------------------------------------------------------------------------
+// LOCAL (agent Li): `XCL_LOCAL_LCAP_CS_UAV=<i,j,...>` (shared view indices; needs `XCL_LOCAL_LCAP_SPEC2`,
+// the stage file of agent R, `S\agentR\spec2.txt`): the compute program the capture takes is, once armed
+// (unchanged: `XCL_LOCAL_LCAP_AFTER_S` / `_AFTER_CS_S` after the mask program), the first one whose
+// used-resource table names as a UAV image (kind 3, 8 dwords) a T# whose word 0 is one of these indices,
+// instead of the first `XCL_LOCAL_LCAP_CS` program; its table slots come from the same file. Meant for
+// the R32_UINT textures behind the R9G9B9E5 light views the tiled-lighting draws read (views 2524 / 2530
+// / 2592 / 2598 of captures L4 and R4 have their R32_UINT companions at 2520 / 2526 / 2588 / 2594).
+// Whatever the arming, each compute bind that names one is logged (`LOCAL lcap uavwatch`: the first 64,
+// then each new program / index), so one run also says which programs write those textures and when.
+// An ExecuteIndirect dispatch has no groups here (`groups 0 0 0`): its argument records follow
+// (`csargs` line, `cs_args`).
+// ---------------------------------------------------------------------------------------
+fn uav_watch() -> &'static [u32] {
+    static V: OnceLock<Vec<u32>> = OnceLock::new();
+    V.get_or_init(|| env("XCL_LOCAL_LCAP_CS_UAV").map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect()).unwrap_or_default())
+}
+
+/// the watched indices that compute program `hash`'s used-resource table names as UAV images, as
+/// (user-data dword, dword offset, index), and the table slots of that program (for `Cap::inputs`)
+unsafe fn uav_watch_hits(hash: u64, io: &[u32]) -> (Vec<(u8, u32, u32)>, Vec<(usize, Vec<u32>)>) {
+    let mut hits = Vec::new();
+    let mut slots: Vec<(usize, Vec<u32>)> = Vec::new();
+    let (Some(s), Some(u)) = (spec2(hash, 6), crate::gpu::uma::get()) else { return (hits, slots) };
+    let base = u.base() & !0xFFFF_FFFF;
+    for &(dw, off, kind, n) in &s.tables {
+        match slots.iter_mut().find(|(k, _)| *k == dw as usize) {
+            Some((_, v)) => v.push(off),
+            None => slots.push((dw as usize, vec![off])),
+        }
+        let Some(&t) = io.get(dw as usize) else { continue };
+        if kind != 3 || n != 8 || t == 0 {
+            continue;
+        }
+        let p = (base | t as usize) + 4 * off as usize;
+        if !crate::gpu::shader::readable(p, 32) {
+            continue;
+        }
+        let w: Vec<u32> = (0..8).map(|k| (p as *const u32).add(k).read_unaligned()).collect();
+        if w[3] >> 28 >= 8 && uav_watch().contains(&w[0]) {
+            hits.push((dw, off, w[0]));
+        }
+    }
+    (hits, slots)
+}
+
+// ---------------------------------------------------------------------------------------
 // LOCAL (agent R): geometry capture. `XCL_LOCAL_LCAP_GEOM=<n>`: instead of the lighting stage, the
 // first run of at most n consecutive two-pass mesh draws on one list whose bound render targets
 // include one of format `XCL_LOCAL_LCAP_GEOM_FMT` (default 29, the sRGB G-buffer target), after
@@ -450,6 +496,8 @@ struct Cap {
     cs_list: usize,
     cs_uav_res: Vec<usize>,
     cs_groups: [u32; 3],
+    /// LOCAL (agent Li): the table slots of the compute program chosen by `XCL_LOCAL_LCAP_CS_UAV`
+    cs_spec: Option<Vec<(usize, Vec<u32>)>>,
     tl: St,
     tl_list: usize,
     tl_targets: Vec<usize>,
@@ -744,8 +792,12 @@ impl Cap {
                 }
             }
         }
-        // used table slots
-        for (sgpr, offs) in slot_spec(gfx) {
+        // used table slots (LOCAL agent Li: those of the program `XCL_LOCAL_LCAP_CS_UAV` chose)
+        let spec: Vec<(usize, Vec<u32>)> = match (&self.cs_spec, gfx) {
+            (Some(s), false) => s.clone(),
+            _ => slot_spec(gfx).to_vec(),
+        };
+        for (sgpr, offs) in &spec {
             let Some(&t) = io.get(*sgpr) else { continue };
             if t == 0 {
                 continue;
@@ -1200,6 +1252,27 @@ pub unsafe fn on_bind(list: *mut c_void, pso: usize, gfx: bool, io: &[u32], tabl
         let _ = FIRST_CS.set(now);
         crate::xlog_info!("LOCAL lcap: first dispatch of the mask program at {now:.3} s");
     }
+    // LOCAL (agent Li): compute programs that name a watched UAV (`XCL_LOCAL_LCAP_CS_UAV`), whatever the arming
+    let mut li_slots: Option<Vec<(usize, Vec<u32>)>> = None;
+    if !gfx && !uav_watch().is_empty() {
+        if let Some((false, h)) = saved_hashes(pso) {
+            let (hits, slots) = uav_watch_hits(h[0], io);
+            if !hits.is_empty() {
+                static SEEN: Mutex<Option<HashSet<(u64, u32)>>> = Mutex::new(None);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let fresh = hits.iter().any(|&(_, _, i)| SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert((h[0], i)));
+                let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k < 64 || fresh {
+                    let at: Vec<String> = hits.iter().map(|(dw, off, i)| format!("{i} at s{dw}+{off}")).collect();
+                    crate::xlog_info!(
+                        "LOCAL lcap uavwatch #{k}: program {:016x} names as UAV {} on list {:#x} type {:?}, groups {:?} (0 0 0: indirect), present {}",
+                        h[0], at.join(", "), list as usize, super::list_x::tracked_list_type(list).map(|t| t.0), GROUPS.with(|c| c.get()), PRESENTS.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                }
+                li_slots = Some(slots);
+            }
+        }
+    }
     if !armed(now) {
         return;
     }
@@ -1252,7 +1325,10 @@ pub unsafe fn on_bind(list: *mut c_void, pso: usize, gfx: bool, io: &[u32], tabl
     if c.tl == St::Active && list as usize == c.tl_list && (!is_tl || c.draws >= max_draws()) {
         end_tl(c, l, direct, "next bind");
     }
-    if !gfx && c.cs == St::Idle && hashes.is_some_and(|(gx, h)| !gx && matches(h[0], cs_set())) {
+    // LOCAL (agent Li): with `XCL_LOCAL_LCAP_CS_UAV`, the first program that names a watched UAV
+    let cs_wanted = if uav_watch().is_empty() { hashes.is_some_and(|(gx, h)| !gx && matches(h[0], cs_set())) } else { li_slots.is_some() };
+    if !gfx && c.cs == St::Idle && cs_wanted {
+        c.cs_spec = li_slots;
         c.note_frame = PRESENTS.load(std::sync::atomic::Ordering::Relaxed);
         c.stage_now = 0;
         c.t_first = now;
@@ -1336,6 +1412,30 @@ pub unsafe fn after_dispatch(list: *mut c_void) {
     barrier_batch(l);
     c.cs = St::Done;
     crate::xlog_info!("LOCAL lcap: compute program's UAV textures captured after it ({} MB so far)", c.bytes >> 20);
+}
+
+/// LOCAL (agent Li): after a translated ExecuteIndirect dispatch on `list`, before `after_dispatch`: the
+/// argument records of the captured compute program (its groups: 12 bytes per record)
+pub unsafe fn cs_args(list: *mut c_void, args: usize, args_off: u64, max: u32) {
+    if !on() {
+        return;
+    }
+    let mut g = CAP.lock().unwrap();
+    let Some(c) = g.as_mut() else { return };
+    if c.cs != St::Active || c.cs_list != list as usize {
+        return;
+    }
+    let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return };
+    let raw = args as *mut c_void;
+    let Some(a) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
+    let n = (12 * max.clamp(1, 16) as u64).min(a.GetDesc().Width.saturating_sub(args_off)) & !3;
+    if n == 0 {
+        return;
+    }
+    c.stage_now = 0;
+    let Some((k, at)) = c.alloc(n) else { return };
+    l.CopyBufferRegion(c.chunks[k].rb.as_ref().unwrap(), at, a, args_off, n);
+    c.man.push(format!("csargs max {max} args {args:#x}+{args_off:#x} bytes {n:#x} file chunk{k}.bin@{at:#x}"));
 }
 
 /// after a translated ExecuteIndirect draw on `list`: its argument records
