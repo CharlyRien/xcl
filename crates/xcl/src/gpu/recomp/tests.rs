@@ -8184,3 +8184,52 @@ fn gpu_local_ms_probe_reads_the_meshlet_entries() {
     let r: Vec<u32> = (0..4).flat_map(|k| [m[0x3800 / 4 + k * 4 + 2], m[0x3800 / 4 + k * 4 + 3]]).collect();
     assert_eq!(r, vec![0x100, 0x3000, 0x1000, 0, 0x1000, 2, 63 | (99 << 7), 31 | (49 << 7)]);
 }
+
+/// LOCAL: the retail MS (`XCL_LOCAL_MS_BIN`) with its SGPRs from `console_list::user_data_ms` for
+/// the title's mesh root signature (tables t0, t4, t8, SRV d12, 2 constants), its memory as the
+/// title lays it out (measured, run n2-cpu / n1-probe): t4 = t8 + 0x20, so t4's slot 0 is t8's
+/// slot 1, a 128-byte block of floats. The MS must read t8 (slot 0 = meshlet buffer): real
+/// counts. With the arguments from s16 it reads t4 and writes (1, 1), as in the game.
+#[test]
+fn gpu_local_retail_ms_counts_through_the_root_arguments() {
+    let Some(path) = std::env::var_os("XCL_LOCAL_MS_BIN") else { return };
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use crate::hle::d3d12x::console_list::{layout_from_blob, user_data_ms};
+    let blob = std::fs::read(path).unwrap();
+    let ps = super::dxc::compile("float4 main(float4 p : SV_Position) : SV_Target0 { return 1.0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let params: [(u32, u32); 5] = [(0, 0), (0, 0), (0, 0), (3, 0), (1, 2)];
+    let mut r = vec![2u32, 5, 24, 0, 0, 0];
+    for (k, &(ty, _)) in params.iter().enumerate() {
+        r.extend([ty, 0, 24 + 60 + 12 * k as u32]);
+    }
+    for &(_, count) in &params {
+        r.extend([0, 0, count]);
+    }
+    let rts: Vec<u8> = r.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let l = layout_from_blob(&rts).unwrap();
+    let entries = [(64u32, 100u32), (32, 50), (128, 128)];
+    let mut mem = vec![0u32; 0x4000];
+    // t8 at 0x100: slot 0 meshlet buffer 0x1000, slot 1 per-draw constants 0x2000 (128 B of 1.0), slot 3 frame constants 0x2800
+    for (at, base, n) in [(0x100usize, 0x1000u32, 0x1000u32), (0x120, 0x2000, 0x80), (0x160, 0x2800, 0x1000)] {
+        mem[at / 4..at / 4 + 4].copy_from_slice(&[base, 0, n, 0]);
+    }
+    for k in 0..32 {
+        mem[0x2000 / 4 + k] = 1.0f32.to_bits();
+    }
+    mem[0x1000 / 4] = entries.len() as u32;
+    for (g, (v, p)) in entries.iter().enumerate() {
+        mem[(0x1000 + 16 * g + 12) / 4] = (v - 1) | ((p - 1) << 7);
+    }
+    let args: Vec<u8> = [0x80u32, 0x120, 0x100, 0x3000, 0, 0, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut sg = user_data_ms(&l, &args, 0);
+    sg.resize(128, 0);
+    println!("s15..s19 {:x?}", &sg[15..20]);
+    let tp = super::pso::console_mesh(&blob, None, runner::split_for(&Mode::Mesh(Default::default()))).unwrap();
+    let (_, rec) = runner::mesh_draw(&tp.cs, &tp.ms, &ps, entries.len() as u32, tp.record.record_dwords(), &sg, &mem, 32, [0.0; 4]).unwrap();
+    let rd = tp.record.record_dwords();
+    let got: Vec<(u32, u32)> = (0..entries.len()).map(|g| (rec[g * rd], rec[g * rd + 1])).collect();
+    println!("records {got:?}");
+    assert_eq!(got, entries.to_vec());
+}
