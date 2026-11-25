@@ -5092,6 +5092,38 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
     }
     let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
+    // LOCAL: what the title's stream holds for the first 12 moved MS: every sub-object (type, payload bytes,
+    // and for a shader sub-object its bytecode length and, for a console container, its stage and
+    // hardware variants), whether a 25 (PC MS) is there too, and the container's mesh interface
+    if moved && ms.is_some() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            let desc_of = |ty: u32, p: &[u8]| -> String {
+                if SHADER_SUBOBJECTS.iter().any(|t| t.0 as u32 == ty) {
+                    match payload_shader(p) {
+                        Some(b) if is_console(b) => match crate::gpu::xbox::parse(b) {
+                            Some(sh) => format!("({ty},{}B: console {} {}B hw{:?})", p.len(), sh.stage, b.len(), sh.fssm.iter().map(|f| f.stages.iter().map(|s| s.hw).collect::<Vec<_>>()).collect::<Vec<_>>()),
+                            None => format!("({ty},{}B: console ? {}B)", p.len(), b.len()),
+                        },
+                        Some(b) => format!("({ty},{}B: PC {}B)", p.len(), b.len()),
+                        None => format!("({ty},{}B: null)", p.len()),
+                    }
+                } else {
+                    format!("({ty},{}B)", p.len())
+                }
+            };
+            let list: Vec<String> = subs.iter().map(|(t, p)| desc_of(*t, p)).collect();
+            let iface = ms.and_then(|b| {
+                let sh = crate::gpu::xbox::parse(b)?;
+                let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7))?;
+                match crate::gpu::recomp::interface(b, &sh, f)? {
+                    crate::gpu::recomp::Mode::Mesh(m) => Some(format!("mesh: {} threads, max {} vertices / {} primitives, {} vertex outputs {:?}", m.threads, m.max_vertices, m.max_primitives, m.outputs.len(), m.outputs.iter().map(|o| o.name.clone()).collect::<Vec<_>>())),
+                    other => Some(format!("not a mesh interface: {:?}", std::mem::discriminant(&other))),
+                }
+            });
+            crate::xlog_info!("D3D12.X: (LOCAL) moved-MS stream {:016x}: {} sub-objects {}; PC MS (25) present: {}; {}", crate::gpu::shader::fnv64(ms.unwrap()), subs.len(), list.join(" "), ms_slot.is_some(), iface.unwrap_or_else(|| "no NGG variant / interface".into()));
+        }
+    }
     let Some(ms) = ms else { return None };
     if !is_console(ms) {
         return None;
