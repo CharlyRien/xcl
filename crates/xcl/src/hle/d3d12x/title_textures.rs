@@ -2499,7 +2499,9 @@ mod tests {
     /// Run alone: `XCL_LOCAL_TEX_OVERLAP=1 <test exe> local_overlapping_textures --test-threads=1`.
     #[test]
     fn local_overlapping_textures_both_follow_their_memory() {
-        if !super::super::vram::tex_overlap_keep() {
+        // (`XCL_LOCAL_TEX_OVERLAP_MEASURE=1` without the switch: the same steps, printed, not asserted)
+        let measure = std::env::var("XCL_LOCAL_TEX_OVERLAP_MEASURE").is_ok_and(|v| v == "1");
+        if !super::super::vram::tex_overlap_keep() && !measure {
             println!("SKIPPED local_overlapping_textures_both_follow_their_memory: XCL_LOCAL_TEX_OVERLAP=1 not set");
             return;
         }
@@ -2585,6 +2587,10 @@ mod tests {
                 println!("level {sub}: A {} of {} bytes as its memory ({} non-zero), B {} of {}", ga.iter().zip(&want_a[sub].data).filter(|(x, y)| x == y).count(), ga.len(), ga.iter().filter(|&&x| x != 0).count(), gb.iter().zip(&want_b[sub].data).filter(|(x, y)| x == y).count(), gb.len());
                 equal_a += (ga == want_a[sub].data) as usize;
                 equal_b += (gb == want_b[sub].data) as usize;
+            }
+            println!("levels equal to their memory: A {equal_a} of {}, B {equal_b} of {} (switch {})", want_a.len(), want_b.len(), super::super::vram::tex_overlap_keep());
+            if !super::super::vram::tex_overlap_keep() {
+                return;
             }
             assert_eq!(equal_b, want_b.len(), "the newer texture holds its memory");
             assert_eq!(equal_a, want_a.len(), "the older texture holds its memory too (it read zeros when it was retired)");
