@@ -33,6 +33,7 @@ pub mod qjournal;
 /// LOCAL diagnostic: `XCL_LOCAL_RTSUM`
 pub mod rtsum;
 pub mod lcap; // LOCAL (agent H): lighting capture for the offline replay
+pub mod lreplay_api; // LOCAL (agent V): what examples/lreplay.rs needs from the crate
 #[cfg(test)]
 mod lreplay; // LOCAL (agent H): offline replay of the lighting capture
 pub mod null;

@@ -1,0 +1,31 @@
+# LOCAL (agent V): the profile of the off-game replay loop. Not read by default: pass it with
+#   cargo build --config .cargo/replay.toml --profile replay -p xcl --example lreplay --target-dir ../t38
+# so that the other builds of this tree (xcl.exe for a title run, the tests) are unchanged.
+#
+# - the workspace code (what we edit) is compiled incrementally, lightly optimised, in many
+#   code generation units, without debug information;
+# - the dependencies keep full optimisation and are built once.
+[profile.replay]
+inherits = "release"
+opt-level = 1
+debug = false
+incremental = true
+codegen-units = 256
+lto = "off"
+
+[profile.replay.package."*"]
+opt-level = 3
+codegen-units = 16
+
+# No linker setting: measured by agent V, rust-lld (shipped with the toolchain) links this binary no
+# faster than link.exe (0.8 - 1.4 s vs 0.9 s for a harness edit) once there is no debug information, and
+# changing the linker makes cargo rebuild the whole crate (30 s).
+
+# the same without any optimisation of the workspace code (measured by agent V: see S/HORS-JEU-vitesse.md)
+[profile.replay0]
+inherits = "replay"
+opt-level = 0
+
+[profile.replay0.package."*"]
+opt-level = 3
+codegen-units = 16
