@@ -708,11 +708,24 @@ pub unsafe fn local_title_image(res: usize, fps: &[D3D12_PLACED_SUBRESOURCE_FOOT
             Some(e) => (e, false),
             None => (t.shadowed.get(&res)?, true),
         };
-        (e.va, e.src.clone(), Arc::clone(&e.tex), format!("shadowed {shadowed} unmapped_tiles {} gpu_written {} placed {} pending {}", e.unmapped, e.gpu_written, e.placed, e.pending))
+        // the active textures over its memory (a shadowed one: the newer one that shadows it),
+        // where the first of them starts from its address (the other project's rule: a newer
+        // texture supersedes an older one only when it starts in its first 4 KiB)
+        let end = e.va + e.tex.size() as usize;
+        let over: Vec<(usize, usize, usize)> = t.active_overlaps(e.va, end).into_iter().filter(|o| o.1 != res).collect();
+        let first = over.iter().map(|o| o.0 as isize - e.va as isize).min_by_key(|d| d.unsigned_abs());
+        (e.va, e.src.clone(), Arc::clone(&e.tex), format!("shadowed {shadowed} overlaps {} first_over {} unmapped_tiles {} gpu_written {} placed {} pending {}", over.len(), first.map_or("none".to_string(), |d| format!("{d:+#x}")), e.unmapped, e.gpu_written, e.placed, e.pending))
     };
     let size = tex.size() as usize;
     let pages = source_by_pages(va, size);
-    let mut line = format!("tsrc now [{}] pages [{}] same_src {} {flags} vram_evicted {}", local_describe(&now, va, size), local_describe(&pages, va, size), now == pages, super::vram::is_evicted(res));
+    // stale: the memory XCL reads now differs from what its last upload sent (`LAST_CONTENT`):
+    // a write the watch did not report (the other project's "memory filled after the view")
+    let last = LAST_CONTENT.lock().unwrap().get(&res).copied();
+    let stale = match last {
+        None => "unknown".to_string(),
+        Some(h) => (content_hash(&now.bytes(0, size)) != h).to_string(),
+    };
+    let mut line = format!("tsrc now [{}] pages [{}] same_src {} {flags} vram_evicted {} stale {stale}", local_describe(&now, va, size), local_describe(&pages, va, size), now == pages, super::vram::is_evicted(res));
     let subs = subresources_of(&pages, &tex);
     if subs.len() != fps.len() || rows.len() != fps.len() {
         line += &format!(" title_img none (subresources {} footprints {})", subs.len(), fps.len());
@@ -1454,6 +1467,21 @@ unsafe fn subresources_on(picked: &[(&Source, &xg::Texture)], threads: usize) ->
 /// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
 /// as much as the detile of a video frame), else read page run by page run.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
+    // LOCAL (agent M): outside the coherent window (committed as a whole) a title thread may
+    // unmap or move a page while it is read here (`kernelx::move_away` decommits the old place;
+    // with #1102 textures read the pool pages the title remaps): copied with the fault-safe
+    // reader instead of borrowed after a `readable` look. `XCL_LOCAL_SAFE_TITLE_READ=0`: as before.
+    static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SAFE.get_or_init(|| std::env::var("XCL_LOCAL_SAFE_TITLE_READ").map_or(true, |v| v.trim() != "0"))
+        && !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len))
+    {
+        // (one ReadProcessMemory when all of it is there; pages that are not read as zeros)
+        let mut out = vec![0u8; len];
+        if at.checked_add(len).is_some() {
+            copy_committed_region(at, out.as_mut_ptr(), len);
+        }
+        return std::borrow::Cow::Owned(out);
+    }
     if crate::gpu::shader::readable(at, len) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
