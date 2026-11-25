@@ -1940,12 +1940,18 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
-    // LOCAL experiment (agent L's `XCL_LOCAL_EMPTYV_MIRROR`, ported by agent Z)
-    let mirror = if in_uma { None } else { super::rtsum::mirror_range(va as usize, size as usize, false, "CBV") };
-    if !in_uma && mirror.is_none() {
+    // #2384 (`XCL_GPU_VIEW_BUFFERS=1`) first, then the LOCAL experiment (agent L's `XCL_LOCAL_EMPTYV_MIRROR`, ported by agent Z) - merge by agent G
+    let mirrored = if in_uma { None } else { super::sparse::gpu_view::base_for(va as usize, size as usize) };
+    let mirror = if in_uma || mirrored.is_some() { None } else { super::rtsum::mirror_range(va as usize, size as usize, false, "CBV") };
+    if !in_uma && mirrored.is_none() && mirror.is_none() {
         note_buffer_view();
     }
-    let (va, size) = if in_uma { (va, size) } else if let Some(m) = mirror { (m as u64, size) } else { (0, 0) };
+    let (va, size) = match (mirrored, mirror) {
+        (Some(b), _) => (b as u64, size),
+        _ if in_uma => (va, size),
+        (None, Some(m)) => (m as u64, size),
+        (None, None) => (0, 0),
+    };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
 
@@ -2273,7 +2279,7 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         let va = atv_view(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false); // LOCAL (agent V, ported by agent Z)
-        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true); // (#2384: read-only views ask for a mirror)
         return super::console_heap::write(&slot, &words);
     }
     dev_create_srv_x(this, super::format_alias::placed_srv_resource(this, rdesc, va, v.Format.0 as u32), &v, cpu);
@@ -2292,7 +2298,7 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let va = atv_view(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true); // LOCAL (agent V, ported by agent Z)
-        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false);
         return super::console_heap::write(&slot, &words);
     }
     dev_create_uav_x(this, super::format_alias::placed_uav_resource(this, rdesc, va, v.Format.0 as u32), std::ptr::null_mut(), &v, cpu);
@@ -2444,7 +2450,8 @@ fn atv_summary_now(n: u64) {
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`.
-fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+/// (`read_only`: a view of a GPU view may get a readable address, `sparse::gpu_view`)
+fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool, read_only: bool) -> [u32; 4] {
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
     let (stride, elem) = match (raw, stride) {
         (true, _) => (0, 4),
@@ -2455,7 +2462,14 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         (false, s) => (s, s),
     };
     let records = if stride == 0 { n.saturating_mul(4) } else { n };
-    crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
+    let mut base = va + first * elem as u64;
+    if read_only {
+        let len = (n as u64).saturating_mul(elem as u64);
+        if let Some(b) = super::sparse::gpu_view::base_for(base as usize, len as usize) {
+            base = b as u64;
+        }
+    }
+    crate::gpu::desc::buffer_words(base, stride, records, fmt)
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {

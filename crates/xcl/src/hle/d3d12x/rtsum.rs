@@ -1343,6 +1343,9 @@ struct CopyPool {
     value: u64,
     blocked: u64,
     faults: u64,
+    /// LOCAL (agent G): distinct addresses not copied this frame (the need, unlike `full`, which counts binds)
+    refused: std::collections::HashSet<u64>,
+    refused_bytes: u64,
 }
 
 /// LOCAL (agent G): segments of the copy pool (`XCL_LOCAL_OOW_COPY_SEGS`, 4; 1 = the old behaviour,
@@ -1377,7 +1380,7 @@ unsafe fn oow_copy_reset(queue: *mut c_void, n: u64) {
     }
     if let Some(p) = COPY_POOL.lock().unwrap().as_mut() {
         if n % 60 == 0 || (p.full > 0 && n % 10 == 0) {
-            crate::xlog_info!("oow copy: frame {n}: {} root views copied ({} MB), {} reused, {} not copied (pool full), {} not copied (segment {} still in use by the GPU), {} copies faulted", p.copied, p.next >> 20, p.reused, p.full, p.blocked, p.seg, p.faults);
+            crate::xlog_info!("oow copy: frame {n}: {} root views copied ({} MB), {} reused, {} not copied (pool full), {} not copied (segment {} still in use by the GPU), {} copies faulted; {} distinct addresses not copied ({} MB at {} B each)", p.copied, p.next >> 20, p.reused, p.full, p.blocked, p.seg, p.faults, p.refused.len(), p.refused_bytes >> 20, copy_bytes());
         }
         let segs = copy_segs();
         if p.seg_fence.len() != segs {
@@ -1408,6 +1411,8 @@ unsafe fn oow_copy_reset(queue: *mut c_void, n: u64) {
         p.full = 0;
         p.blocked = 0;
         p.faults = 0;
+        p.refused.clear();
+        p.refused_bytes = 0;
     }
 }
 
@@ -1422,7 +1427,7 @@ pub unsafe fn oow_copy_root_views(layout: Option<&super::console_list::Layout>, 
     }
     let (Some(l), Some(u)) = (layout, crate::gpu::uma::get()) else { return 0 };
     let mut g = COPY_POOL.lock().unwrap();
-    let p = g.get_or_insert_with(|| CopyPool { base: 0, next: 0, map: HashMap::new(), copied: 0, reused: 0, full: 0, seg: 0, seg_fence: Vec::new(), fence: None, value: 0, blocked: 0, faults: 0 });
+    let p = g.get_or_insert_with(|| CopyPool { base: 0, next: 0, map: HashMap::new(), copied: 0, reused: 0, full: 0, seg: 0, seg_fence: Vec::new(), fence: None, value: 0, blocked: 0, faults: 0, refused: Default::default(), refused_bytes: 0 });
     // the pool: retried (256 / 128 / 64 MB) until the coherent window has room, at most once per frame
     if p.base == 0 && p.full == 0 {
         // LOCAL (agent G): `XCL_LOCAL_OOW_COPY_POOL_MB` (256): with segments, one frame gets pool / segments
@@ -1476,10 +1481,16 @@ pub unsafe fn oow_copy_root_views(layout: Option<&super::console_list::Layout>, 
             }
             if busy {
                 p.blocked += 1;
+                if p.refused.insert(a) {
+                    p.refused_bytes += len as u64;
+                }
                 continue;
             }
             if len < 0x1000 || p.next + len > seg_len {
                 p.full += 1;
+                if p.refused.insert(a) {
+                    p.refused_bytes += len as u64;
+                }
                 continue;
             }
             let dst = seg_base + p.next;

@@ -1145,6 +1145,19 @@ mod shader_cache_tests {
         assert!(base.starts_with(dir.join("translated").join("v2").join("000000000000002a")));
     }
 
+    /// LOCAL (agent G): the translated cache's identity of this build for each backend, and whether
+    /// `XCL_DXIL_CACHE` (or the default folder) holds a directory for it. Prints only.
+    #[test]
+    fn local_print_translated_identity() {
+        let dir = super::super::dxc::cache_dir();
+        for (name, b) in [("hlsl", translated::Backend::Hlsl), ("direct-compute", translated::Backend::DirectCompute), ("direct-all", translated::Backend::DirectAll)] {
+            let id = translated::identity_with(env!("XCL_TRANSLATOR_SOURCE_ID"), super::super::dxc::toolchain_identity(), b, crate::gpu::dxil::kernel::TRANSLATOR_VERSION);
+            let d = dir.join("translated").join("v2").join(format!("{id:016x}"));
+            let n = std::fs::read_dir(&d).map(|r| r.count()).unwrap_or(0);
+            println!("LOCALID {name} source {} identity {id:016x} dir {} entries {n}", env!("XCL_TRANSLATOR_SOURCE_ID"), d.display());
+        }
+    }
+
     /// A translation on disk comes back for the same bytes and semantic identity only: other
     /// bytes of the same length, another translator/toolchain or a cut file are misses.
     #[test]

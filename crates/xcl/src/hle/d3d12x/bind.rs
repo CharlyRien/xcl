@@ -298,7 +298,25 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
+    let va = readable_root(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
+}
+
+/// The address a root descriptor at `va` gets (`sparse::gpu_view`): a root descriptor has no
+/// size, so as much of the tile is taken as lies in the view. A read through it is in step with
+/// the title's memory, a write is not (a root UAV in a GPU view stays what it was before).
+fn readable_root(va: u64) -> u64 {
+    // LOCAL (agent G): `XCL_LOCAL_GPU_VIEW_ROOT_KB` (64): how much the mirror of a root view takes. A
+    // retail title's mesh shaders read their vertex streams from the root at offsets of ~0x2a740 and
+    // more (capture G1b), past the 64 KiB the PR maps: those reads found unmapped tiles
+    static ROOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let root = *ROOT.get_or_init(|| std::env::var("XCL_LOCAL_GPU_VIEW_ROOT_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&k| k >= 4).unwrap_or(64) << 10);
+    for len in [root, root / 4, 0x1_0000usize, 0x1000] {
+        if let Some(b) = super::sparse::gpu_view::base_for(va as usize, len) {
+            return b as u64;
+        }
+    }
+    va
 }
 
 /// `XCL_TRACE_ADDRESSES=1`: root descriptor addresses of console code – in unified memory
@@ -1601,6 +1619,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
+    let va = readable_root(va);
     put(this, i, 0, &va.to_le_bytes());
 }
 
