@@ -1244,8 +1244,21 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
 /// stride = element size, num_records in elements); empty when the buffer is not in UMA.
-fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
-    let Some((at, bytes)) = console_buffer(res) else {
+fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool, uav: bool) -> [u32; 4] {
+    // LOCAL experiment (agent L's `XCL_LOCAL_EMPTYV_MIRROR`, ported by agent Z): a mirror in the sparse windows instead of an empty V#
+    let mirrored = || -> Option<(usize, usize)> {
+        let va = title_address(res)?;
+        let r = res as *mut c_void;
+        let w = unsafe { ID3D12Resource::from_raw_borrowed(&r)?.GetDesc().Width } as usize;
+        unsafe { super::rtsum::mirror_range(va, w, uav, if uav { "UAV" } else { "SRV" }) }.map(|m| (m, w))
+    };
+    let Some((at, bytes)) = console_buffer(res).or_else(|| if super::rtsum::mirror_on() { mirrored() } else { None }) else {
+        if super::rtsum::mirror_on() {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!("emptyv mirror: buffer {res:#x} has no title address: empty V#");
+            }
+        }
         note_buffer_view();
         return [0; 4];
     };
@@ -1696,6 +1709,8 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::depth_uav::forget(this as usize);
+        super::format_alias::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -1925,10 +1940,12 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
-    if !in_uma {
+    // LOCAL experiment (agent L's `XCL_LOCAL_EMPTYV_MIRROR`, ported by agent Z)
+    let mirror = if in_uma { None } else { super::rtsum::mirror_range(va as usize, size as usize, false, "CBV") };
+    if !in_uma && mirror.is_none() {
         note_buffer_view();
     }
-    let (va, size) = if in_uma { (va, size) } else { (0, 0) };
+    let (va, size) = if in_uma { (va, size) } else if let Some(m) = mirror { (m as u64, size) } else { (0, 0) };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
 
@@ -2053,6 +2070,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
     super::rtsum::note_dsv(cpu as usize, res); // LOCAL
+    super::depth_uav::note_dsv(cpu as usize, res as usize);
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2185,7 +2203,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false)); // LOCAL: uav flag (agent Z)
     }
     let (format, dim, array, mips) = match desc.as_ref() {
         Some(v) => {
@@ -2239,33 +2257,6 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
-/// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
-/// per address and desc – titles make views of the same memory again and again.
-unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
-    if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
-        return std::ptr::null_mut();
-    }
-    // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
-    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    x[0x34..].fill(0);
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
-        return r as *mut c_void;
-    }
-    let mut r = std::ptr::null_mut();
-    let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
-    if hr < 0 || r.is_null() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 8 {
-            crate::xlog_warn!("D3D12.X: view at {va:#x}: the resource cannot be made ({hr:#x}); desc {x:02x?}");
-        }
-        r = std::ptr::null_mut();
-    }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
-    r
-}
-
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
 /// (resource desc, { the PC's SRV desc; GPU address @0x28; … }, destination).
 unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u8, view: *const u8, cpu: u64) {
@@ -2278,10 +2269,11 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        let va = atv_view(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, false); // LOCAL (agent V, ported by agent Z)
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+    dev_create_srv_x(this, super::format_alias::placed_srv_resource(this, rdesc, va, v.Format.0 as u32), &v, cpu);
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
@@ -2296,10 +2288,156 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        let va = atv_view(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true); // LOCAL (agent V, ported by agent Z)
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+    dev_create_uav_x(this, super::format_alias::placed_uav_resource(this, rdesc, va, v.Format.0 as u32), std::ptr::null_mut(), &v, cpu);
+}
+
+// ---- LOCAL (agent V, ported from S/w25 by agent Z): `XCL_LOCAL_ATV=1` census of #70 / #71 buffer views whose address is in a
+// GPU view (`kernelx::mirrors`); `XCL_LOCAL_ATV_MIRROR=1` experiment: such a view is given a mirror
+// in the sparse windows (`rtsum::mirror_range`, agent L's machinery; filled from the CPU view at
+// creation, SRV-only mirrors refilled at each present once rtsum runs) and its V# points there.
+// Caps: `XCL_LOCAL_ATV_VIEW_MB` (default 64) per view, `XCL_LOCAL_ATV_CAP_MB` (default 768) in all.
+#[derive(Default)]
+struct AtvStats {
+    count: u64,
+    bytes: u64,
+    srv: u64,
+    uav: u64,
+    zero: u64,
+    buckets: [u64; 6], // <=4K, <=64K, <=1M, <=16M, <=256M, more
+    top: Vec<(u64, u64, bool)>, // (len, base, uav), 10 largest
+    src_mapped: u64,
+    src_unmapped: u64,
+    src_cpu: u64,
+    committed: u64,
+    in_window: u64,
+    mirrored: u64,
+    mirrored_bytes: u64,
+    too_big: u64,
+    over_cap: u64,
+    refused: u64,
+    distinct: HashSet<(u64, u64)>,
+}
+
+static ATV: Mutex<Option<AtvStats>> = Mutex::new(None);
+
+fn atv_on() -> bool {
+    static W: OnceLock<bool> = OnceLock::new();
+    *W.get_or_init(|| std::env::var_os("XCL_LOCAL_ATV").is_some() || atv_mirror_on())
+}
+
+pub fn atv_mirror_on() -> bool {
+    static W: OnceLock<bool> = OnceLock::new();
+    *W.get_or_init(|| std::env::var_os("XCL_LOCAL_ATV_MIRROR").is_some())
+}
+
+fn atv_mb(name: &str, d: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d) << 20
+}
+
+/// LOCAL: census (and with the mirror switch, the mirror) of a #70 / #71 buffer view; returns the
+/// address to write in the V# (unchanged unless mirrored).
+fn atv_view(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool, uav: bool) -> u64 {
+    if !atv_on() {
+        return va;
+    }
+    let elem = match (raw, stride) {
+        (true, _) => 4,
+        (false, 0) => crate::gpu::desc::format_bytes(crate::gpu::desc::gfx10_format(format).unwrap_or(22)) as u64,
+        (false, s) => s as u64,
+    };
+    let base = va.wrapping_add(first.wrapping_mul(elem));
+    let len = n as u64 * elem;
+    if crate::hle::kernelx::mirrors::gpu_view_of(base as usize).is_none() {
+        return va;
+    }
+    let ms: Option<Option<usize>> = None; // LOCAL (agent Z): no #1055 page map in this tree, the source is the CPU view
+    let src = match ms {
+        Some(Some(a)) => Some(a),
+        Some(None) => None,
+        None => crate::hle::kernelx::mirrors::source(base as usize),
+    };
+    let committed = src.is_some_and(|s| crate::gpu::shader::readable(s, (len as usize).clamp(1, 0x1_0000)));
+    let in_window = src.is_some_and(|s| crate::gpu::uma::get().and_then(|u| u.window_of(s)).is_some());
+    let mut out = va;
+    let mut how = 0u8; // 0 not tried, 1 mirrored, 2 too big, 3 over cap, 4 refused
+    if atv_mirror_on() && len > 0 {
+        if len > atv_mb("XCL_LOCAL_ATV_VIEW_MB", 64) {
+            how = 2;
+        } else if super::rtsum::mirror_bytes() + len > atv_mb("XCL_LOCAL_ATV_CAP_MB", 768) {
+            how = 3;
+        } else {
+            match unsafe { super::rtsum::mirror_range(base as usize, len as usize, uav, if uav { "ATV UAV" } else { "ATV SRV" }) } {
+                Some(dst) if dst as u64 >= first.wrapping_mul(elem) => {
+                    out = dst as u64 - first * elem;
+                    how = 1;
+                }
+                _ => how = 4,
+            }
+        }
+    }
+    // LOCAL: the summary also 60 s after the first such view, then every 15 s (the run may end before rtsum starts)
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(60);
+    let el = T0.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    let due = el >= NEXT.load(Ordering::Relaxed);
+    if due {
+        NEXT.store(el + 15, Ordering::Relaxed);
+        atv_summary_now(el);
+    }
+    let mut g = ATV.lock().unwrap();
+    let s = g.get_or_insert_with(AtvStats::default);
+    s.count += 1;
+    if !s.distinct.insert((base, len)) {
+        // the same range again: only the count
+        match how { 1 => s.mirrored += 1, 2 => s.too_big += 1, 3 => s.over_cap += 1, 4 => s.refused += 1, _ => {} }
+        return out;
+    }
+    s.bytes += len;
+    if uav { s.uav += 1 } else { s.srv += 1 }
+    if len == 0 { s.zero += 1 }
+    let b = match len { 0..=0x1000 => 0, ..=0x1_0000 => 1, ..=0x10_0000 => 2, ..=0x100_0000 => 3, ..=0x1000_0000 => 4, _ => 5 };
+    s.buckets[b] += 1;
+    s.top.push((len, base, uav));
+    s.top.sort_by(|a, b| b.0.cmp(&a.0));
+    s.top.truncate(10);
+    match ms { Some(Some(_)) => s.src_mapped += 1, Some(None) => s.src_unmapped += 1, None => s.src_cpu += 1 }
+    if committed { s.committed += 1 }
+    if in_window { s.in_window += 1 }
+    match how { 1 => { s.mirrored += 1; s.mirrored_bytes += len } 2 => s.too_big += 1, 3 => s.over_cap += 1, 4 => s.refused += 1, _ => {} }
+    if s.distinct.len() <= 8 {
+        crate::xlog_info!("LOCAL atv: {} at {va:#x} first {first} n {n} elem {elem} -> range {base:#x}+{len:#x}, source {src:x?} ({}), committed {committed}, in window {in_window}, V# address {out:#x}", if uav { "UAV" } else { "SRV" }, match ms { Some(Some(_)) => "page map", Some(None) => "unmapped by page map", None => "CPU view" });
+    }
+    out
+}
+
+/// LOCAL: the census summary (from `rtsum::on_present`, i.e. after `XCL_LOCAL_RTSUM_AFTER_S`).
+pub fn atv_summary(n: u64) {
+    static FIRST: AtomicBool = AtomicBool::new(true);
+    if !atv_on() || !(FIRST.swap(false, Ordering::Relaxed) || n % 300 == 0) {
+        return;
+    }
+    atv_summary_now(n);
+}
+
+/// LOCAL: prints the census summary (`n`: frame, or seconds since the first view).
+fn atv_summary_now(n: u64) {
+    let g = ATV.lock().unwrap();
+    let Some(s) = g.as_ref() else {
+        crate::xlog_info!("LOCAL atv summary frame {n}: no #70/#71 buffer view in a GPU view");
+        return;
+    };
+    let top: Vec<String> = s.top.iter().map(|(l, b, u)| format!("{l:#x}@{b:#x}{}", if *u { "U" } else { "S" })).collect();
+    crate::xlog_info!(
+        "LOCAL atv summary frame {n}: calls {}, distinct ranges {} ({} MB; SRV {}, UAV {}; empty {}); sizes <=4K {} <=64K {} <=1M {} <=16M {} <=256M {} more {}; source: page map {}, unmapped {}, CPU view {}; source committed {}, source in a window {}; mirror on {}: mirrored {} ({} MB new ranges), too big {}, over cap {}, refused {}; largest [{}]",
+        s.count, s.distinct.len(), s.bytes >> 20, s.srv, s.uav, s.zero,
+        s.buckets[0], s.buckets[1], s.buckets[2], s.buckets[3], s.buckets[4], s.buckets[5],
+        s.src_mapped, s.src_unmapped, s.src_cpu, s.committed, s.in_window,
+        atv_mirror_on(), s.mirrored, s.mirrored_bytes >> 20, s.too_big, s.over_cap, s.refused, top.join(", ")
+    );
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`.
@@ -2318,27 +2456,35 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    let orig_desc = desc.as_ref().copied();
+    // Route depth+UAV textures (`ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS`) to their
+    // writable color twin so compute writes land on a real UAV instead of a null view.
+    let depth_twin = super::depth_uav::resolve_uav(this, res, orig_desc.as_ref());
     // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8,
     // `device_x::pc_resource_desc`: an invalid call, the device removed)
-    let mut copy = desc.as_ref().copied();
-    if let (Some(c), Some(r)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
-        let rf = r.GetDesc().Format.0 as u32;
-        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+    let mut copy = orig_desc;
+    if depth_twin.is_none() {
+        if let (Some(c), Some(r)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
+            let rf = r.GetDesc().Format.0 as u32;
+            c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+        }
     }
-    let desc = copy.as_ref().map_or(desc, |c| c as *const _);
+    let (uav_res, uav_desc) = match &depth_twin {
+        Some((twin_res, patched)) => (*twin_res, patched as *const D3D12_UNORDERED_ACCESS_VIEW_DESC),
+        None => (res, copy.as_ref().map_or(desc, |c| c as *const _)),
+    };
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     if super::present::trace_frame() {
         let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
         if d.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
             let s = super::console_heap::slot(cpu);
-            crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
+            crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), uav_desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
         }
     }
-    // a resource without ALLOW_UNORDERED_ACCESS (a console depth buffer that also had it: the PC
-    // refuses the pair, `device_x::pc_resource_desc`): a null view – a UAV of it is an invalid
-    // call, and the device is removed (0x887A0001)
-    let no_uav = ID3D12Resource::from_raw_borrowed(&res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
+    // a resource without ALLOW_UNORDERED_ACCESS (a console depth buffer without a twin or
+    // another non-UAV resource): a null view – a UAV of it is an invalid call (0x887A0001)
+    let no_uav = ID3D12Resource::from_raw_borrowed(&uav_res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
     let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
     let pc_uav = |at: u64| {
         if no_uav {
@@ -2347,26 +2493,37 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
             }
             super::rtsum::count(super::rtsum::NULL_DEPTH_UAV); // LOCAL
+            // LOCAL agent G: which resource / view (XCL_LOCAL_DEPTHUAV_LOG=1)
+            static G: AtomicU64 = AtomicU64::new(0);
+            let rd = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+            if std::env::var_os("XCL_LOCAL_DEPTHUAV_LOG").is_some() && rd.is_some_and(|d| d.Width >= 1920) && G.fetch_add(1, Ordering::Relaxed) < 200 {
+                let gva = ID3D12Resource::from_raw_borrowed(&res).map_or(0, |r| r.GetGPUVirtualAddress());
+                crate::xlog_info!(
+                    "LOCAL depthuav: null UAV of {res:p} (w, h, array, pc format, flags) {:?} gpu va {gva:#x} at {at:#x}: view (format, dim) {:?}",
+                    rd.map(|d| (d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.Flags.0)),
+                    desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0))
+                );
+            }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
-            f(this, res, counter, desc, at)
+            f(this, uav_res, counter, uav_desc, at)
         }
     };
     let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
-    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&uav_res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
     let rd = r.GetDesc();
-    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+    if let Some(v) = uav_desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, true)); // LOCAL: uav flag (agent Z)
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
-    let (format, dim, array, mip) = match desc.as_ref() {
+    let (format, dim, array, mip) = match uav_desc.as_ref() {
         Some(v) => {
             let a = &v.Anonymous;
             let (array, mip) = match v.ViewDimension.0 {
@@ -2385,10 +2542,12 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);
     };
-    // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
+    // RDNA images have no SRV / UAV distinction: console shaders may read this slot too.
+    // Use `uav_res` / `uav_desc` so Depth+UAV routed slots pair their SRV against the color twin.
     if dim == 4 {
+        let srv_fmt = uav_desc.as_ref().map_or(format, |v| v.Format);
         let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { format },
+            Format: if srv_fmt == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { srv_fmt },
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
@@ -2397,7 +2556,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             srv = v;
         }
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
-        g(this, res, &srv, slot.pc_srv);
+        g(this, uav_res, &srv, slot.pc_srv);
         super::console_heap::publish(&slot, false);
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
@@ -2496,7 +2655,8 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // not placed in unified memory (e.g. its coherent window kept for readback heaps): a PC
     // resource of the PC's description – the console's flag bits (0x1000000, 0x300000 …) and
     // alignments made the PC refuse Fortnite's 3264x1836 scene targets (E_INVALIDARG, a crash)
-    let pc_full = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38)).then(|| super::device_x::pc_resource_desc(&(console_desc as *const [u8; 0x38]).read_unaligned()));
+    let console_raw = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38)).then(|| (console_desc as *const [u8; 0x38]).read_unaligned());
+    let pc_full = console_raw.as_ref().map(super::device_x::pc_resource_desc);
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
@@ -2504,6 +2664,11 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // buffer the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV
     let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| super::device_x::pc_initial_state(u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()), state as u32));
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(ref raw_x) = console_raw {
+            super::depth_uav::register_if_depth_uav(this, *ppv, raw_x, st, state as u32);
+        }
+    }
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
@@ -2979,6 +3144,71 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
 /// `XCL_DEBUG_NO_STENCIL` / `XCL_DEBUG_NO_CULL` `=hash,…` (pixel shader dump hashes, hex):
 /// pipelines with those pixel shaders draw without their stencil test / culling – diagnostics
 /// for draws the fixed-function stages reject.
+/// LOCAL agent G: `XCL_LOCAL_PSOLOG=<vs hex prefixes>` logs the depth / stencil / blend state of
+/// every translated graphics PSO whose VS matches; `XCL_LOCAL_TL_NODEPTH=<vs hex prefixes>` turns
+/// off the depth and stencil tests of those PSOs (diagnostic for tiled lighting against a second
+/// depth buffer the title fills with a compute UAV, which XCL makes a null view).
+fn local_vs_match(var: &str, vs: u64) -> bool {
+    let h = format!("{vs:016x}");
+    std::env::var(var).is_ok_and(|v| v.split(',').map(str::trim).any(|p| !p.is_empty() && h.starts_with(p)))
+}
+
+fn local_pso_state(vs: u64, ps: u64, c: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!(
+            "LOCAL agentG w26: PSOLOG {:?} TL_NODEPTH {:?} DEPTHUAV_LOG {:?}",
+            std::env::var("XCL_LOCAL_PSOLOG").ok(),
+            std::env::var("XCL_LOCAL_TL_NODEPTH").ok(),
+            std::env::var("XCL_LOCAL_DEPTHUAV_LOG").ok()
+        );
+    });
+    if local_vs_match("XCL_LOCAL_PSOLOG", vs) && LOGGED.fetch_add(1, Ordering::Relaxed) < 600 {
+        let z = &c.DepthStencilState;
+        let b = &c.BlendState.RenderTarget;
+        let st = |o: &D3D12_DEPTH_STENCILOP_DESC| (o.StencilFunc.0, o.StencilPassOp.0, o.StencilFailOp.0, o.StencilDepthFailOp.0);
+        crate::xlog_info!(
+            "LOCAL psolog: vs {vs:016x} ps {ps:016x}: RTs {:?} DSV {} depth (enable {}, write {}, func {}) stencil {} (read {:#x} write {:#x} front {:?} back {:?}) blend0 ({}, {} {} {}, a {} {} {}, mask {:#x}) blend1 ({}, {} {} {}, mask {:#x}) indep {} cull {} depth clip {}",
+            &c.RTVFormats[..c.NumRenderTargets.min(8) as usize].iter().map(|f| f.0).collect::<Vec<_>>(),
+            c.DSVFormat.0,
+            z.DepthEnable.as_bool(),
+            z.DepthWriteMask.0,
+            z.DepthFunc.0,
+            z.StencilEnable.as_bool(),
+            z.StencilReadMask,
+            z.StencilWriteMask,
+            st(&z.FrontFace),
+            st(&z.BackFace),
+            b[0].BlendEnable.as_bool(),
+            b[0].SrcBlend.0,
+            b[0].DestBlend.0,
+            b[0].BlendOp.0,
+            b[0].SrcBlendAlpha.0,
+            b[0].DestBlendAlpha.0,
+            b[0].BlendOpAlpha.0,
+            b[0].RenderTargetWriteMask,
+            b[1].BlendEnable.as_bool(),
+            b[1].SrcBlend.0,
+            b[1].DestBlend.0,
+            b[1].BlendOp.0,
+            b[1].RenderTargetWriteMask,
+            c.BlendState.IndependentBlendEnable.as_bool(),
+            c.RasterizerState.CullMode.0,
+            c.RasterizerState.DepthClipEnable.as_bool()
+        );
+    }
+    if local_vs_match("XCL_LOCAL_TL_NODEPTH", vs) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 600 {
+            crate::xlog_info!("LOCAL tl-nodepth: vs {vs:016x} ps {ps:016x}: depth test (func {}) and stencil ({}) turned off", c.DepthStencilState.DepthFunc.0, c.DepthStencilState.StencilEnable.as_bool());
+        }
+        c.DepthStencilState.DepthEnable = false.into();
+        c.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        c.DepthStencilState.StencilEnable = false.into();
+    }
+}
+
 fn debug_pso_switch(var: &str, ps: u64) -> bool {
     ps != 0 && std::env::var(var).is_ok_and(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).any(|h| h == ps))
 }
@@ -4335,6 +4565,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    local_pso_state(crate::gpu::shader::fnv64(vs), ps_hash, &mut copy); // LOCAL agent G
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let hr = driver_compile("graphics", bytes, true, || retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)));
     if hr < 0 {
@@ -4349,6 +4580,12 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    {
+        // LOCAL agent I: does this pipeline write depth or stencil (copy at use, `depth_uav`)
+        let z = &copy.DepthStencilState;
+        let writes = (z.DepthEnable.as_bool() && z.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO) || (z.StencilEnable.as_bool() && z.StencilWriteMask != 0);
+        super::depth_uav::local_note_pso_ds_write(*ppv as usize, writes);
+    }
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
@@ -5673,11 +5910,15 @@ unsafe extern "system" fn cl_clear_uav_float(this: *mut c_void, gpu: u64, cpu: u
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
+    if !dsv.is_null() {
+        super::depth_uav::before_bind_dsv(this, *dsv);
+    }
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     super::rtsum::bind(this, n, rtvs, single, dsv); // LOCAL
+    super::depth_uav::local_raster_check(this, super::bind::tracked_pso(this)); // LOCAL agent I
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {

@@ -214,6 +214,14 @@ pub mod mirrors {
         let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
         (va < gpu + size).then(|| cpu + (va - gpu))
     }
+
+    /// LOCAL (agent Z, from agent T's w25 helper): whether `va` lies in a GPU view; its base,
+    /// size and CPU view.
+    pub fn gpu_view_of(va: usize) -> Option<(usize, usize, usize)> {
+        let s = STATE.lock().unwrap();
+        let (&g, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
+        (va < g + size).then_some((g, size, cpu))
+    }
 }
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified

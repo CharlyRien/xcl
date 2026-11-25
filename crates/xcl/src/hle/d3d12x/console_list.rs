@@ -97,6 +97,7 @@ const FIRST_SGPR_GFX: usize = 8;
 /// the SRV's 64-bit address from s[18:19]; with s16 they got the second table and a pair
 /// (third table, SRV low half) as the address, and wrote one vertex and one primitive per
 /// group). Upstream #724 took s16 without a measurement.
+#[allow(dead_code)] // LOCAL (agent U): replaced by `first_sgpr_ms`
 const FIRST_SGPR_MS: usize = 15;
 /// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
 /// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
@@ -190,8 +191,19 @@ pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
 }
 
+/// LOCAL (agent U): first SGPR of the mesh root arguments, `XCL_LOCAL_MS_FIRST=15|16` (default 16:
+/// every NGG stage's root layout table in the title's shader pack puts slot 0 at user-data dword 8 = s16;
+/// 15 is agent N's experiment, kept selectable for an A/B from one binary).
+pub fn first_sgpr_ms() -> usize {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *F.get_or_init(|| match std::env::var("XCL_LOCAL_MS_FIRST").ok().as_deref() {
+        Some("15") => 15,
+        _ => 16,
+    })
+}
+
 pub fn user_data_ms(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
-    let mut s = vec![0u32; FIRST_SGPR_MS];
+    let mut s = vec![0u32; first_sgpr_ms()]; // LOCAL (agent U): was FIRST_SGPR_MS
     s[8] = table_at as u32;
     s[9] = (table_at >> 32) as u32;
     let inline = &args[..(l.inline_ms as usize).min(args.len())];
@@ -1138,7 +1150,9 @@ mod tests {
     }
 
     #[test]
-    fn mesh_arguments_go_in_user_sgprs_from_s15() {
+    // LOCAL (agent U): back to s16 (the default of `first_sgpr_ms`, no XCL_LOCAL_MS_FIRST in tests) and the
+    // heap bases after the arguments, as the title's NGG root layout tables state for the 5-slot mesh layout
+    fn mesh_arguments_go_in_user_sgprs_from_s16() {
         let inline = |p: &[(u32, u32)]| layout_from_blob(&rts0(p)).unwrap().inline_ms;
         assert_eq!(inline(&[(1, 2), (2, 0), (0, 0)]), 20);
         assert_eq!(inline(&[(1, 14), (2, 0)]), 64);
@@ -1149,13 +1163,15 @@ mod tests {
         let got = user_data_ms(&l, &args, 0x7_0000_0200);
         assert_eq!(got[8], 0x200);
         assert_eq!(got[9], 7);
-        assert_eq!(&got[15..], &[1, 2, 0x5000, 4, 0x80]);
-        // the retail title's mesh root signature: three tables, an SRV, two constants – its MS
-        // programs take the third table from s17 and the SRV's address from s[18:19]
-        let l = layout_from_blob(&rts0(&[(0, 0), (0, 0), (0, 0), (3, 0), (1, 2)])).unwrap();
+        assert_eq!(&got[16..], &[1, 2, 0x5000, 4, 0x80]);
+        // the title's 5-slot mesh root signature [t, t, t, root SRV, 2 constants] with both heap flags:
+        // console table: s16 t0, s17 t4, s18 t8, s[19:20] SRV, s21:22 constants, s23 view heap, s24 sampler heap
+        let mut b = rts0(&[(0, 0), (0, 0), (0, 0), (3, 0), (1, 2)]);
+        b[20..24].copy_from_slice(&(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED).to_le_bytes());
+        let l = layout_from_blob(&b).unwrap();
+        assert_eq!(l.heaps, [true, true]);
         let args: Vec<u8> = [0x100u32, 0x120, 0x140, 0x5000, 7, 1, 2].iter().flat_map(|w| w.to_le_bytes()).collect();
-        let got = user_data_ms(&l, &args, 0);
-        assert_eq!(got[17], 0x140, "third table");
-        assert_eq!(&got[18..20], &[0x5000, 7], "SRV address");
+        let got = with_heaps(&l, None, user_data_ms(&l, &args, 0), [0xAAA0_0000, 0xBBB0_0000]);
+        assert_eq!(&got[16..25], &[0x100, 0x120, 0x140, 0x5000, 7, 1, 2, 0xAAA0_0000, 0xBBB0_0000]);
     }
 }

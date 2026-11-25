@@ -418,6 +418,7 @@ pub fn note_resource(s: &Slot, res: usize) {
     if s.sampler || !super::present::trace_frame() {
         return;
     }
+    note_index(s, res); // LOCAL (agent Z)
     let mut g = RES.lock().unwrap();
     let m = g.get_or_insert_with(Default::default);
     if res == 0 {
@@ -425,6 +426,33 @@ pub fn note_resource(s: &Slot, res: usize) {
     } else {
         m.insert(s.at, res);
     }
+}
+
+/// LOCAL (agent Z): PC (shared) heap index of a view -> the resource it names (the SRV at
+/// `index`, the UAV at `index + 1`), so that a T# copied by the title as memory can be named.
+static IDX: Mutex<Option<std::collections::HashMap<u32, (usize, bool)>>> = Mutex::new(None);
+
+/// LOCAL (agent Z): see `IDX`; recorded with `note_resource` (`XCL_TRACE_FRAME`).
+fn note_index(s: &Slot, res: usize) {
+    let mut g = IDX.lock().unwrap();
+    let m = g.get_or_insert_with(Default::default);
+    for (i, uav) in [(s.index, false), (s.index + 1, true)] {
+        if res == 0 {
+            m.remove(&i);
+        } else {
+            m.insert(i, (res, uav));
+        }
+    }
+}
+
+/// LOCAL (agent Z): the resource a T#'s PC heap index names.
+pub fn resource_of_index(i: u32) -> Option<usize> {
+    IDX.lock().unwrap().as_ref()?.get(&i).map(|v| v.0)
+}
+
+/// LOCAL (agent Z): whether a T#'s PC heap index is the UAV of its view slot (None: unknown).
+pub fn index_is_uav(i: u32) -> Option<bool> {
+    IDX.lock().unwrap().as_ref()?.get(&i).map(|v| v.1)
 }
 
 /// The resource of the view slot at UMA address `at`.

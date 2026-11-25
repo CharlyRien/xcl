@@ -29,6 +29,8 @@ struct State {
     /// the title's graphics root signature (a PC object), bound before a draw with an
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
+    /// the title's compute root signature (a PC object), preserved for internal-pass restoration
+    rs_cs: usize,
     pso: usize,
     /// 32-bit addresses of the view heap and the sampler heap set (0: none)
     heaps: [u32; 2],
@@ -147,6 +149,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.rs_cs = 0;
         s.heaps = [0; 2];
         // (the scratch blocks are in `res_retired` already)
         (s.scratch, s.scratch_used, s.scratch_taken) = (None, 0, 0);
@@ -171,6 +174,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.args_gfx.clear();
         s.rs_gfx = 0;
         s.heaps = [0; 2];
+        s.rs_cs = 0;
     });
 }
 
@@ -178,8 +182,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.heaps)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, rs_cs, pso, heaps) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.rs_cs, s.pso, s.heaps)
     });
     let allocator = recording_allocator(to, allocator);
     let (old, blocks) = with(to, |s| {
@@ -190,6 +194,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.layout_gfx = layout_gfx;
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
+        s.rs_cs = rs_cs;
         s.pso = pso;
         s.heaps = heaps;
         (old, std::mem::take(&mut s.uma))
@@ -549,9 +554,33 @@ fn two_pass_io(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass
     two_pass_io_heaps(layout, args, table_at, compute_pass, uma_base, [0; 2])
 }
 
+/// LOCAL (agent U): `XCL_LOCAL_MS_HEAPS` (see `two_pass_io_heaps`), logged once with `XCL_LOCAL_MS_FIRST`.
+fn local_ms_heaps_mode() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        let m = match std::env::var("XCL_LOCAL_MS_HEAPS").ok().as_deref() {
+            Some("0") => 0,
+            Some("2") => 2,
+            _ => 1,
+        };
+        crate::xlog_info!("LOCAL agentU: mesh compute pass root arguments from s{}, heap bases mode {} (XCL_LOCAL_MS_FIRST / XCL_LOCAL_MS_HEAPS)", console_list::first_sgpr_ms(), m);
+        m
+    })
+}
+
 fn two_pass_io_heaps(layout: Option<&Layout>, args: &[u8], table_at: u64, compute_pass: bool, uma_base: usize, heaps: [u32; 2]) -> Vec<u32> {
     let mut io = match layout {
-        Some(l) if compute_pass => console_list::with_heaps(l, None, console_list::user_data_ms(l, args, table_at), heaps),
+        // LOCAL (agent U): `XCL_LOCAL_MS_HEAPS=0|1|2` for the mesh compute pass: 0 no heap bases, 1 (default)
+        // #1803's rule (after the arguments, from the root signature's flags), 2 both bases whatever the flags
+        Some(l) if compute_pass => match local_ms_heaps_mode() {
+            0 => console_list::user_data_ms(l, args, table_at),
+            2 => {
+                let mut v = console_list::user_data_ms(l, args, table_at);
+                v.extend(heaps);
+                v
+            }
+            _ => console_list::with_heaps(l, None, console_list::user_data_ms(l, args, table_at), heaps),
+        },
         Some(l) => console_list::with_heaps(l, None, console_list::user_data_gfx(l, args, table_at), heaps),
         None if compute_pass => {
             let mut v = vec![0u32; 16];
@@ -577,7 +606,11 @@ unsafe fn bind_two_pass_stage(
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
+    let (layout, mut args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps)); // LOCAL: mut (agent Z)
+    // LOCAL (agent Z): agent L's root-view copies / scratch and out-of-window scan for the two-pass mesh stages too
+    super::rtsum::oow_copy_root_views(layout.as_deref(), &mut args);
+    super::rtsum::oow_scratch_root_views(layout.as_deref(), &mut args);
+    super::rtsum::oow_scan(with(this, |s| s.pso), !compute_pass, layout.as_deref(), &args);
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
@@ -592,6 +625,26 @@ unsafe fn bind_two_pass_stage(
     let io = two_pass_io_heaps(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
     // LOCAL (agent N): `XCL_LOCAL_MS_CPU=N`: the first N two-pass compute binds log what the CPU view of
     // unified memory holds now (record time) where the retail MS reads its counts (see `local_ms_probe`)
+    // LOCAL (agent U): how many mesh compute binds have the view-heap flag and a nonzero view-heap base
+    if compute_pass {
+        static B: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        let n = B[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if layout.as_ref().is_some_and(|l| l.heaps[0]) {
+            B[1].fetch_add(1, Ordering::Relaxed);
+        }
+        if heaps[0] != 0 {
+            B[2].fetch_add(1, Ordering::Relaxed);
+        }
+        if [1, 10, 100, 1000, 10000, 100000, 1000000].contains(&n) {
+            crate::xlog_info!(
+                "LOCAL agentU ms binds: {} binds, {} with the view-heap flag, {} with a nonzero view-heap base (passed: mode {})",
+                n,
+                B[1].load(Ordering::Relaxed),
+                B[2].load(Ordering::Relaxed),
+                local_ms_heaps_mode()
+            );
+        }
+    }
     if compute_pass {
         static N: AtomicU64 = AtomicU64::new(0);
         static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -623,6 +676,15 @@ unsafe fn bind_two_pass_stage(
                 layout.as_ref().map(|l| l.inline_ms),
                 params,
                 aw
+            );
+            // LOCAL (agent U): the heap flags of the layout, the list's heap bases and what s15..s25 hold
+            crate::xlog_info!(
+                "LOCAL agentU ms sgprs: first s{} mode {} flags {:?} list heaps {:x?} s15..s25 {:x?}",
+                console_list::first_sgpr_ms(),
+                local_ms_heaps_mode(),
+                layout.as_ref().map(|l| l.heaps),
+                heaps,
+                &io[15..26]
             );
         }
     }
@@ -866,7 +928,30 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // where the commands are in unified memory (a console buffer's offsets are the title's)
     let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
     let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
-    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    // LOCAL (agent Z, `XCL_LOCAL_EI_NO_DELTA=1`): a buffer placed below its console address gets
+    // `buffer_delta` added to offsets; a retail title's ExecuteIndirect passes an offset into such
+    // a buffer that equals that delta and lies past the buffer's console size (args 0x87d0 into a
+    // 0x780-byte buffer placed 0x87d0 above its 64 KiB start): with the delta added the PC call
+    // reads past the resource. With the switch, an offset that only fits WITHOUT the delta is
+    // taken as relative to the resource start.
+    let local_off = |res: usize, off: u64, need: u64| -> u64 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let d = super::real::buffer_delta(res);
+        if d == 0 || !*ON.get_or_init(|| std::env::var_os("XCL_LOCAL_EI_NO_DELTA").is_some()) {
+            return off + d;
+        }
+        let width = { let raw = res as *mut c_void; ID3D12Resource::from_raw_borrowed(&raw).map_or(0, |r| r.GetDesc().Width) };
+        if off + d + need > width && off + need <= width {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_info!("LOCAL ei-no-delta: buffer {res:#x} width {width:#x} offset {off:#x} delta {d:#x}: read at {off:#x}, not {:#x}", off + d);
+            }
+            return off;
+        }
+        off + d
+    };
+    let ei_stride = super::rtsum::stride_of(sig) as u64;
+    let (args_off, count_off) = (local_off(args, args_off, (max.max(1) as u64) * ei_stride.max(4)), if count_buf == 0 { count_off } else { local_off(count_buf, count_off, 4) });
     if let Some(tp) = super::real::two_pass_of(pso) {
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
@@ -994,6 +1079,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if !gfx {
+        super::depth_uav::local_before_dispatch(this); // LOCAL agent I
+    }
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
@@ -1002,6 +1090,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
             super::rtsum::after_indirect(this, sig, max, args, args_off, count_buf, count_off, gfx, with(this, |s| s.pso)); // LOCAL
+            if !gfx {
+                super::depth_uav::local_after_dispatch(this, raw_pso); // LOCAL agent I (the title's handle)
+            }
             super::culprit::end(this, mark)
         }
         Err(e) => {
@@ -1475,6 +1566,7 @@ pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_voi
     with(this, |s| {
         s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout = layout;
+        s.rs_cs = rs as usize;
     });
 }
 
@@ -1507,6 +1599,7 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     with(this, |s| s.pso = pso as usize);
     super::real::bind_pipeline(this, pso);
+    super::depth_uav::local_raster_check(this, pso as usize); // LOCAL agent I
 }
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
@@ -1525,8 +1618,10 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         super::culprit::skipped(this, || super::culprit::compute_op("Dispatch", with(this, |s| s.pso), pso, [x, y, z]));
         return;
     }
+    super::depth_uav::local_before_dispatch(this); // LOCAL agent I
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => {
+            super::depth_uav::local_after_dispatch(this, with(this, |s| s.pso)); // LOCAL agent I (the title's handle)
             count(DISPATCHES);
             super::rtsum::count(super::rtsum::DISPATCH_TR); // LOCAL
         }
@@ -1618,6 +1713,400 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
     crate::xlog_info!("frame trace: … its indices name: {}", if res.is_empty() { "nothing".to_string() } else { res.join("; ") });
 }
 
+/// LOCAL (agent Z, `XCL_LOCAL_FSTRACE`): a translated direct dispatch of at least 30x17 groups in
+/// a traced frame: its shader, groups, root constants, root buffers (inside a window or not), and
+/// the resources its tables name – slots 0..15 of each table and every small value of its
+/// constants / root buffers used as an index into each table – with their title addresses and
+/// whether they are render targets of this frame. Textures are dumped at the next present.
+unsafe fn local_fs_trace(this: *mut c_void, groups: [u32; 3]) {
+    if groups[0] < 30 || groups[1] < 17 {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args, title_pso) = with(this, |s| (s.layout.clone(), s.args.clone(), s.pso));
+    let Some(layout) = layout else { return };
+    let seq = super::rtsum::fs_seq();
+    let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let mut tables: Vec<u32> = Vec::new();
+    let mut values: Vec<u32> = Vec::new();
+    let mut what: Vec<String> = Vec::new();
+    for (i, p) in layout.params.iter().enumerate() {
+        match *p {
+            Param::Constants { at, count } => {
+                let w: Vec<u32> = (0..count as usize).filter_map(|k| word(at as usize + 4 * k)).collect();
+                what.push(format!("p{i} constants {w:x?}"));
+                values.extend(&w);
+            }
+            Param::Descriptor { at } => {
+                let va = (word(at as usize).unwrap_or(0) as u64 | (word(at as usize + 4).unwrap_or(0) as u64) << 32) as usize;
+                let win = if (va >> 32) == 0 { Some(0) } else { u.window_of(va) };
+                let cpu = crate::hle::kernelx::mirrors::source(va).unwrap_or(va);
+                let p = if (va >> 32) == 0 { u.window(0).0 + va } else { cpu };
+                let n = 32usize;
+                let w: Vec<u32> = if va != 0 && crate::gpu::shader::readable(p, 4 * n) { (0..n).map(|k| ((p + 4 * k) as *const u32).read_unaligned()).collect() } else { Vec::new() };
+                what.push(format!("p{i} buffer {va:#x} window {win:?}{} cpu {w:x?}", if cpu != va { format!(" (GPU view of {cpu:#x})") } else { String::new() }));
+                values.extend(&w);
+            }
+            Param::Table { at } => {
+                let v = word(at as usize).unwrap_or(0);
+                what.push(format!("p{i} table {v:#x}"));
+                tables.push(v);
+            }
+        }
+    }
+    // the first 24 slots of each table as words (LOCAL: 8 before z9): null / image (PC index, the resource of that slot or
+    // of the view heap's slot of that index) / buffer (address, window)
+    let mut slots: Vec<String> = Vec::new();
+    for &t in &tables {
+        for k in 0..24u32 {
+            let Some(w) = super::console_heap::words_at(t + 32 * k) else { continue };
+            let s = if w.iter().all(|&v| v == 0) {
+                "null".to_string()
+            } else if w[3] >> 28 >= 8 {
+                let r = super::console_heap::resource_at(u.base() + t as usize + 32 * k as usize).or_else(|| super::console_heap::resource_of_index(w[0]));
+                if let Some(r) = r {
+                    // LOCAL: full-size / half-size images, 1x1 images (exposure-like), big shadow-map-like ones
+                    if std::env::var_os("XCL_LOCAL_FS_NODUMP").is_none() && desc(r).is_some_and(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && ((d.Width >= 1280 && d.Height >= 720) || (d.Width <= 4 && d.Height <= 4) || (d.Width <= 64 && d.Height <= 64 && matches!(d.Format.0, 10 | 16 | 41 | 54)) || (d.Format.0 == 53 && d.Width >= 1024))) {
+                        super::rtsum::fs_note(r);
+                    }
+                }
+                format!(
+                    "image{} idx {} -> {:x?} {:?}{}",
+                    match super::console_heap::index_is_uav(w[0]) { Some(true) => " UAV", Some(false) => " SRV", None => "" },
+                    w[0],
+                    r,
+                    r.and_then(desc).map(|d| (d.Width, d.Height, d.Format.0)),
+                    if r.is_some_and(super::rtsum::fs_is_target) { " TARGET" } else { "" }
+                )
+            } else {
+                let a = w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32;
+                format!("buffer {a:#x} window {:?} records {:#x}", if (a >> 32) == 0 { Some(0) } else { u.window_of(a as usize) }, w[2])
+            };
+            slots.push(format!("t{t:#x}[{k}] {s}"));
+        }
+    }
+    crate::xlog_info!("fstrace: #{seq} slots: {}", slots.join(" | "));
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for &t in &tables {
+        for k in 0..16u32 {
+            if let Some(r) = super::console_heap::resource_at(u.base() + t as usize + 32 * k as usize) {
+                if !found.iter().any(|x| x.1 == r) {
+                    found.push((format!("t{t:#x}[{k}]"), r));
+                }
+            }
+        }
+    }
+    for &v in &values {
+        if v >= 1 << 20 {
+            continue;
+        }
+        for &t in &tables {
+            if let Some(r) = super::console_heap::resource_at(u.base() + t as usize + 32 * v as usize) {
+                if !found.iter().any(|x| x.1 == r) {
+                    found.push((format!("t{t:#x}+idx {v}"), r));
+                }
+            }
+        }
+    }
+    let res: Vec<String> = found
+        .iter()
+        .take(40)
+        .map(|(from, r)| {
+            let d = ID3D12Resource::from_raw_borrowed(&(*r as *mut c_void)).map(|x| x.GetDesc());
+            if d.is_some_and(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 64 && d.Height >= 64) {
+                super::rtsum::fs_note(*r);
+            }
+            format!(
+                "{from} {r:#x} {:?} title {:x?}/{:x?}{}{}",
+                d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)),
+                super::real::title_address(*r),
+                super::title_textures::address(*r),
+                if super::rtsum::fs_is_target(*r) { " TARGET" } else { "" },
+                if super::present::is_presented(*r) { " PRESENTED" } else { "" }
+            )
+        })
+        .collect();
+    crate::xlog_info!("fstrace: #{seq} dispatch {} groups {groups:?}: {}", super::rtsum::shaders(title_pso), what.join("; "));
+    crate::xlog_info!("fstrace: #{seq} names: {}", if res.is_empty() { "nothing".to_string() } else { res.join(" | ") });
+}
+
+/// LOCAL (agent Z, `XCL_LOCAL_ZPROBE=<hex prefix>,…` with `XCL_LOCAL_FSTRACE`): in the traced frame,
+/// the first 4 calls of each listed compute program: its user SGPRs, and for each descriptor table
+/// of its root arguments the first 16 slots decoded as buffer V#s (address, records, stride), where
+/// each points (window, GPU view of the 24 GB pair with its CPU view, a title reservation outside
+/// the windows, null) and the first 8 words the CPU sees there now (record time).
+unsafe fn local_zprobe(this: *mut c_void, io: &[u32], layout: Option<&Layout>, args: &[u8]) {
+    static WANT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| std::env::var("XCL_LOCAL_ZPROBE").unwrap_or_default().split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect());
+    if want.is_empty() {
+        return;
+    }
+    let name = super::rtsum::shaders(with(this, |s| s.pso));
+    let Some(h) = name.strip_prefix("cs ") else { return };
+    if !want.iter().any(|w| h.starts_with(w.as_str())) {
+        return;
+    }
+    static SEEN: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+    {
+        let mut g = SEEN.lock().unwrap();
+        let n = match g.iter_mut().find(|x| x.0 == h) {
+            Some(x) => {
+                x.1 += 1;
+                x.1
+            }
+            None => {
+                g.push((h.to_string(), 1));
+                1
+            }
+        };
+        if n > 4 {
+            return;
+        }
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut parts: Vec<String> = Vec::new();
+    for (i, p) in layout.map(|l| l.params.clone()).unwrap_or_default().iter().enumerate() {
+        match *p {
+            Param::Table { at } => {
+                let t = word(at as usize);
+                let mut slots = Vec::new();
+                for k in 0..16u32 {
+                    let Some(w) = super::console_heap::words_at(t + 32 * k).or_else(|| {
+                        let p = u.window(0).0 + t as usize + 16 * k as usize;
+                        crate::gpu::shader::readable(p, 16).then(|| { let mut x = [0u32; 8]; std::ptr::copy_nonoverlapping(p as *const u32, x.as_mut_ptr(), 4); x })
+                    }) else { continue };
+                    if w[..4].iter().all(|&v| v == 0) {
+                        slots.push(format!("[{k}] null"));
+                        continue;
+                    }
+                    if w[3] >> 28 >= 8 {
+                        let r = super::console_heap::resource_of_index(w[0]);
+                        let dd = r.and_then(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc()));
+                        if let (Some(r), Some(d)) = (r, dd) {
+                            if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                                super::rtsum::fs_note(r); // LOCAL: dumped at the next present
+                            }
+                        }
+                        slots.push(format!("[{k}] image idx {} -> {:x?} {:?}", w[0], r, dd.map(|d| (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels))));
+                        continue;
+                    }
+                    let a = w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32;
+                    let stride = (w[1] >> 16) & 0x3FFF;
+                    let win = if (a >> 32) == 0 { Some(0) } else { u.window_of(a as usize) };
+                    let (kind, cpu) = if (a >> 32) == 0 {
+                        ("window 0", u.window(0).0 + a as usize)
+                    } else if win.is_some() {
+                        ("window", a as usize)
+                    } else if let Some(src) = crate::hle::kernelx::mirrors::source(a as usize) {
+                        ("GPU view (24 GB pair)", src)
+                    } else if crate::hle::kernelx::in_graphics_reservation(a as usize) {
+                        ("title reservation outside the windows", a as usize)
+                    } else {
+                        ("other", a as usize)
+                    };
+                    let words: Vec<u32> = if crate::gpu::shader::readable(cpu & !3, 32) { (0..8).map(|j| ((cpu & !3) as *const u32).add(j).read_unaligned()).collect() } else { Vec::new() };
+                    slots.push(format!("[{k}] V# {a:#x} records {:#x} stride {stride} {kind} win {win:?} cpu {cpu:#x} {words:x?}", w[2]));
+                }
+                parts.push(format!("p{i} table {t:#x}: {}", slots.join(" ; ")));
+            }
+            Param::Descriptor { at } => parts.push(format!("p{i} root view {:#x}", word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32)),
+            Param::Constants { at, count } => parts.push(format!("p{i} constants {:x?}", (0..count.min(8) as usize).map(|k| word(at as usize + 4 * k)).collect::<Vec<_>>())),
+        }
+    }
+    crate::xlog_info!("zprobe: {name} sgprs {:x?} | {}", &io[..16.min(io.len())], parts.join(" | "));
+}
+
+/// LOCAL (agent G, `XCL_LOCAL_GPROBE=<hex prefix>,…` with `XCL_LOCAL_FSTRACE`): in the traced frame,
+/// the first 6 graphics binds whose VS or PS hash starts with a prefix: root constants / views, and
+/// every non-null slot of the first 200 (table 0) / 32 (other tables) slots of 32 bytes, decoded as
+/// image (PC index -> resource, shape; 2D images are dumped at the next present) or buffer V#
+/// (address, records, where it points, first 4 CPU words).
+unsafe fn local_gprobe(this: *mut c_void, layout: Option<&Layout>, args: &[u8]) {
+    static WANT: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| std::env::var("XCL_LOCAL_GPROBE").unwrap_or_default().split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect());
+    if want.is_empty() {
+        return;
+    }
+    let name = super::rtsum::shaders(with(this, |s| s.pso));
+    let hit = name.split_whitespace().any(|h| want.iter().any(|w| h.starts_with(w.as_str())));
+    if !hit {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 6 {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut parts: Vec<String> = Vec::new();
+    let mut ti = 0u32;
+    for (i, p) in layout.map(|l| l.params.clone()).unwrap_or_default().iter().enumerate() {
+        match *p {
+            Param::Table { at } => {
+                let t = word(at as usize);
+                let max = if ti == 0 { 200u32 } else { 32 };
+                ti += 1;
+                let mut slots = Vec::new();
+                for k in 0..max {
+                    let Some(w) = super::console_heap::words_at(t + 32 * k) else { continue };
+                    if w.iter().all(|&v| v == 0) {
+                        continue;
+                    }
+                    if w[3] >> 28 >= 8 {
+                        let r = super::console_heap::resource_at(u.base() + t as usize + 32 * k as usize).or_else(|| super::console_heap::resource_of_index(w[0]));
+                        let dd = r.and_then(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc()));
+                        if let (Some(r), Some(d)) = (r, dd) {
+                            if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 {
+                                super::rtsum::fs_note(r);
+                            }
+                        }
+                        slots.push(format!("[{k}] img idx {} -> {:x?} {:?}{}", w[0], r, dd.map(|d| (d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.Flags.0)), if r.is_some_and(super::rtsum::fs_is_target) { " TARGET" } else { "" }));
+                        continue;
+                    }
+                    let a = w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32;
+                    let win = if (a >> 32) == 0 { Some(0) } else { u.window_of(a as usize) };
+                    let (kind, cpu) = if (a >> 32) == 0 {
+                        ("w0", u.window(0).0 + a as usize)
+                    } else if win.is_some() {
+                        ("win", a as usize)
+                    } else if let Some(src) = crate::hle::kernelx::mirrors::source(a as usize) {
+                        ("GPUVIEW24", src)
+                    } else if crate::hle::kernelx::in_graphics_reservation(a as usize) {
+                        ("RESV", a as usize)
+                    } else {
+                        ("OTHER", a as usize)
+                    };
+                    let words: Vec<u32> = if crate::gpu::shader::readable(cpu & !3, 16) { (0..4).map(|j| ((cpu & !3) as *const u32).add(j).read_unaligned()).collect() } else { Vec::new() };
+                    slots.push(format!("[{k}] V# {a:#x} rec {:#x} {kind} {win:?} cpu {words:x?} w4.. {:x?}", w[2], &w[4..]));
+                }
+                parts.push(format!("p{i} table {t:#x}: {}", slots.join(" ; ")));
+            }
+            Param::Descriptor { at } => {
+                let a = word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32;
+                parts.push(format!("p{i} root view {a:#x} window {:?}", if (a >> 32) == 0 { Some(0) } else { u.window_of(a as usize) }));
+            }
+            Param::Constants { at, count } => parts.push(format!("p{i} constants {:x?}", (0..count.min(8) as usize).map(|k| word(at as usize + 4 * k)).collect::<Vec<_>>())),
+        }
+    }
+    crate::xlog_info!("gprobe: {name} | {}", parts.join(" | "));
+}
+
+/// LOCAL (agent Z, `XCL_LOCAL_ZWATCH=<hex prefix>:<table>:<slot>`, e.g. `55b6fb3a:1:1`): the buffer
+/// V# that program finds in slot <slot> of its <table>-th descriptor table is remembered at each of
+/// its binds; in the traced frame (`XCL_LOCAL_FSTRACE`) every translated compute bind whose tables
+/// (first 24 slots each) hold a buffer V# overlapping that range is logged in record order.
+static ZWATCH: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+static ZWATCH_FIXED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// LOCAL (agent Z): a watched range set from the indirect draw arguments (`rtsum::after_indirect`);
+/// the first one wins until the traced frame. True when newly set (to log it once).
+pub(super) fn local_zwatch_set(at: u64, len: u64) -> bool {
+    if ZWATCH_FIXED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    *ZWATCH.lock().unwrap() = Some((at, len));
+    true
+}
+
+/// LOCAL (agent Z, `XCL_LOCAL_CB_READBACK=1`): the counter buffer 55b6fb3a reads (its table 1, slot 1).
+static CB_RANGE: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+pub(super) fn local_cb_range() -> Option<(usize, usize)> {
+    *CB_RANGE.lock().unwrap()
+}
+
+unsafe fn local_zwatch(this: *mut c_void, layout: Option<&Layout>, args: &[u8]) {
+    static CB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *CB.get_or_init(|| std::env::var_os("XCL_LOCAL_CB_READBACK").is_some()) {
+        if let Some(l) = layout {
+            let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+            let tables: Vec<u32> = l.params.iter().filter_map(|p| if let Param::Table { at } = *p { Some(word(at as usize)) } else { None }).collect();
+            if tables.len() >= 2 && super::rtsum::shaders(with(this, |s| s.pso)).starts_with("cs 55b6fb3a") {
+                if let Some(w) = super::console_heap::words_at(tables[1] + 32) {
+                    let a = (w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32) as usize;
+                    let stride = ((w[1] >> 16) & 0x3FFF).max(1) as usize;
+                    let n = (w[2] as usize * stride).min(0x1000);
+                    let mut g = CB_RANGE.lock().unwrap();
+                    if g.is_none() {
+                        crate::xlog_info!("LOCAL cb-readback: counter buffer {a:#x}+{n:#x} (55b6fb3a table 1 slot 1)");
+                    }
+                    *g = Some((a, n));
+                }
+            }
+        }
+    }
+    static CFG: std::sync::OnceLock<Option<(String, usize, u32)>> = std::sync::OnceLock::new();
+    let Some((want, ti, si)) = CFG.get_or_init(|| {
+        let v = std::env::var("XCL_LOCAL_ZWATCH").ok()?;
+        let p: Vec<&str> = v.trim().split(':').collect();
+        Some((p.first()?.to_lowercase(), p.get(1)?.parse().ok()?, p.get(2)?.parse().ok()?))
+    }) else { return };
+    let Some(l) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let tables: Vec<u32> = l.params.iter().filter_map(|p| if let Param::Table { at } = *p { Some(word(at as usize)) } else { None }).collect();
+    let vsharp = |t: u32, k: u32| -> Option<(u64, u64, [u32; 8])> {
+        let w = super::console_heap::words_at(t + 32 * k)?;
+        if w[..4].iter().all(|&v| v == 0) || w[3] >> 28 >= 8 {
+            return None;
+        }
+        let a = w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32;
+        let stride = ((w[1] >> 16) & 0x3FFF) as u64;
+        Some((a, w[2] as u64 * stride.max(1), w))
+    };
+    let name = super::rtsum::shaders(with(this, |s| s.pso));
+    if !ZWATCH_FIXED.load(Ordering::Relaxed) && name.strip_prefix("cs ").is_some_and(|h| h.starts_with(want.as_str())) {
+        if let Some((a, n, _)) = tables.get(*ti).and_then(|&t| vsharp(t, *si)) {
+            let mut g = ZWATCH.lock().unwrap();
+            if g.is_none() || super::rtsum::fs_active() {
+                crate::xlog_info!("zwatch: {name} table {ti} slot {si}: watching {a:#x}+{n:#x}");
+            }
+            *g = Some((a, n.max(4)));
+        }
+    }
+    if !super::rtsum::fs_active() {
+        return;
+    }
+    let Some((wa, wn)) = *ZWATCH.lock().unwrap() else { return };
+    let mut hits = Vec::new();
+    // LOCAL: root views too (address only: a view starting at most 1 MB below the range)
+    for (i, p) in l.params.iter().enumerate() {
+        if let Param::Descriptor { at } = *p {
+            let a = word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32;
+            if a != 0 && a <= wa + wn && wa < a + 0x10_0000 {
+                hits.push(format!("root view p{i} {a:#x}"));
+            }
+        }
+    }
+    for (i, &t) in tables.iter().enumerate() {
+        for k in 0..64u32 {
+            if let Some((a, n, w)) = vsharp(t, k) {
+                // LOCAL: only plausible buffer V#s (title memory, at most 256 MB)
+                if a < wa + wn && wa < a + n.max(4) && n <= 0x1000_0000 && (0x4_0000_0000..0x8_0000_0000).contains(&a) {
+                    hits.push(format!("table {i} slot {k} V# {a:#x}+{n:#x} words {:x?}", &w[..4]));
+                }
+            }
+        }
+    }
+    // LOCAL (agent Z, `XCL_LOCAL_ZSNAP_ALL=1`): a snapshot before EVERY bind of the traced frame, with the
+    // words the CPU sees in the range at record time
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ALL.get_or_init(|| std::env::var_os("XCL_LOCAL_ZSNAP_ALL").is_some()) {
+        static SEQA: AtomicU64 = AtomicU64::new(0);
+        let cpu: Vec<u32> = if crate::gpu::shader::readable(wa as usize, 16) { (0..4).map(|j| (wa as *const u32).add(j).read_unaligned()).collect() } else { Vec::new() };
+        let seq = SEQA.fetch_add(1, Ordering::Relaxed);
+        super::rtsum::zsnap(this, wa as usize, wn, format!("@{seq} {name}{} cpu {cpu:x?}", if hits.is_empty() { "" } else { " NAMES IT" }));
+        return;
+    }
+    if !hits.is_empty() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        crate::xlog_info!("zwatch: #{seq} {name} names the watched range: {}", hits.join("; "));
+        super::rtsum::zsnap(this, wa as usize, wn, format!("#{seq} {name}"));
+    }
+}
+
 /// #148 AllocateUploadMemory(size, alignment) → CPU/GPU pointer in unified memory (used by
 /// `XboxBvhBuilder.dll` and other console middleware on default title command lists).
 /// Freed automatically when the list's command allocator is reset.
@@ -1650,6 +2139,9 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
+    }
+    if super::rtsum::fs_active() {
+        local_fs_trace(this, [x, y, z]); // LOCAL (agent Z)
     }
     bind_abi(this, list, pso, false)?;
     // LOCAL diagnostic (`XCL_LOCAL_DUMP_CS_INPUTS`): what the title feeds this program; its GPU
@@ -1687,10 +2179,12 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     if first == 0 && u.shadowed() {
         return Err("window 0 of unified memory has no buffer on the GPU".into());
     }
-    let (layout, args, heaps) = with(this, |s| {
+    let (layout, mut args, heaps) = with(this, |s| { // LOCAL: mut (agent Z)
         let (layout, args) = if gfx { (&s.layout_gfx, &s.args_gfx) } else { (&s.layout, &s.args) };
         (layout.clone(), args.clone(), s.heaps)
     });
+    super::rtsum::oow_copy_root_views(layout.as_deref(), &mut args); // LOCAL experiment (agent L's XCL_LOCAL_OOW_COPY, ported by agent Z)
+    super::rtsum::oow_scratch_root_views(layout.as_deref(), &mut args); // LOCAL experiment (agent L's XCL_LOCAL_OOW_SCRATCH, ported by agent Z)
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -1702,6 +2196,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
+    super::rtsum::oow_scan(with(this, |s| s.pso), gfx, layout.as_deref(), &args); // LOCAL (agent L, ported by agent Z)
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
         Some(l) if gfx => console_list::with_heaps(l, None, console_list::user_data_gfx(l, &args, table_at as u64), heaps),
@@ -1710,6 +2205,13 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    local_zwatch(this, layout.as_deref(), &args); // LOCAL (agent Z): compute and graphics binds
+    if !gfx && super::rtsum::fs_active() {
+        local_zprobe(this, &io, layout.as_deref(), &args); // LOCAL (agent Z)
+    }
+    if gfx && super::rtsum::fs_active() {
+        local_gprobe(this, layout.as_deref(), &args); // LOCAL (agent G)
+    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
@@ -1752,6 +2254,17 @@ pub(super) fn tracked_pso(list: *mut c_void) -> usize {
         .as_ref()
         .and_then(|m| m.get(&(list as usize)))
         .map_or(0, |s| s.pso)
+}
+
+/// Tracked console `(graphics_root_signature, compute_root_signature)` on `list` for restoring
+/// PC root signatures after an internal graphics/compute sync pass.
+pub(super) fn tracked_root_sigs(list: *mut c_void) -> (usize, usize) {
+    STATES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(list as usize)))
+        .map_or((0, 0), |s| (s.rs_gfx, s.rs_cs))
 }
 
 #[cfg(test)]
