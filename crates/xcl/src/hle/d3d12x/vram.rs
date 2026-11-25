@@ -260,6 +260,21 @@ struct Target {
     evictable: bool,
     /// placed, remapped or transitioned last
     touched: std::time::Instant,
+    /// LOCAL (agent M): tiles of its own, keyed by `(va, tile)` (`tex_overlap_keep`), not shared
+    /// with other addresses' textures by title page
+    private: bool,
+}
+
+/// LOCAL (agent M): `XCL_LOCAL_TEX_OVERLAP=1`. A retail title keeps only the small levels of some
+/// streamed textures and places the next texture where their large levels would be (capture R4:
+/// material textures 32 KiB apart, each ~350 KiB on the PC). Then a newer texture leaves an older
+/// one it overlaps active (`title_textures`: unless it starts in the older one's first 4 KiB,
+/// the rule of another project that runs this title), and a sampled texture gets tiles of its
+/// own (by `(va, tile)`): shared by title page, the PC layouts of two textures at different
+/// addresses wrote over each other's levels.
+pub(super) fn tex_overlap_keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_LOCAL_TEX_OVERLAP").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Per-heap free-tile allocator for `Pages`.
@@ -662,8 +677,10 @@ impl Pages {
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, private: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
+        // (LOCAL agent M: private tiles, all by `(va, tile)`)
+        let own = if private { 0 } else { own };
         let now = std::time::Instant::now();
         self.sweep(now);
 
@@ -869,8 +886,9 @@ unsafe fn place_on_pages(
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now() });
+            let private = !require_aligned && tex_overlap_keep();
+            if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, private) {
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now(), private });
                 true
             } else {
                 false
@@ -919,13 +937,13 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
+    let Some((va, console_bytes, total, mapped, private)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped, t.private)) else {
         return false;
     };
     if mapped {
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, private) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {

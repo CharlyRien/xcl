@@ -140,6 +140,9 @@ struct Table {
     shadowed_by_va: BTreeMap<(usize, usize), usize>,
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
+    /// LOCAL (agent M): largest byte span ever put in `by_va` (`XCL_LOCAL_TEX_OVERLAP`: active
+    /// entries may overlap, so a backwards scan cannot stop at the first one that ends before)
+    max_active_size: usize,
     next_seq: u64,
 }
 
@@ -151,11 +154,15 @@ impl Table {
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
+            max_active_size: 0,
             next_seq: 0,
         }
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
+        if super::vram::tex_overlap_keep() {
+            return !self.active_overlaps(va, end).is_empty();
+        }
         if let Some((_, &oend)) = self.by_va.range(..(va, 0)).next_back() {
             if oend > va {
                 return true;
@@ -165,6 +172,13 @@ impl Table {
     }
 
     fn active_overlaps(&self, va: usize, end: usize) -> Vec<(usize, usize, usize)> {
+        if super::vram::tex_overlap_keep() {
+            if end <= va {
+                return Vec::new();
+            }
+            let lo = va.saturating_sub(self.max_active_size);
+            return self.by_va.range((lo, 0)..(end, 0)).filter(|&(_, &oend)| oend > va).map(|(&(ova, ores), &oend)| (ova, ores, oend)).collect();
+        }
         let mut out = Vec::new();
         for (&(ova, ores), &oend) in self.by_va.range(..(va, 0)).rev() {
             if oend <= va {
@@ -247,6 +261,11 @@ impl Table {
             if !entry.placed && ova == va && oend == end && self.by_res.get(&ores).is_some_and(|e| !e.placed) {
                 continue;
             }
+            // LOCAL (agent M, `XCL_LOCAL_TEX_OVERLAP=1`): a texture that does not start in the
+            // older one's first 4 KiB leaves it active (its own tiles: `vram::tex_overlap_keep`)
+            if super::vram::tex_overlap_keep() && !(va >= ova && va < ova + 0x1000) && (ova != va || oend != end) {
+                continue;
+            }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
                 if old.pending {
@@ -264,7 +283,8 @@ impl Table {
         // Also release tiles of any already-shadowed exact-range sibling now overwritten by a
         // different range (e.g. A and B shared an unaligned range, then C overwrites both).
         for (sva, sres, send) in self.shadowed_overlaps(va, end) {
-            if sva != va || send != end {
+            // (LOCAL agent M: with private tiles a different range takes none of its tiles)
+            if (sva != va || send != end) && !super::vram::tex_overlap_keep() {
                 if let Some(old) = self.shadowed.get_mut(&sres) {
                     if old.placed && !old.unmapped {
                         old.unmapped = true;
@@ -279,6 +299,7 @@ impl Table {
             pending_delta += 1;
         }
         self.by_va.insert((va, res), end);
+        self.max_active_size = self.max_active_size.max(end - va);
         self.by_res.insert(res, entry);
         (pending_delta, to_unmap)
     }
@@ -322,6 +343,7 @@ impl Table {
                     pending_delta += 1;
                 }
                 self.by_va.insert((sva, sres), send);
+                self.max_active_size = self.max_active_size.max(send - sva);
                 self.by_res.insert(sres, e);
             }
         }
