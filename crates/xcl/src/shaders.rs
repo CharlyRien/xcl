@@ -868,6 +868,24 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let (_, blob) = input.get(i);
             let Some(blob) = blob else { continue };
             let h = format!("{:016x}", shader::fnv64(&blob));
+            // `XCL_LOCAL_MESH_NAME=<text>`: every container whose FSSM holds that text: its disassembly
+            if let Ok(name) = std::env::var("XCL_LOCAL_MESH_NAME") {
+                if let Some(sh) = xbox::parse(&blob) {
+                    for (k, f) in sh.fssm.iter().enumerate() {
+                        if f.data.windows(name.len()).any(|w| w == name.as_bytes()) && seen.insert(format!("{h}-{k}")) {
+                            let mut dis = format!("// {} hw {:?}\n", sh.stage, f.stages.iter().map(|s| s.hw).collect::<Vec<_>>());
+                            for p in &f.programs {
+                                for l in crate::gpu::rdna2::disassemble(&f.data[p.offset..p.offset + p.len], 0, false) {
+                                    dis.push_str(&format!("{:6x}: {}\n", l.pc, l.text));
+                                }
+                            }
+                            let _ = std::fs::write(dir.join(format!("{h}-{k}.name.s")), dis);
+                            println!("{h} fssm {k}: {} matches", sh.stage);
+                        }
+                    }
+                }
+                continue;
+            }
             if !want.split(',').any(|w| w.trim() == h) || !seen.insert(h.clone()) {
                 continue;
             }

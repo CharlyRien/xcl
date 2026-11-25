@@ -590,6 +590,42 @@ unsafe fn bind_two_pass_stage(
     let table_at = copy(&args[inline..])?;
     let heaps = if std::env::var_os("XCL_LOCAL_TWO_PASS_NO_HEAPS").is_some() { [0; 2] } else { heaps };
     let io = two_pass_io_heaps(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
+    // LOCAL (agent N): `XCL_LOCAL_MS_CPU=N`: the first N two-pass compute binds log what the CPU view of
+    // unified memory holds now (record time) where the retail MS reads its counts (see `local_ms_probe`)
+    if compute_pass {
+        static N: AtomicU64 = AtomicU64::new(0);
+        static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let max = *MAX.get_or_init(|| std::env::var("XCL_LOCAL_MS_CPU").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        if max > 0 && N.fetch_add(1, Ordering::Relaxed) < max {
+            let rd = |hi: u32, lo: u32| -> Option<u32> {
+                let base_hi = (u.base() as u64 >> 32) as u32;
+                let k = if hi == 0 { 0 } else { hi.wrapping_sub(base_hi) };
+                if k > 3 {
+                    return None;
+                }
+                let p = u.base() + ((k as usize) << 32) + (lo & !3) as usize;
+                (u.contains(p) && crate::gpu::shader::readable(p, 4)).then(|| (p as *const u32).read_volatile())
+            };
+            let t = io[17];
+            let v: Vec<Option<u32>> = (0..4).map(|k| rd(0, t + 4 * k)).collect();
+            let (bhi, blo) = (v[1].unwrap_or(0) & 0xFFFF, v[0].unwrap_or(0));
+            let words: Vec<Option<u32>> = (0..12).map(|k| rd(bhi, blo + 4 * k)).collect();
+            let params: Vec<String> = layout
+                .as_ref()
+                .map(|l| l.params.iter().map(|p| match p { Param::Constants { at, count } => format!("c{at}x{count}"), Param::Descriptor { at } => format!("d{at}"), Param::Table { at } => format!("t{at}") }).collect())
+                .unwrap_or_default();
+            let aw: Vec<u32> = args.chunks(4).take(16).map(|c| u32::from_le_bytes([c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0), *c.get(3).unwrap_or(&0)])).collect();
+            crate::xlog_info!(
+                "ms cpu: s16..s19 {:x?} table {:x?} buffer[0..12] {:x?} | inline_ms {:?} params {:?} args {:x?}",
+                &io[16..20],
+                v,
+                words,
+                layout.as_ref().map(|l| l.inline_ms),
+                params,
+                aw
+            );
+        }
+    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
