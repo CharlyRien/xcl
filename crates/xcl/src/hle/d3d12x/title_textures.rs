@@ -476,6 +476,18 @@ fn mirror_source(va: usize) -> usize {
 /// offset), else `mirror_source`. A page the method never mapped reads `mirror_source`; the
 /// method's mapping goes before a physical page mapped at the GPU-view address itself.
 fn source_of(va: usize, len: usize) -> Source {
+    // LOCAL (agent M): `XCL_LOCAL_GPU_VIEW_PAGES=0` reads as before the port of #1102 (the CPU
+    // view's same offset) while #1055 still records the method's pages: an A/B in one binary,
+    // and the capture's `title_img` still says what the pages hold (`source_by_pages`)
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("XCL_LOCAL_GPU_VIEW_PAGES").is_ok_and(|v| v.trim() == "0")) {
+        return Source::At(mirror_source(va));
+    }
+    source_by_pages(va, len)
+}
+
+/// `source_of` as #1102 has it (LOCAL agent M: split out for the switch above).
+fn source_by_pages(va: usize, len: usize) -> Source {
     use crate::hle::kernelx::mirrors::{self, mapped_source, PAGE};
     let end = va.saturating_add(len);
     if mirrors::source(va).is_none() || !(va & !(PAGE - 1)..end).step_by(PAGE).any(|p| mapped_source(p).is_some()) {
@@ -516,12 +528,17 @@ fn recheck_gpu_view_sources() {
         return;
     }
     let mut changed = false;
+    // LOCAL (agent M): the textures whose source changed, whose last upload's hash goes (below)
+    let mut moved: Vec<usize> = Vec::new();
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
     if all {
-        for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-            changed |= recheck_source(e);
+        for (&res, e) in t.by_res.iter_mut().chain(t.shadowed.iter_mut()) {
+            if recheck_source(e) {
+                changed = true;
+                moved.push(res);
+            }
         }
     } else {
         let mut on: Vec<usize> = Vec::new();
@@ -532,11 +549,19 @@ fn recheck_gpu_view_sources() {
         on.dedup();
         for res in on {
             if let Some(e) = t.get_mut(res) {
-                changed |= recheck_source(e);
+                if recheck_source(e) {
+                    changed = true;
+                    moved.push(res);
+                }
             }
         }
     }
     drop(g);
+    // LOCAL (agent M): new memory under the texture: its next upload is not left out as
+    // "the same bytes as at its last upload" (a hash of the old source's bytes)
+    for res in moved {
+        forget_content(res);
+    }
     if changed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -553,6 +578,10 @@ fn recheck_source(e: &mut Entry) -> bool {
         return false;
     }
     e.src = src;
+    // LOCAL (agent M, as reported on #1102 by another tester): what the GPU wrote was in the old
+    // memory; the new memory is what the console shows now, and the CPU's later writes there
+    // must go up too (left `gpu_written`, they were filtered out after this one upload)
+    e.gpu_written = false;
     if !e.pending {
         e.pending = true;
         PENDING.fetch_add(1, Ordering::Relaxed);
@@ -639,7 +668,73 @@ pub fn forget(res: usize) {
 /// LOCAL (agent G): where texture `res` is read from now (`Entry::src`), for the capture
 pub fn local_source(res: usize) -> Option<usize> {
     let t = TEXTURES.lock().unwrap();
-    t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.src)
+    t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.src.first())
+}
+
+/// LOCAL (agent M): `src` described for the capture: `at` or `pages <runs>`, then the 64 KiB
+/// pages of the texture by where they are read from – `method` (the page-mapping method's
+/// page, `kernelx::mirrors::mapped_source`), `unmapped` (zeros), `same` (the CPU view's same
+/// offset or the address itself) – and the non-zero bytes of the whole texture read there.
+unsafe fn local_describe(src: &Source, va: usize, size: usize) -> String {
+    use crate::hle::kernelx::mirrors::{mapped_source, PAGE};
+    let (mut method, mut unmapped, mut same) = (0usize, 0usize, 0usize);
+    let mut p = va & !(PAGE - 1);
+    while p < va + size {
+        match mapped_source(p) {
+            Some(Some(_)) => method += 1,
+            Some(None) => unmapped += 1,
+            None => same += 1,
+        }
+        p += PAGE;
+    }
+    let kind = match src {
+        Source::At(a) => format!("at {a:#x}"),
+        Source::Pages(r) => format!("pages {} from {:#x}", r.len(), src.first()),
+    };
+    let nz = src.bytes(0, size).iter().filter(|&&b| b != 0).count();
+    format!("{kind} method {method} unmapped {unmapped} same {same} nz {nz}/{size}")
+}
+
+/// LOCAL (agent M): for the capture, texture `res` as XCL keeps it: the source it reads now
+/// (`now`), the source the page-mapping method's record gives (`pages`, #1102's
+/// `source_by_pages`, whatever `XCL_LOCAL_GPU_VIEW_PAGES` says), its flags; and that second
+/// source's texels detiled as an upload would send them, laid out in `fps` / `rows` (the
+/// capture's footprints from offset 0, `total` bytes) – what the replay's `tex<ID>=file:`
+/// takes. None: not a texture kept in step, or its layout does not match the footprints.
+pub unsafe fn local_title_image(res: usize, fps: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32], total: usize) -> Option<(String, Option<Vec<u8>>)> {
+    let (va, now, tex, flags) = {
+        let t = TEXTURES.lock().unwrap();
+        let (e, shadowed) = match t.by_res.get(&res) {
+            Some(e) => (e, false),
+            None => (t.shadowed.get(&res)?, true),
+        };
+        (e.va, e.src.clone(), Arc::clone(&e.tex), format!("shadowed {shadowed} unmapped_tiles {} gpu_written {} placed {} pending {}", e.unmapped, e.gpu_written, e.placed, e.pending))
+    };
+    let size = tex.size() as usize;
+    let pages = source_by_pages(va, size);
+    let mut line = format!("tsrc now [{}] pages [{}] same_src {} {flags} vram_evicted {}", local_describe(&now, va, size), local_describe(&pages, va, size), now == pages, super::vram::is_evicted(res));
+    let subs = subresources_of(&pages, &tex);
+    if subs.len() != fps.len() || rows.len() != fps.len() {
+        line += &format!(" title_img none (subresources {} footprints {})", subs.len(), fps.len());
+        return Some((line, None));
+    }
+    let mut out = vec![0u8; total];
+    for ((s, fp), &nrows) in subs.iter().zip(fps).zip(rows) {
+        let pitch = fp.Footprint.RowPitch as usize;
+        let row = s.row_bytes.min(pitch);
+        let slice_pitch = pitch * nrows as usize;
+        for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
+            for y in 0..(nrows as usize).min(s.rows) {
+                let at = fp.Offset as usize + z * slice_pitch + y * pitch;
+                let from = (z * s.rows + y) * s.row_bytes;
+                if at + row <= out.len() && from + row <= s.data.len() {
+                    out[at..at + row].copy_from_slice(&s.data[from..from + row]);
+                }
+            }
+        }
+    }
+    line += &format!(" title_img_nz {}", out.iter().filter(|&&b| b != 0).count());
+    Some((line, Some(out)))
 }
 
 /// LOCAL (agent G): whether texture `res` still waits for an upload (`Entry::pending`)

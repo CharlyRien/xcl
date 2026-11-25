@@ -536,6 +536,8 @@ struct Cap {
     /// LOCAL (agent G): root-descriptor ranges whose CPU bytes were taken at record time: read again
     /// once the GPU ran the captured lists (`cpu_after.bin`)
     cpu_roots: Vec<(usize, usize)>,
+    /// LOCAL (agent M): bytes of `timg` title images put in `cpu` so far
+    title_img_bytes: usize,
 }
 
 /// LOCAL (agent G): `XCL_LOCAL_LCAP_ROOT_CPU=0` leaves out the CPU bytes of the root descriptors'
@@ -708,7 +710,9 @@ impl Cap {
         let Some(dev) = device() else { return };
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); nsub as usize];
         let mut total = 0u64;
-        dev.GetCopyableFootprints(&d, 0, nsub, 0, Some(fps.as_mut_ptr()), None, None, Some(&mut total));
+        // (LOCAL agent M: the rows too, for the title's image below)
+        let mut rows = vec![0u32; nsub as usize];
+        dev.GetCopyableFootprints(&d, 0, nsub, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
         if total == 0 || total == u64::MAX || total > tex_max() {
             self.man.push(format!("{head} skipped ({total} bytes)"));
             return;
@@ -725,6 +729,26 @@ impl Cap {
             l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
         self.man.push(format!("{head} nsub {nsub} total {total:#x} file chunk{c}.bin@{at:#x}"));
+        // LOCAL (agent M): where XCL reads this texture from and what the page-mapping method's
+        // record gives (`tsrc`), and those bytes detiled in the footprints above (`timg`, in
+        // cpu.bin; `XCL_LOCAL_LCAP_TITLE_MB`, 512, bounds them): the texture XCL would upload
+        // with #1102, for `tex<ID>=file:` in the replay
+        if geom_draws() != 0 {
+            if let Some((desc, img)) = super::title_textures::local_title_image(r, &fps, &rows, total as usize) {
+                self.man.push(format!("tsrc {id} {phase} {desc}"));
+                if let Some(img) = img {
+                    let used = self.title_img_bytes;
+                    if used + img.len() <= (geom_num("XCL_LOCAL_LCAP_TITLE_MB", 512) << 20) as usize {
+                        let o = self.cpu.len();
+                        self.cpu.extend_from_slice(&img);
+                        self.title_img_bytes += img.len();
+                        self.man.push(format!("timg {id} {phase} cpu cpu.bin@{o:#x} bytes {:#x}", img.len()));
+                    } else {
+                        self.man.push(format!("timg {id} {phase} skipped (budget)"));
+                    }
+                }
+            }
+        }
     }
 
     /// the view at shared index `i` (and its UAV at i + 1): lines + texture copies
