@@ -856,6 +856,32 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    // LOCAL agent J: `--local-rodata-list`: one line per console container: its fnv64, stage, and per
+    // FSSM program the hardware stage, code bytes, dwords of constant data after it (`Fssm::rodata`,
+    // PR #2229) and how many `s_getpc_b64` it has
+    if args.iter().any(|a| a == "--local-rodata-list") {
+        for i in 0..input.len() {
+            let (_, blob) = input.get(i);
+            let Some(blob) = blob else { continue };
+            let Some(sh) = xbox::parse(&blob) else { continue };
+            let mut line = format!("{:016x} {}", shader::fnv64(&blob), sh.stage);
+            for f in &sh.fssm {
+                for p in &f.programs {
+                    let code = &f.data[p.offset..p.offset + p.len];
+                    let (mut off, mut getpc) = (0usize, 0u32);
+                    while off + 4 <= code.len() {
+                        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+                        off += d.len;
+                        getpc += (d.inst.name == "S_GETPC_B64") as u32;
+                    }
+                    let dwords: usize = f.rodata(p).iter().map(|b| b.1.len()).sum();
+                    line.push_str(&format!(" | hw {:?} code {} rodata_dwords {dwords} getpc {getpc}", f.stages.iter().map(|s| s.hw).collect::<Vec<_>>(), p.len));
+                }
+            }
+            println!("{line}");
+        }
+        return 0;
+    }
     // LOCAL: `--local-mesh-dump <dir>` with `XCL_LOCAL_MESH_HASHES=h1,h2`: for each console MS container
     // with that fnv64, write the container, its NGG program's disassembly and the two-pass compute HLSL
     // (split wave64 and not)
@@ -1352,6 +1378,26 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                // LOCAL agent J: `XCL_LOCAL_PRECOMPILE_HASHES=<file>`: only the containers whose fnv64
+                // (16 hex digits, one per line) is in that file; one timing line per container
+                static LOCAL_ONLY: std::sync::OnceLock<Option<HashSet<u64>>> = std::sync::OnceLock::new();
+                let local_only = LOCAL_ONLY.get_or_init(|| {
+                    let text = std::fs::read_to_string(std::env::var("XCL_LOCAL_PRECOMPILE_HASHES").ok()?).ok()?;
+                    Some(text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect())
+                });
+                if local_only.as_ref().is_some_and(|l| !l.contains(&shader::fnv64(&blob))) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                struct LocalTimer(Option<(u64, std::time::Instant, String)>);
+                impl Drop for LocalTimer {
+                    fn drop(&mut self) {
+                        if let Some((h, t, stage)) = &self.0 {
+                            println!("LOCAL agentJ: precompiled {h:016x} {stage} in {} ms", t.elapsed().as_millis());
+                        }
+                    }
+                }
+                let _local_timer = LocalTimer(local_only.is_some().then(|| (shader::fnv64(&blob), std::time::Instant::now(), sh.stage.to_string())));
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
@@ -1398,7 +1444,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, rodata: recomp::pso::local_rodata(f, p), ..Default::default() };
                         let Ok(t) = recomp::translate_routed(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
@@ -2038,9 +2084,9 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                         let t = std::time::Instant::now();
                         let r = {
                             let (tx, rx) = std::sync::mpsc::channel();
-                            let (c, m) = (code.to_vec(), mode.clone());
+                            let (c, m, rodata) = (code.to_vec(), mode.clone(), recomp::pso::local_rodata(f, p));
                             std::thread::spawn(move || {
-                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
+                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate, &rodata));
                             });
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
@@ -2082,7 +2128,7 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                                     recomp::Mode::Pixel(_) => "ps_6_6",
                                     _ => "cs_6_6",
                                 };
-                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, ..Default::default() };
+                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, rodata: recomp::pso::local_rodata(f, p), ..Default::default() };
                                 let t = recomp::translate(code, &opt).ok().filter(|t| t.complete())?;
                                 dump("hlsl", t.hlsl.as_bytes());
                                 let d = recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok()?;

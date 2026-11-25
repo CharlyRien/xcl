@@ -320,6 +320,7 @@ pub unsafe fn on_present(queue: *mut c_void, res: usize, dump: bool) {
             // LOCAL (agent Z): the textures the traced full-screen dispatches named, after the targets
             list.extend(fs_extra.iter().copied().filter(|r| *r != res && !t.iter().take(max).any(|(x, _)| x == r)));
             list.extend(super::depth_uav::local_dump_extra(n)); // LOCAL agent I: depth twins and their snapshots
+            list.extend(local_3d_list()); // LOCAL agent J: small 3D title textures (XCL_LOCAL_LUT_DUMP)
             dump_targets(queue, &list, std::path::Path::new(&dir), n);
         }
     }
@@ -441,7 +442,9 @@ unsafe fn dump_targets(queue: *mut c_void, targets: &[usize], dir: &std::path::P
         let raw = r as *mut c_void;
         let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
         let d = res.GetDesc();
-        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 || ((d.Width < 16 || d.Height < 16) && fs_frames() == 0) { // LOCAL: small ones too with FSTRACE (agent Z)
+        let local_3d = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && local_lut_on(); // LOCAL agent J
+        if local_3d {
+        } else if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 || ((d.Width < 16 || d.Height < 16) && fs_frames() == 0) { // LOCAL: small ones too with FSTRACE (agent Z)
             crate::xlog_info!("rtsum: frame {frame} dump: {r:#x} not dumped (dimension {}, {} samples)", d.Dimension.0, d.SampleDesc.Count);
             continue;
         }
@@ -495,9 +498,97 @@ unsafe fn dump_targets(queue: *mut c_void, targets: &[usize], dir: &std::path::P
     }
     let _ = std::fs::create_dir_all(dir);
     for (k, p) in pending.iter().enumerate() {
-        write_target(p, dir, frame, k);
+        if p.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            write_3d(p, dir, frame, k); // LOCAL agent J
+        } else {
+            write_target(p, dir, frame, k);
+        }
         release(p.res);
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// LOCAL agent J (`XCL_LOCAL_LUT_DUMP=1`, with the frame dumps): the title's small 3D textures
+// (colour look-up tables a compute program bakes) are kept (32 to 256 wide; one reference each, at most 16) and
+// read back whole with each dump: distinct texels over all slices, raw bytes to `<dir>`.
+// ---------------------------------------------------------------------------------------
+static LOCAL_3D: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn local_lut_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var("XCL_LOCAL_LUT_DUMP").is_ok_and(|v| v == "1"))
+}
+
+pub unsafe fn local_note_3d(res: usize, pc: &D3D12_RESOURCE_DESC) {
+    // (32 to 256 wide only: the title also makes dozens of 17-cube and 1-cube ones)
+    if !local_lut_on() || pc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || pc.Width > 256 || pc.Width < 32 {
+        return;
+    }
+    let mut g = LOCAL_3D.lock().unwrap();
+    if g.len() >= 16 || g.contains(&res) {
+        return;
+    }
+    add_ref(res);
+    g.push(res);
+    crate::xlog_info!("LOCAL agentJ lut: 3D title texture {res:#x} {}x{}x{} f{} mips {} flags {:#x} (#{}, kept for the dumps)", pc.Width, pc.Height, pc.DepthOrArraySize, pc.Format.0, pc.MipLevels, pc.Flags.0, g.len());
+}
+
+fn local_3d_list() -> Vec<usize> {
+    LOCAL_3D.lock().unwrap().clone()
+}
+
+unsafe fn write_3d(p: &Pending, dir: &std::path::Path, frame: u64, k: usize) {
+    let mut m: *mut c_void = std::ptr::null_mut();
+    if p.rb.Map(0, None, Some(&mut m)).is_err() || m.is_null() {
+        return;
+    }
+    let fp = &p.fp;
+    let f = fp.Footprint.Format;
+    let bpt = texel_bytes(f);
+    let (w, h, d, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.Depth as usize, fp.Footprint.RowPitch as usize);
+    let base = (m as *const u8).add(fp.Offset as usize);
+    let mut raw: HashMap<Vec<u8>, u64> = HashMap::new();
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    let mut slice0: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut bytes = Vec::with_capacity(w * h * d * bpt);
+    for z in 0..d {
+        for y in 0..h {
+            let row = base.add((z * h + y) * pitch);
+            bytes.extend_from_slice(std::slice::from_raw_parts(row, w * bpt));
+            for x in 0..w {
+                let t = row.add(bpt * x);
+                let key = std::slice::from_raw_parts(t, bpt.min(16)).to_vec();
+                if z == 0 {
+                    slice0.insert(key.clone());
+                }
+                *raw.entry(key).or_default() += 1;
+                if let Some(c) = channels(f, t) {
+                    for i in 0..3 {
+                        if c[i].is_finite() {
+                            lo[i] = lo[i].min(c[i]);
+                            hi[i] = hi[i].max(c[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    p.rb.Unmap(0, None);
+    let mut top: Vec<(Vec<u8>, u64)> = raw.into_iter().collect();
+    let distinct = top.len();
+    top.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let hex = |b: &[u8]| b.iter().rev().map(|v| format!("{v:02x}")).collect::<String>();
+    let name = format!("lut_f{frame}_{k:02}_{w}x{h}x{d}_fmt{}.bin", p.desc.Format.0);
+    let _ = std::fs::write(dir.join(&name), &bytes);
+    crate::xlog_info!(
+        "LOCAL agentJ lut: frame {frame} dump {k} {:#x} {w}x{h}x{d} res f{} footprint f{}: {name}; {} texels, {distinct} distinct ({} distinct in slice 0), most common {}; ch min {lo:?} max {hi:?}",
+        p.res,
+        p.desc.Format.0,
+        f.0,
+        w * h * d,
+        slice0.len(),
+        top.iter().take(4).map(|(v, c)| format!("{}x{c}", hex(v))).collect::<Vec<_>>().join(" ")
+    );
 }
 
 unsafe fn write_target(p: &Pending, dir: &std::path::Path, frame: u64, k: usize) {

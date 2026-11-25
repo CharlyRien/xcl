@@ -935,6 +935,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                     real::note_title_address(*ppv as usize, va as usize);
                     super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
                     super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc, flags, state);
+                    super::rtsum::local_note_3d(*ppv as usize, &pc); // LOCAL agent J
                 }
                 return hr;
             }
@@ -951,6 +952,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
+        if let Some(pc) = pc_tex_desc.as_ref() {
+            super::rtsum::local_note_3d(*ppv as usize, pc); // LOCAL agent J
+        }
         let aliased_to_gpu = pc_tex_desc.as_ref().is_some_and(|pc| {
             super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, pc, flags, state)
         });

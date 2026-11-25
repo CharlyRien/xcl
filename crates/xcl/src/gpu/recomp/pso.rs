@@ -352,7 +352,44 @@ mod translated {
         compact: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
-        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, compact, translate)
+        cached_in(dir, local_identity_for(blob), blob, stage, sampler_base, windows, split, compact, translate)
+    }
+
+    /// LOCAL agent J, not for upstream: `XCL_LOCAL_TRANSLATED_BASE_SRC=<16 hex>` is the
+    /// `XCL_TRANSLATOR_SOURCE_ID` of the build this one differs from only by the port of PR
+    /// #2229 (constant data after the program). That port changes the HLSL of a program only
+    /// when `Options::rodata` is not empty, so a container none of whose programs has a data
+    /// block after it (or a driver container, which never gets one) keeps the entries of that
+    /// build; every other container gets this build's own identity and is translated again.
+    /// HLSL backend only (the direct translator's change is not limited that way).
+    fn local_identity_for(blob: &[u8]) -> u64 {
+        let own = identity();
+        static BASE: OnceLock<u64> = OnceLock::new();
+        let base = *BASE.get_or_init(|| {
+            let Ok(src) = std::env::var("XCL_LOCAL_TRANSLATED_BASE_SRC") else { return 0 };
+            if own == 0 || Backend::current() != Backend::Hlsl || std::env::var_os("XCL_LOCAL_TRANSLATED_ID").is_some() {
+                return 0;
+            }
+            let base = identity_for(src.trim(), super::dxc::toolchain_identity());
+            let dir = super::dxc::cache_dir().join("translated").join("v2").join(format!("{base:016x}"));
+            crate::xlog_info!(
+                "LOCAL agentJ: translated cache: own identity {own:016x} (source {}), containers without data after their programs use {base:016x} (source {}, directory exists: {})",
+                env!("XCL_TRANSLATOR_SOURCE_ID"),
+                src.trim(),
+                dir.is_dir()
+            );
+            base
+        });
+        if base == 0 {
+            return own;
+        }
+        let has_rodata = crate::gpu::xbox::parse(blob).is_some_and(|sh| sh.fssm.iter().any(|f| f.programs.iter().any(|p| !super::local_rodata(f, p).is_empty())));
+        static COUNT: [std::sync::atomic::AtomicU32; 2] = [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
+        let n = COUNT[has_rodata as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if has_rodata && (n <= 400 || n % 100 == 0) {
+            crate::xlog_info!("LOCAL agentJ: container {:016x} has data after a program: own identity (#{n}; {} without so far)", crate::gpu::shader::fnv64(blob), COUNT[0].load(std::sync::atomic::Ordering::Relaxed));
+        }
+        if has_rodata { own } else { base }
     }
 }
 
@@ -647,6 +684,45 @@ fn direct_fallback(stage: &str, err: &str) {
     crate::xlog_info!("[SHADER] direct DXIL fallback stage={stage} reason=\"{reason}\" detail=\"{}\" – HLSL path", err.lines().next().unwrap_or(""));
 }
 
+/// LOCAL agent J, not for upstream: the constant data PR #2229 gives the translators
+/// (`Fssm::rodata`). `XCL_LOCAL_RODATA_GETPC_ONLY=1`: none for a program without any
+/// `s_getpc_b64` - it cannot form a code address, so with memory windows its loads never reach
+/// the table, and without the table its translation is the one of the build before the port
+/// (`translated::local_identity_for` keeps that build's cache entries for it).
+pub(crate) fn local_rodata(f: &xbox::Fssm, p: &xbox::Program) -> Vec<(u32, Vec<u32>)> {
+    let r = f.rodata(p);
+    static GETPC_ONLY: OnceLock<bool> = OnceLock::new();
+    if r.is_empty() || !*GETPC_ONLY.get_or_init(|| std::env::var("XCL_LOCAL_RODATA_GETPC_ONLY").is_ok_and(|v| v == "1")) {
+        return r;
+    }
+    let Some(code) = f.data.get(p.offset..p.offset + p.len) else { return r };
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        // (a program that does not decode keeps its table)
+        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return r };
+        if d.inst.name == "S_GETPC_B64" {
+            return r;
+        }
+        off += d.len;
+    }
+    Vec::new()
+}
+
+/// Whether the program takes an address in its code region for something else than a far jump
+/// (`rdna2::resolve_far_jumps`): an `s_getpc_b64` the compiler emits to reach the constant
+/// data after the program.
+fn takes_code_address(code: &[u8]) -> bool {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return false };
+        off += d.len;
+        insts.push(d);
+    }
+    crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    (0..insts.len()).any(|i| insts[i].inst.name == "S_GETPC_B64" && !insts.get(i + 3).is_some_and(|s| s.far_target.is_some()))
+}
+
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
@@ -655,10 +731,13 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
+    // the constant data the program reads from its own code region (`Options::rodata`)
+    let rodata = local_rodata(f, p);
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
-    if super::lower_dxil::enabled() {
+    // (and for a program that reads constant data in its code: the per-lane form has no table)
+    if super::lower_dxil::enabled() && !(!rodata.is_empty() && takes_code_address(code)) {
         match super::lower_dxil::compute_with(code, &cs, o) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
@@ -671,7 +750,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Compute(cs), &rodata)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -702,11 +781,12 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
-    let k = match (&mode, stage) {
-        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
-        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
+    let entry = match (&mode, stage) {
+        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::Entry::Vertex(vs.clone()),
+        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::Entry::Pixel(ps.clone()),
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
+    let k = crate::gpu::dxil::kernel::translate_entry_rodata(code, o, entry, &local_rodata(f, p))?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -798,7 +878,9 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     local_skip(code)?;
-    let (t, compact) = translate_as(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form)?;
+    // LOCAL agent J: PR #2229 port on the local `translate_as` (the compact form is refused for
+    // a program with constant data after it, see `translate_as`)
+    let (t, compact) = translate_as(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, rodata: local_rodata(f, p), ..Default::default() }, form)?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -845,10 +927,12 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::detect_wave64(code);
+    // LOCAL agent J: PR #2229 port on the local (uncached) mesh path
+    let rodata = local_rodata(f, p);
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
     if crate::gpu::dxil::kernel::enabled() {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
-        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+        match crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Mesh(ms.clone()), &rodata) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
@@ -859,7 +943,7 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)
+    finish_two_pass(super::translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: mem_windows(), rodata, ..Default::default() })?, record, ps)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
