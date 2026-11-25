@@ -548,7 +548,18 @@ pub(super) unsafe fn run(
         let (a, b) = r.split_once("..")?;
         Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
     });
-    let wanted = |d: &GDraw| !range.is_some_and(|(a, b)| d.k < a || d.k > b);
+    // LOCAL (agent G): `XCL_LREPLAY_SKIP=k,k,...` (or a file of numbers, `@<path>`): draws left out
+    let skip: std::collections::HashSet<u32> = env("XCL_LREPLAY_SKIP")
+        .map(|v| match v.strip_prefix('@') {
+            Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
+            None => v,
+        })
+        .map(|v| v.split(|c: char| c == ',' || c.is_whitespace()).filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    if !skip.is_empty() {
+        summary(format!("skip: {} draws left out", skip.len()));
+    }
+    let wanted = |d: &GDraw| !range.is_some_and(|(a, b)| d.k < a || d.k > b) && !skip.contains(&d.k);
     // every view's eviction state at the capture (views.txt: index, resource, view format, evicted)
     let mut views: HashMap<u32, (u64, u32, bool)> = HashMap::new();
     if let Ok(t) = std::fs::read_to_string(dir.join("views.txt")) {

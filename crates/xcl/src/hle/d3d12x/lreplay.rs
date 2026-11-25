@@ -166,13 +166,29 @@ fn load(dir: &Path) -> Capture {
     let mut f = Files { dir: dir.to_path_buf(), cache: HashMap::new(), missing: 0 };
     let mut c = Capture { uma_hi: 4, ranges: vec![], texs: vec![], descs: HashMap::new(), views: vec![], samplers: vec![], psos: HashMap::new(), dispatch: None, targets: (vec![], 0), draws: vec![], missing: 0, complete: vec![], rec_info: vec![], gdraws: vec![], evicted: HashMap::new(), gtargets: vec![], gexec: vec![], oow: vec![], oowslots: vec![], oowio: vec![] };
     let mut recs: HashMap<u32, Vec<[u32; 4]>> = HashMap::new();
+    // LOCAL (agent G): `XCL_LREPLAY_SRC=cpuroot`: the root descriptors' targets from the CPU's bytes at
+    // record time (`range root@... cpu`); `=cpuafter`: from the CPU's bytes once the GPU had run the
+    // lists (`cpuafter` lines); the other ranges from the GPU's bytes
+    let src = env("XCL_LREPLAY_SRC").unwrap_or_default();
+    let after: HashMap<u64, String> = man.lines().filter(|l| l.starts_with("cpuafter ") && tok(l, "file").is_some()).map(|l| (hex(tok(l, "ea").unwrap()), tok(l, "file").unwrap().to_string())).collect();
+    let mut src_used = 0usize;
     for l in man.lines() {
         let first = l.split_whitespace().next().unwrap_or("");
         match first {
             "uma_base_hi" => c.uma_hi = hex(tok(l, "uma_base_hi").unwrap()) as u32,
             "range" => {
                 let n = hex(tok(l, "bytes").unwrap()) as usize;
-                let bytes = if env("XCL_LREPLAY_SRC").is_some_and(|v| v == "cpu") && tok(l, "cpu").is_some() { f.try_get(tok(l, "cpu").unwrap(), n) } else { f.try_get(tok(l, "file").unwrap(), n) };
+                let root = l.split_whitespace().nth(1).is_some_and(|x| x.starts_with("root@"));
+                let ea = tok(l, "ea").map_or(0, hex);
+                let bytes = if src == "cpu" && tok(l, "cpu").is_some() || src == "cpuroot" && root && tok(l, "cpu").is_some() {
+                    src_used += 1;
+                    f.try_get(tok(l, "cpu").unwrap(), n)
+                } else if src == "cpuafter" && root && after.contains_key(&ea) {
+                    src_used += 1;
+                    f.try_get(&after[&ea], n)
+                } else {
+                    f.try_get(tok(l, "file").unwrap(), n)
+                };
                 let Some(bytes) = bytes else { continue };
                 c.ranges.push(Range { w: tok(l, "window").unwrap().parse().unwrap(), off: hex(tok(l, "offset").unwrap()), phase: tok(l, "phase").unwrap().to_string(), bytes });
             }
@@ -282,6 +298,9 @@ fn load(dir: &Path) -> Capture {
     }
     c.missing = f.missing;
     c.complete = man.lines().filter(|l| l.starts_with("complete ")).map(String::from).collect();
+    if !src.is_empty() {
+        summary(format!("source {src}: {src_used} ranges from the CPU's bytes ({} cpuafter ranges in the capture)", after.len()));
+    }
     c
 }
 

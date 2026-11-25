@@ -1858,6 +1858,81 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
 }
 
+/// LOCAL (agent G): `XCL_LOCAL_SPARSE_AUDIT=<N>[,<lo>-<hi>]`: every N-th submit, after the pages the
+/// write-watch reported were scanned, every committed page of the mapped tiles (in `[lo, hi)`, hex,
+/// when given) is compared with what was last sent to its video memory. A 64-byte chunk the CPU holds
+/// differently that this submit does not upload is a CPU write the GPU never got (a write the
+/// write-watch did not report, or one dropped on the way). Logged (count, bytes, first addresses);
+/// with `XCL_LOCAL_SPARSE_AUDIT_FIX=1` they are uploaded with this submit (the brute-force resync,
+/// for an A/B run). Measured in capture R4 (`D/mesures/agentG-image-hors-jeu.md`): the GPU's bytes of
+/// the mesh draws' root buffers in window 0 were not the CPU's.
+unsafe fn local_audit(s: &mut State, dirty_runs: &mut Vec<(usize, usize)>) {
+    static CFG: OnceLock<Option<(u64, usize, usize, bool)>> = OnceLock::new();
+    let Some(&(every, lo, hi, fix)) = CFG
+        .get_or_init(|| {
+            let v = std::env::var("XCL_LOCAL_SPARSE_AUDIT").ok()?;
+            let mut it = v.split(',');
+            let every: u64 = it.next()?.trim().parse().ok().filter(|&n: &u64| n > 0)?;
+            let (lo, hi) = it
+                .next()
+                .and_then(|r| r.split_once('-'))
+                .and_then(|(a, b)| Some((usize::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?, usize::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()?)))
+                .unwrap_or((0, usize::MAX));
+            let fix = std::env::var("XCL_LOCAL_SPARSE_AUDIT_FIX").is_ok_and(|v| v.trim() == "1");
+            crate::xlog_info!("LOCAL sparse audit: every {every} submits, {lo:#x}..{hi:#x}, fix {fix}");
+            Some((every, lo, hi, fix))
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % every != 0 {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    let mut pages = 0usize;
+    let mut tiles: Vec<usize> = s.mapped.keys().copied().filter(|&t| t + TILE > lo && t < hi).collect();
+    tiles.sort_unstable();
+    for t in tiles {
+        let Some(entry) = s.mapped.get_mut(&t) else { continue };
+        for idx in 0..PAGES_PER_TILE {
+            if entry.holes & (1u16 << idx) != 0 {
+                continue;
+            }
+            let pg = t + idx * PAGE;
+            if pg + PAGE <= lo || pg >= hi {
+                continue;
+            }
+            pages += 1;
+            let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+            if fix {
+                scan_page(bytes, pg, &mut entry.sent[idx], &mut found);
+            } else {
+                let mut copy = entry.sent[idx].clone();
+                scan_page(bytes, pg, &mut copy, &mut found);
+            }
+        }
+    }
+    let bytes: usize = found.iter().map(|r| r.1).sum();
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let total = TOTAL.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
+    let first: Vec<String> = found.iter().take(6).map(|&(a, l)| format!("{a:#x}+{l:#x}")).collect();
+    crate::xlog_info!(
+        "LOCAL sparse audit at submit {n}: {} chunk runs, {bytes} B the CPU holds that the GPU was not sent ({total} B so far), {pages} pages looked at in {} ms{}; first {}",
+        found.len(),
+        t0.elapsed().as_millis(),
+        if fix { ", uploaded now" } else { "" },
+        first.join(" ")
+    );
+    if fix {
+        dirty_runs.extend(found);
+        dirty_runs.sort_unstable();
+    }
+}
+
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
@@ -1905,6 +1980,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             x = end;
         }
     }
+    local_audit(s, &mut dirty_runs); // LOCAL (agent G)
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     // (a GPU write on its way back keeps its chunk out of this upload: `AsyncRb`)

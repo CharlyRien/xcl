@@ -479,6 +479,15 @@ struct Cap {
     guess_bytes: u64,
     reserve: u64,
     trace: HashMap<usize, String>,
+    /// LOCAL (agent G): root-descriptor ranges whose CPU bytes were taken at record time: read again
+    /// once the GPU ran the captured lists (`cpu_after.bin`)
+    cpu_roots: Vec<(usize, usize)>,
+}
+
+/// LOCAL (agent G): `XCL_LOCAL_LCAP_ROOT_CPU=0` leaves out the CPU bytes of the root descriptors'
+/// targets (taken by default: the GPU's copy of them differed from the CPU's in capture R4)
+fn root_cpu() -> bool {
+    env("XCL_LOCAL_LCAP_ROOT_CPU").is_none_or(|v| v != "0")
 }
 
 /// LOCAL (agent L): capture `k` goes to `<XCL_LOCAL_LCAP>/c<k>`
@@ -579,7 +588,11 @@ impl Cap {
         };
         l.CopyBufferRegion(self.chunks[c].rb.as_ref().unwrap(), at, w, off, n as u64);
         let mut line = format!("range {name} ea {p:#x} window {k} offset {off:#x} bytes {n:#x} phase {phase} file chunk{c}.bin@{at:#x}");
-        if cpu && crate::gpu::shader::readable(p, n) {
+        // (LOCAL agent G: a budget for the CPU copies, `XCL_LOCAL_LCAP_CPU_MB`, 1024 by default)
+        if cpu && self.cpu.len() + n <= (geom_num("XCL_LOCAL_LCAP_CPU_MB", 1024) << 20) as usize && crate::gpu::shader::readable(p, n) {
+            if name.starts_with("root@") {
+                self.cpu_roots.push((p, n));
+            }
             let o = self.cpu.len();
             self.cpu.extend_from_slice(std::slice::from_raw_parts(p as *const u8, n));
             line += &format!(" cpu cpu.bin@{o:#x} cpu_bytes {n:#x}");
@@ -610,11 +623,17 @@ impl Cap {
                 Some(va) => {
                     let src = crate::hle::kernelx::mirrors::source(va).unwrap_or(va);
                     let m = 0x1_0000usize;
+                    // LOCAL (agent G): also the address XCL really reads the texture from
+                    // (`title_textures::local_source`: the GPU view itself when a physical page is
+                    // mapped there), whether a page is mapped at the GPU view, and its bytes
+                    let nz = |p: usize| if crate::gpu::shader::readable(p, m) { format!("{}/{m}", std::slice::from_raw_parts(p as *const u8, m).iter().filter(|x| **x != 0).count()) } else { "unreadable".to_string() };
+                    let used = super::title_textures::local_source(r);
+                    let more = format!(" xcl_src {} at_va {} phys_at_va {} pending {}", used.map_or("none".to_string(), |u| format!("{u:#x} {}", nz(u))), nz(va), crate::hle::kernelx::physical_page_at(va), super::title_textures::local_pending(r));
                     if crate::gpu::shader::readable(src, m) {
                         let b = std::slice::from_raw_parts(src as *const u8, m);
-                        format!(" title {va:#x} cpu_nz {}/{m}", b.iter().filter(|x| **x != 0).count())
+                        format!(" title {va:#x} cpu_nz {}/{m}{more}", b.iter().filter(|x| **x != 0).count())
                     } else {
-                        format!(" title {va:#x} cpu_unreadable")
+                        format!(" title {va:#x} cpu_unreadable{more}")
                     }
                 }
             }
@@ -859,7 +878,7 @@ impl Cap {
                 }
             }
             if let Some(n) = inw {
-                self.range(l, &format!("root@{a:#x}"), a, n, phase, false);
+                self.range(l, &format!("root@{a:#x}"), a, n, phase, root_cpu());
                 let m = 4096.min(n);
                 if crate::gpu::shader::readable(a, m) {
                     small.push((format!("root{dw}"), (0..m / 4).map(|k| (a as *const u32).add(k).read_unaligned()).collect()));
@@ -1412,6 +1431,8 @@ struct Job {
     q: ID3D12CommandQueue,
     dev: ID3D12Device,
     from: String,
+    /// LOCAL (agent G): the root ranges to read again on the CPU once the GPU is done
+    cpu_roots: Vec<(usize, usize)>,
 }
 struct SendJob(Job);
 unsafe impl Send for SendJob {}
@@ -1482,7 +1503,7 @@ unsafe fn try_flush(c: &mut Cap, q: &ID3D12CommandQueue, from: &str) {
     if let Some(f) = &fence {
         let _ = q.Signal(f, 1);
     }
-    let job = Job { seq: JOB_SEQ.fetch_add(1, Relaxed), index: c.index, dir: cap_dir(c.index), lines, cpu: c.cpu.clone(), chunks, fin, draws: c.draws, skipped: c.skipped, fence, q: q.clone(), dev, from: from.to_string() };
+    let job = Job { seq: JOB_SEQ.fetch_add(1, Relaxed), index: c.index, dir: cap_dir(c.index), lines, cpu: c.cpu.clone(), chunks, fin, draws: c.draws, skipped: c.skipped, fence, q: q.clone(), dev, from: from.to_string(), cpu_roots: if fin { c.cpu_roots.clone() } else { Vec::new() } };
     crate::xlog_info!("LOCAL lcap: capture {} {} handed to the writer ({} chunks, from {from})", c.index, if fin { "(all)" } else { "(cs stage)" }, job.chunks.len());
     if !fin {
         c.cs_flushed = true;
@@ -1529,9 +1550,27 @@ unsafe fn run_job(job: Job) {
         },
         None => false,
     };
+    // LOCAL (agent G): the CPU's view of the root ranges now that the GPU ran the lists: next to the
+    // CPU bytes taken at record time and the GPU's (`range ... cpu`), it tells a CPU write the GPU
+    // never got (record = after != GPU) from data the GPU wrote (GPU = after != record)
+    let mut extra: Vec<String> = Vec::new();
+    if !job.cpu_roots.is_empty() {
+        let mut after: Vec<u8> = Vec::new();
+        for &(p, n) in &job.cpu_roots {
+            if crate::gpu::shader::readable(p, n) {
+                let o = after.len();
+                after.extend_from_slice(std::slice::from_raw_parts(p as *const u8, n));
+                extra.push(format!("cpuafter ea {p:#x} bytes {n:#x} file cpu_after.bin@{o:#x} at {:.3} s", crate::log::uptime()));
+            } else {
+                extra.push(format!("cpuafter ea {p:#x} bytes {n:#x} not readable"));
+            }
+        }
+        let _ = std::fs::write(job.dir.join("cpu_after.bin"), &after);
+    }
     let (total, done) = read_chunks(&job.dev, &job.q, &job.chunks, &job.dir);
     if LAST_SEQ.load(Relaxed) <= job.seq {
-        write_man(&[format!("complete {} chunks {done:?} of {} fence {fence_ok} bytes {total:#x} draws {} skipped {}", if job.fin { "all" } else { "cs" }, job.chunks.len(), job.draws, job.skipped)]);
+        extra.push(format!("complete {} chunks {done:?} of {} fence {fence_ok} bytes {total:#x} draws {} skipped {}", if job.fin { "all" } else { "cs" }, job.chunks.len(), job.draws, job.skipped));
+        write_man(&extra);
     }
     crate::xlog_info!("LOCAL lcap: written {} ({}, from {}): chunks {done:?} of {}, {} MB, {} manifest lines, {} draws, in {:.1} s", job.dir.display(), if job.fin { "all" } else { "cs stage" }, job.from, job.chunks.len(), total >> 20, job.lines.len(), job.draws, t0.elapsed().as_secs_f64());
     if job.fin && job.index + 1 < repeat() {

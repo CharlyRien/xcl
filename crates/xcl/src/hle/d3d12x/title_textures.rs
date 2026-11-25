@@ -528,6 +528,18 @@ pub fn forget(res: usize) {
     }
 }
 
+/// LOCAL (agent G): where texture `res` is read from now (`Entry::src`), for the capture
+pub fn local_source(res: usize) -> Option<usize> {
+    let t = TEXTURES.lock().unwrap();
+    t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.src)
+}
+
+/// LOCAL (agent G): whether texture `res` still waits for an upload (`Entry::pending`)
+pub fn local_pending(res: usize) -> bool {
+    let t = TEXTURES.lock().unwrap();
+    t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).is_some_and(|e| e.pending)
+}
+
 /// The title-memory address of a texture kept in step with it.
 pub fn address(res: usize) -> Option<usize> {
     let t = TEXTURES.lock().unwrap();
