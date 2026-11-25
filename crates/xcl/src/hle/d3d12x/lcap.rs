@@ -70,7 +70,22 @@ fn cs_set() -> &'static [String] {
 // ---------------------------------------------------------------------------------------
 fn uav_watch() -> &'static [u32] {
     static V: OnceLock<Vec<u32>> = OnceLock::new();
-    V.get_or_init(|| env("XCL_LOCAL_LCAP_CS_UAV").map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect()).unwrap_or_default())
+    V.get_or_init(|| {
+        let mut v: Vec<u32> = env("XCL_LOCAL_LCAP_CS_UAV").map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect()).unwrap_or_default();
+        // LOCAL (agent Li): `XCL_LOCAL_LCAP_CS_FOR_VIEW` alone turns the watch on (index 0 never matches a UAV slot)
+        if v.is_empty() && view_watch().is_some() {
+            v.push(u32::MAX);
+        }
+        v
+    })
+}
+
+/// LOCAL (agent Li): `XCL_LOCAL_LCAP_CS_FOR_VIEW=<read view index>` (e.g. 21156, an R9G9B9E5 view whose R32_UINT
+/// writer no UAV slot of the light textures names): the watch also matches a compute program whose UAV entry's
+/// view resource is a format-alias writer of that read view's resource (`format_alias::local_writers_of`)
+fn view_watch() -> Option<u32> {
+    static V: OnceLock<Option<u32>> = OnceLock::new();
+    *V.get_or_init(|| env("XCL_LOCAL_LCAP_CS_FOR_VIEW").and_then(|v| v.trim().parse().ok()))
 }
 
 /// the watched indices that compute program `hash`'s used-resource table names as UAV images, as
@@ -94,8 +109,18 @@ unsafe fn uav_watch_hits(hash: u64, io: &[u32]) -> (Vec<(u8, u32, u32)>, Vec<(us
             continue;
         }
         let w: Vec<u32> = (0..8).map(|k| (p as *const u32).add(k).read_unaligned()).collect();
-        if w[3] >> 28 >= 8 && uav_watch().contains(&w[0]) {
+        if w[3] >> 28 < 8 {
+            continue;
+        }
+        if uav_watch().contains(&w[0]) {
             hits.push((dw, off, w[0]));
+        } else if let Some(v) = view_watch() {
+            // LOCAL (agent Li): the UAV's resource is a writer of the alias pair of the watched read view
+            let uav_res = view_of(w[0] + 1).map_or(0, |x| x.res);
+            let reader = view_of(v).map_or(0, |x| x.res);
+            if uav_res != 0 && reader != 0 && super::format_alias::local_writers_of(reader).iter().any(|(wr, _)| *wr == uav_res) {
+                hits.push((dw, off, w[0]));
+            }
         }
     }
     (hits, slots)

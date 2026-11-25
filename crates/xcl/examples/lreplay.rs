@@ -1750,6 +1750,7 @@ unsafe fn trial(s: &mut Session, tm: &mut Vec<(&'static str, f64)>) {
                 iow[i] = hex(&v) as u32;
             }
         }
+        alias_copies(s, &dev, "prealias"); // LOCAL (agent Li)
         let io_buf = upload_words(&mut s.g, &iow);
         let l = s.g.list();
         l.SetDescriptorHeaps(&[Some(s.dh.clone()), Some(s.sh.clone())]);
@@ -1786,50 +1787,7 @@ unsafe fn trial(s: &mut Session, tm: &mut Vec<(&'static str, f64)>) {
             }
         }
         lap(tm, "compute outputs");
-        // LOCAL (agent Li): `alias<W>=<R>`: the texels of texture W (a writer the dispatch wrote, R32_UINT)
-        // copied raw into texture R (its R9G9B9E5 reader) through a buffer, as XCL's format-alias sync does
-        // (`format_alias::sync_pair`), before the draws
-        for (k, v) in directives() {
-            let (Some(w), Ok(r)) = (k.strip_prefix("alias").and_then(|x| x.parse::<u32>().ok()), v.trim().parse::<u32>()) else { continue };
-            let (Some((wr, ws)), Some((rr, rs))) = (s.res.get(&w).cloned(), s.res.get(&r).cloned()) else {
-                summary(format!("alias{w}={r}: texture not in this replay"));
-                continue;
-            };
-            let (wd, rd) = (wr.GetDesc(), rr.GetDesc());
-            let (mut wf, mut rf) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default());
-            let (mut wt, mut rt) = (0u64, 0u64);
-            dev.GetCopyableFootprints(&wd, 0, 1, 0, Some(&mut wf), None, None, Some(&mut wt));
-            dev.GetCopyableFootprints(&rd, 0, 1, 0, Some(&mut rf), None, None, Some(&mut rt));
-            if wf.Footprint.RowPitch != rf.Footprint.RowPitch || wf.Footprint.Height != rf.Footprint.Height {
-                summary(format!("alias{w}={r}: footprints differ ({:?} / {:?})", (wf.Footprint.RowPitch, wf.Footprint.Height), (rf.Footprint.RowPitch, rf.Footprint.Height)));
-                continue;
-            }
-            let b = buf(&dev, wt.max(rt), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);
-            let l = s.g.list();
-            if ws != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                l.ResourceBarrier(&[transition(&wr, ws, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            }
-            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&wr), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-            let mid = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&b), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: wf } };
-            l.CopyTextureRegion(&mid, 0, 0, 0, &src, None);
-            l.ResourceBarrier(&[transition(&b, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            if rs != D3D12_RESOURCE_STATE_COPY_DEST {
-                l.ResourceBarrier(&[transition(&rr, rs, D3D12_RESOURCE_STATE_COPY_DEST)]);
-            }
-            let mid2 = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&b), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: rf } };
-            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rr), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-            l.CopyTextureRegion(&dst, 0, 0, 0, &mid2, None);
-            if rs != D3D12_RESOURCE_STATE_COPY_DEST {
-                l.ResourceBarrier(&[transition(&rr, D3D12_RESOURCE_STATE_COPY_DEST, rs)]);
-            }
-            if ws != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                l.ResourceBarrier(&[transition(&wr, D3D12_RESOURCE_STATE_COPY_SOURCE, ws)]);
-            }
-            s.g.run(l);
-            s.g.keep.push(b.cast().unwrap());
-            s.dirty.insert(r);
-            summary(format!("alias{w}={r}: writer texels copied into the reader ({wt} bytes)"));
-        }
+        alias_copies(s, &dev, "alias"); // LOCAL (agent Li)
     }
     // ---- the depth before the draws, then the draws
     if do_tl {
@@ -1843,6 +1801,53 @@ unsafe fn trial(s: &mut Session, tm: &mut Vec<(&'static str, f64)>) {
     }
     s.g.keep.truncate(keep0);
     s.in_gpu = false;
+}
+
+/// LOCAL (agent Li): `alias<W>=<R>` (after the dispatch) / `prealias<W>=<R>` (before it): the texels of texture W
+/// (a writer, R32_UINT) copied raw into texture R (its R9G9B9E5 reader) through a buffer, as XCL's format-alias
+/// sync does (`format_alias::sync_pair`)
+unsafe fn alias_copies(s: &mut Session, dev: &ID3D12Device, prefix: &str) {
+    for (k, v) in directives() {
+        let (Some(w), Ok(r)) = (k.strip_prefix(prefix).and_then(|x| x.parse::<u32>().ok()), v.trim().parse::<u32>()) else { continue };
+        let (Some((wr, ws)), Some((rr, rs))) = (s.res.get(&w).cloned(), s.res.get(&r).cloned()) else {
+            summary(format!("{prefix}{w}={r}: texture not in this replay"));
+            continue;
+        };
+        let (wd, rd) = (wr.GetDesc(), rr.GetDesc());
+        let (mut wf, mut rf) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default());
+        let (mut wt, mut rt) = (0u64, 0u64);
+        dev.GetCopyableFootprints(&wd, 0, 1, 0, Some(&mut wf), None, None, Some(&mut wt));
+        dev.GetCopyableFootprints(&rd, 0, 1, 0, Some(&mut rf), None, None, Some(&mut rt));
+        if wf.Footprint.RowPitch != rf.Footprint.RowPitch || wf.Footprint.Height != rf.Footprint.Height {
+            summary(format!("{prefix}{w}={r}: footprints differ ({:?} / {:?})", (wf.Footprint.RowPitch, wf.Footprint.Height), (rf.Footprint.RowPitch, rf.Footprint.Height)));
+            continue;
+        }
+        let b = buf(&dev, wt.max(rt), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);
+        let l = s.g.list();
+        if ws != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            l.ResourceBarrier(&[transition(&wr, ws, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        }
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&wr), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        let mid = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&b), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: wf } };
+        l.CopyTextureRegion(&mid, 0, 0, 0, &src, None);
+        l.ResourceBarrier(&[transition(&b, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        if rs != D3D12_RESOURCE_STATE_COPY_DEST {
+            l.ResourceBarrier(&[transition(&rr, rs, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
+        let mid2 = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&b), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: rf } };
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rr), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        l.CopyTextureRegion(&dst, 0, 0, 0, &mid2, None);
+        if rs != D3D12_RESOURCE_STATE_COPY_DEST {
+            l.ResourceBarrier(&[transition(&rr, D3D12_RESOURCE_STATE_COPY_DEST, rs)]);
+        }
+        if ws != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            l.ResourceBarrier(&[transition(&wr, D3D12_RESOURCE_STATE_COPY_SOURCE, ws)]);
+        }
+        s.g.run(l);
+        s.g.keep.push(b.cast().unwrap());
+        s.dirty.insert(r);
+        summary(format!("{prefix}{w}={r}: writer texels copied into the reader ({wt} bytes)"));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
