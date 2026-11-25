@@ -740,6 +740,13 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     while at < end {
         let mut n = buf.len();
         if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
+            // LOCAL (agent G): a failed look leaves the CPU's writes of the whole rest of the range
+            // unsent – say so (first 8, then powers of two)
+            static FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let k = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if k <= 8 || k.is_power_of_two() {
+                crate::xlog_warn!("LOCAL write-watch: GetWriteWatch failed on {at:#x}..{end:#x} (error {}) – CPU writes there not looked at ({k} so far)", windows_sys::Win32::Foundation::GetLastError());
+            }
             break;
         }
         dirty.extend(buf[..n].iter().map(|&p| p as usize));

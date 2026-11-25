@@ -720,6 +720,37 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
         *OOW_MAP.lock().unwrap() = Some(map.clone());
         summary(format!("override oow=map: {} buffers outside the windows made readable ({} MB), {patched} of {} descriptors rewritten", map.len(), extra.iter().map(|r| r.bytes.len()).sum::<usize>() >> 20, cap.oowslots.len()));
     }
+    // LOCAL (agent G): directive `copy=<src ea>:<dst ea>:<bytes>` (hex, repeatable): what if the title
+    // memory at dst held the captured bytes found at src (e.g. a mesh draw's root buffer, whose bytes the
+    // CPU had at dst but the GPU only at src)
+    let mut copies = 0usize;
+    for (k, v) in directives() {
+        if k != "copy" {
+            continue;
+        }
+        let p: Vec<u64> = v.split(':').filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect();
+        let [src, dst, n] = p[..] else { panic!("copy={v}: want <src>:<dst>:<bytes> in hex") };
+        let ws = ((src >> 32) as u32).wrapping_sub(cap.uma_hi);
+        let wd = ((dst >> 32) as u32).wrapping_sub(cap.uma_hi);
+        let (so, dof) = (src & 0xFFFF_FFFF, dst & 0xFFFF_FFFF);
+        let mut b = vec![0u8; n as usize];
+        let mut got = 0usize;
+        for r in placed.iter().filter(|r| r.w == ws) {
+            let (lo, hi) = (so.max(r.off), (so + n).min(r.off + r.bytes.len() as u64));
+            if lo < hi {
+                b[(lo - so) as usize..(hi - so) as usize].copy_from_slice(&r.bytes[(lo - r.off) as usize..(hi - r.off) as usize]);
+                got += (hi - lo) as usize;
+            }
+        }
+        extra.push(Range { w: wd, off: dof, phase: "before".into(), bytes: b });
+        copies += 1;
+        if got < n as usize {
+            summary(format!("copy {src:#x} -> {dst:#x}: {got} of {n} bytes captured at the source (the rest zero)"));
+        }
+    }
+    if copies > 0 {
+        summary(format!("override copy: {copies} ranges of title memory replaced by captured bytes from elsewhere"));
+    }
     let placed: Vec<&Range> = placed.iter().copied().chain(extra.iter()).collect();
     const TILE: u64 = 65536;
     const WIN: u64 = 1 << 32;
