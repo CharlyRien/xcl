@@ -312,7 +312,7 @@ pub unsafe fn on_present(queue: *mut c_void, res: usize, dump: bool) {
             if *r == res { " (presented)" } else { "" }
         );
     }
-    oow_copy_reset(n); // LOCAL experiment (agent L, ported by agent Z)
+    oow_copy_reset(queue, n); // LOCAL experiment (agent L, ported by agent Z; segments: agent G)
     mirror_refresh(n); // LOCAL experiment (agent L, ported by agent Z)
     super::real::atv_summary(n); // LOCAL (agent V, ported by agent Z)
     eicap_present(queue, n, total(DRAW_EI)); // ExecuteIndirect capture
@@ -1332,6 +1332,33 @@ struct CopyPool {
     copied: u64,
     reused: u64,
     full: u64,
+    // LOCAL (agent G): the pool in `SEGS` segments, one per frame in turn; a segment is used again
+    // only once the presenting queue has passed the present that closed its frame (`seg_fence`).
+    // Before: one pool reset at each present while the GPU, behind, still had to run the lists
+    // that read it: they read the copies of a later frame (capture R4: 465 of 489 mesh draws' root
+    // buffers, positions garbage; `D/mesures/agentG-image-hors-jeu.md`, defect D1).
+    seg: usize,
+    seg_fence: Vec<u64>,
+    fence: Option<ID3D12Fence>,
+    value: u64,
+    blocked: u64,
+    faults: u64,
+}
+
+/// LOCAL (agent G): segments of the copy pool (`XCL_LOCAL_OOW_COPY_SEGS`, 4; 1 = the old behaviour,
+/// reset at each present without waiting for the GPU)
+fn copy_segs() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_LOCAL_OOW_COPY_SEGS").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &usize| n >= 1).unwrap_or(4))
+}
+
+/// LOCAL (agent G): `src` -> `dst` without faulting when a page of `src` goes away meanwhile (the
+/// plain copy crashed runs G1 and E2: `readable` checked, then the title decommitted). False: not copied.
+unsafe fn copy_no_fault(src: usize, dst: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut read = 0usize;
+    ReadProcessMemory(GetCurrentProcess(), src as *const c_void, dst as *mut c_void, len, &mut read) != 0 && read == len
 }
 
 static COPY_POOL: Mutex<Option<CopyPool>> = Mutex::new(None);
@@ -1342,20 +1369,45 @@ fn copy_bytes() -> usize {
     *N.get_or_init(|| std::env::var("XCL_LOCAL_OOW_COPY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
-/// At each present: the pool is reused from its start (and its use logged now and then).
-fn oow_copy_reset(n: u64) {
+/// At each present: the next segment of the pool is used from its start (and its use logged now
+/// and then) – LOCAL (agent G): once the GPU is past the frame that last used it.
+unsafe fn oow_copy_reset(queue: *mut c_void, n: u64) {
     if copy_bytes() == 0 {
         return;
     }
     if let Some(p) = COPY_POOL.lock().unwrap().as_mut() {
         if n % 60 == 0 || (p.full > 0 && n % 10 == 0) {
-            crate::xlog_info!("oow copy: frame {n}: {} root views copied ({} MB), {} reused, {} not copied (pool full)", p.copied, p.next >> 20, p.reused, p.full);
+            crate::xlog_info!("oow copy: frame {n}: {} root views copied ({} MB), {} reused, {} not copied (pool full), {} not copied (segment {} still in use by the GPU), {} copies faulted", p.copied, p.next >> 20, p.reused, p.full, p.blocked, p.seg, p.faults);
         }
+        let segs = copy_segs();
+        if p.seg_fence.len() != segs {
+            p.seg_fence = vec![0; segs];
+        }
+        // the frame just closed: its segment is free once the presenting queue is past this point
+        if segs > 1 {
+            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+                if p.fence.is_none() {
+                    let mut d: Option<ID3D12Device> = None;
+                    if q.GetDevice(&mut d).is_ok() {
+                        p.fence = d.and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok());
+                    }
+                }
+                if let Some(f) = &p.fence {
+                    p.value += 1;
+                    if q.Signal(f, p.value).is_ok() {
+                        p.seg_fence[p.seg] = p.value;
+                    }
+                }
+            }
+        }
+        p.seg = (p.seg + 1) % segs;
         p.next = 0;
         p.map.clear();
         p.copied = 0;
         p.reused = 0;
         p.full = 0;
+        p.blocked = 0;
+        p.faults = 0;
     }
 }
 
@@ -1370,7 +1422,7 @@ pub unsafe fn oow_copy_root_views(layout: Option<&super::console_list::Layout>, 
     }
     let (Some(l), Some(u)) = (layout, crate::gpu::uma::get()) else { return 0 };
     let mut g = COPY_POOL.lock().unwrap();
-    let p = g.get_or_insert_with(|| CopyPool { base: 0, next: 0, map: HashMap::new(), copied: 0, reused: 0, full: 0 });
+    let p = g.get_or_insert_with(|| CopyPool { base: 0, next: 0, map: HashMap::new(), copied: 0, reused: 0, full: 0, seg: 0, seg_fence: Vec::new(), fence: None, value: 0, blocked: 0, faults: 0 });
     // the pool: retried (256 / 128 / 64 MB) until the coherent window has room, at most once per frame
     if p.base == 0 && p.full == 0 {
         for mb in [256usize, 128, 64] {
@@ -1394,6 +1446,14 @@ pub unsafe fn oow_copy_root_views(layout: Option<&super::console_list::Layout>, 
     if p.base == 0 {
         return 0;
     }
+    // LOCAL (agent G): this frame's segment, and whether the GPU still reads what it holds
+    let segs = copy_segs();
+    let seg_len = (POOL_BYTES.load(std::sync::atomic::Ordering::Relaxed) / segs) & !0xFFFF;
+    let seg_base = p.base + p.seg * seg_len;
+    let busy = match (&p.fence, p.seg_fence.get(p.seg)) {
+        (Some(f), Some(&v)) if v > 0 => f.GetCompletedValue() < v,
+        _ => false,
+    };
     let mut done = 0;
     for prm in &l.params {
         let super::console_list::Param::Descriptor { at } = *prm else { continue };
@@ -1412,12 +1472,19 @@ pub unsafe fn oow_copy_root_views(layout: Option<&super::console_list::Layout>, 
             while len >= 0x1000 && !crate::gpu::shader::readable(src, len) {
                 len /= 2;
             }
-            if len < 0x1000 || p.next + len > POOL_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+            if busy {
+                p.blocked += 1;
+                continue;
+            }
+            if len < 0x1000 || p.next + len > seg_len {
                 p.full += 1;
                 continue;
             }
-            let dst = p.base + p.next;
-            std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+            let dst = seg_base + p.next;
+            if !copy_no_fault(src, dst, len) {
+                p.faults += 1;
+                continue;
+            }
             p.next += (len + 0xFF) & !0xFF;
             p.copied += 1;
             p.map.insert(a, dst as u64);

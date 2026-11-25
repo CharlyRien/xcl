@@ -799,6 +799,17 @@ impl Cap {
                 self.range(l, &format!("page0@{wb:#x}"), wb, 0x1_0000, phase, false);
             }
         }
+        // LOCAL (agent G): `XCL_LOCAL_LCAP_PAGES=<file>`: 64 KiB pages of the windows (one hex address a line, e.g.
+        // the `not captured` pages the replay's notes list) taken at the first draw that needs a page there
+        static PAGES: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+        let pages = PAGES.get_or_init(|| {
+            env("XCL_LOCAL_LCAP_PAGES").and_then(|f| std::fs::read_to_string(f).ok()).map_or_else(Vec::new, |t| t.lines().filter_map(|x| usize::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).map(|a| a & !0xFFFF).collect())
+        });
+        for &p in pages {
+            if u.window_of(p).is_some() {
+                self.range(l, &format!("page@{p:#x}"), p, 0x1_0000, phase, false);
+            }
+        }
         let Some(sp) = spec2(hash, hw) else {
             self.man.push(format!("nospec {hash:016x} hw {hw}"));
             return;
