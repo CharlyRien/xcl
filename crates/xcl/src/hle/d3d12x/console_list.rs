@@ -92,7 +92,12 @@ const INLINE_SGPRS_GFX: u32 = 24;
 const INLINE_SGPRS_MS: u32 = 16;
 const FIRST_SGPR: usize = 4;
 const FIRST_SGPR_GFX: usize = 8;
-const FIRST_SGPR_MS: usize = 16;
+/// Mesh (NGG) programs: root arguments from s15 – measured on a retail title (root signature
+/// table, table, table, SRV, 2 constants: its MS programs read the third table from s17 and
+/// the SRV's 64-bit address from s[18:19]; with s16 they got the second table and a pair
+/// (third table, SRV low half) as the address, and wrote one vertex and one primitive per
+/// group). Upstream #724 took s16 without a measurement.
+const FIRST_SGPR_MS: usize = 15;
 /// Most bytes of root arguments a layout has. The PC's limit is 64 DWORDs (256 bytes: a
 /// constant or a table 1, a root descriptor 2, D3D12 "Root Signature Limits"); the console's
 /// is not known, so 16 times that. A malformed blob (a count of 0x3FFF_FFFF constants) gets no
@@ -1133,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_arguments_go_in_user_sgprs_from_s16() {
+    fn mesh_arguments_go_in_user_sgprs_from_s15() {
         let inline = |p: &[(u32, u32)]| layout_from_blob(&rts0(p)).unwrap().inline_ms;
         assert_eq!(inline(&[(1, 2), (2, 0), (0, 0)]), 20);
         assert_eq!(inline(&[(1, 14), (2, 0)]), 64);
@@ -1144,6 +1149,13 @@ mod tests {
         let got = user_data_ms(&l, &args, 0x7_0000_0200);
         assert_eq!(got[8], 0x200);
         assert_eq!(got[9], 7);
-        assert_eq!(&got[16..], &[1, 2, 0x5000, 4, 0x80]);
+        assert_eq!(&got[15..], &[1, 2, 0x5000, 4, 0x80]);
+        // the retail title's mesh root signature: three tables, an SRV, two constants – its MS
+        // programs take the third table from s17 and the SRV's address from s[18:19]
+        let l = layout_from_blob(&rts0(&[(0, 0), (0, 0), (0, 0), (3, 0), (1, 2)])).unwrap();
+        let args: Vec<u8> = [0x100u32, 0x120, 0x140, 0x5000, 7, 1, 2].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let got = user_data_ms(&l, &args, 0);
+        assert_eq!(got[17], 0x140, "third table");
+        assert_eq!(&got[18..20], &[0x5000, 7], "SRV address");
     }
 }
