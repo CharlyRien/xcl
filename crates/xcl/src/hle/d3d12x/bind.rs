@@ -671,6 +671,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     let pso = super::pso_async::resolve_wait(raw_pso);
     if let Some(tp) = super::real::two_pass_of(pso) {
         let groups = x.saturating_mul(y).saturating_mul(z);
+        super::rtsum::direct_mesh(groups as u64); // LOCAL
         if groups == 0 {
             return;
         }
@@ -692,6 +693,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             list.Dispatch(n, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
+            super::rtsum::two_pass_headers(this, &res_buf, record_bytes, n.min(4) as u64, format!("direct DispatchMesh {groups} groups, record {record_bytes} B")); // LOCAL
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
             pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
@@ -776,6 +778,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                         let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
                         pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
                         emit_uav_barrier(list, Some(&res_buf));
+                        if compute && k == 0 {
+                            super::rtsum::two_pass_headers(this, &res_buf, record_bytes, 4, format!("ExecuteIndirect(DispatchMesh) command 0 of {max}, record {record_bytes} B")); // LOCAL
+                        }
                     }
                     Ok(())
                 })();

@@ -645,6 +645,10 @@ struct Cap {
     used: u64,
     calls: Vec<EiCall>,
     draws: Vec<String>,
+    /// LOCAL (agent J): record headers the two-pass compute pass wrote: (slot, records copied, text)
+    hdrs: Vec<(u64, u64, String)>,
+    /// direct two-pass DispatchMesh calls: [0 groups, groups > 0], and the groups summed
+    dm: [u64; 3],
 }
 
 static CAP: Mutex<Option<Cap>> = Mutex::new(None);
@@ -761,7 +765,7 @@ unsafe fn eicap_present(queue: *mut c_void, n: u64, prev_ei_draws: u64) {
                     }
                     CAPTURED.fetch_add(1, Ordering::Relaxed);
                     crate::xlog_info!("eicap: capturing the frame after present {n}");
-                    *CAP.lock().unwrap() = Some(Cap { frame: 0, rb, used: 0, calls: Vec::new(), draws: Vec::new() });
+                    *CAP.lock().unwrap() = Some(Cap { frame: 0, rb, used: 0, calls: Vec::new(), draws: Vec::new(), hdrs: Vec::new(), dm: [0; 3] });
                 }
             }
         }
@@ -804,6 +808,7 @@ unsafe fn log_cap(c: &Cap) {
     let f = c.frame;
     let (mut g_calls, mut g_zero_count, mut g_zero_inst, mut g_unwritten, mut g_work) = (0usize, 0, 0, 0, 0);
     let mut c_zero = 0;
+    let (mut m_calls, mut m_zero, mut m_work, mut m_unwritten, mut m_groups) = (0usize, 0usize, 0usize, 0usize, 0u64);
     for e in &c.calls {
         let base = e.slot * SLOT;
         let count = if e.has_count { Some(w(base)) } else { None };
@@ -813,13 +818,25 @@ unsafe fn log_cap(c: &Cap) {
         let tail: usize = match e.last {
             0 | 2 => 4,
             1 => 5,
+            10 => 3,
             _ => 0,
         };
         let tail = if e.last == 2 { 3 } else { tail };
         let per = (e.stride / 4) as usize;
         let recs: Vec<Vec<u32>> = if per >= tail && per > 0 && tail > 0 { words.chunks(per).filter(|r| r.len() == per).map(|r| r[per - tail..].to_vec()).collect() } else { Vec::new() };
         let n_eff = count.map_or(e.max, |c| c.min(e.max));
-        if e.gfx {
+        if e.last == 10 {
+            // LOCAL: DispatchMesh records (x, y, z groups)
+            m_calls += 1;
+            if unwritten {
+                m_unwritten += 1;
+            } else if n_eff == 0 || recs.first().is_none_or(|r| r.iter().take(3).any(|&v| v == 0)) {
+                m_zero += 1;
+            } else {
+                m_work += 1;
+                m_groups += recs.first().map_or(0, |r| r[0] as u64 * r[1] as u64 * r[2] as u64);
+            }
+        } else if e.gfx {
             g_calls += 1;
             if unwritten {
                 g_unwritten += 1;
@@ -845,7 +862,29 @@ unsafe fn log_cap(c: &Cap) {
             e.text
         );
     }
+    // LOCAL: the headers (vertices, primitives) of the first records the two-pass compute pass wrote
+    let (mut h_n, mut h_empty, mut h_verts, mut h_prims, mut h_bad) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for (slot, n, text) in &c.hdrs {
+        let base = slot * SLOT;
+        let hs: Vec<(u32, u32)> = (0..*n).map(|k| (w(base + 16 + 16 * k), w(base + 20 + 16 * k))).collect();
+        for &(nv, np) in &hs {
+            h_n += 1;
+            if nv == 0xCDCD_CDCD {
+                h_bad += 1;
+            } else if nv == 0 || np == 0 {
+                h_empty += 1;
+            } else {
+                h_verts += nv as u64;
+                h_prims += np as u64;
+            }
+        }
+        crate::xlog_info!("eicap: frame {f} two-pass records (vertices, primitives) {:x?} | {text}", hs);
+    }
     c.rb.Unmap(0, None);
+    crate::xlog_info!(
+        "eicap: frame {f} mesh summary: {m_calls} indirect DispatchMesh: {m_zero} with 0 groups (or count 0), {m_work} with groups ({m_groups} groups in their first records), {m_unwritten} not executed by read time; direct two-pass DispatchMesh: {} with 0 groups, {} with groups ({} groups); record headers read: {h_n}: {h_empty} empty (0 vertices or primitives), {} with geometry ({h_verts} vertices, {h_prims} primitives), {h_bad} unwritten",
+        c.dm[0], c.dm[1], c.dm[2], h_n - h_empty - h_bad
+    );
     for (k, d) in c.draws.iter().enumerate() {
         crate::xlog_info!("eicap: frame {f} direct draw {k}: {d}");
     }
@@ -854,4 +893,55 @@ unsafe fn log_cap(c: &Cap) {
         c.calls.len() - g_calls,
         c.draws.len()
     );
+}
+
+/// LOCAL (agent J): a direct two-pass DispatchMesh of `groups` (x·y·z) in a captured frame.
+pub fn direct_mesh(groups: u64) {
+    if !on() || cap_frames() == 0 {
+        return;
+    }
+    if let Some(c) = CAP.lock().unwrap().as_mut() {
+        c.dm[if groups == 0 { 0 } else { 1 }] += 1;
+        c.dm[2] += groups;
+    }
+}
+
+/// LOCAL (agent J): after a two-pass compute pass on `list`, copy the headers (16 bytes) of its first
+/// `n` records (`record_bytes` apart from `res_va`'s buffer offset 0) for the log of a captured frame.
+pub unsafe fn two_pass_headers(list: *mut c_void, res: &ID3D12Resource, record_bytes: u64, n: u64, text: String) {
+    if !on() || cap_frames() == 0 || n == 0 {
+        return;
+    }
+    let mut g = CAP.lock().unwrap();
+    let Some(c) = g.as_mut() else { return };
+    if c.used >= SLOTS || c.hdrs.len() >= 400 {
+        return;
+    }
+    let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return };
+    let n = n.min((SLOT - 16) / 16);
+    let slot = c.used;
+    c.used += 1;
+    let barrier = |before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES| {
+        let b = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(res.clone())),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        };
+        l.ResourceBarrier(&[b.clone()]);
+        let mut b = b;
+        std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.Transition).pResource);
+    };
+    barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for k in 0..n {
+        l.CopyBufferRegion(&c.rb, slot * SLOT + 16 + 16 * k, res, k * record_bytes, 16);
+    }
+    barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    c.hdrs.push((slot, n, text));
 }
