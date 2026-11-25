@@ -2491,4 +2491,104 @@ mod tests {
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
+
+    /// LOCAL (agent M): with `XCL_LOCAL_TEX_OVERLAP=1`, two textures 32 KiB apart whose memory
+    /// overlaps (a title keeping only the small levels of one and placing the next where its large
+    /// levels would be) both hold, after the CPU writes their memory, the detile of that memory at
+    /// their own address - as the console reads it - instead of the older one reading zeros.
+    /// Run alone: `XCL_LOCAL_TEX_OVERLAP=1 <test exe> local_overlapping_textures --test-threads=1`.
+    #[test]
+    fn local_overlapping_textures_both_follow_their_memory() {
+        if !super::super::vram::tex_overlap_keep() {
+            println!("SKIPPED local_overlapping_textures_both_follow_their_memory: XCL_LOCAL_TEX_OVERLAP=1 not set");
+            return;
+        }
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { println!("SKIPPED: no adapter"); return };
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { println!("SKIPPED: no device"); return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(uma) = crate::gpu::uma::get() else { println!("SKIPPED: no UMA"); return };
+            let Some(base) = uma.alloc(8 << 20, 0x1_0000).map(|p| p as usize) else { println!("SKIPPED: UMA alloc"); return };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_tex = |va: usize, desc: &[u8; 0x38]| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let read_sub = |r: &ID3D12Resource, sub: u32| -> Vec<u8> {
+                let rd = r.GetDesc();
+                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+                dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+                let mut rb: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .unwrap();
+                let rb = rb.unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.Close().unwrap();
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let mut out = Vec::new();
+                for y in 0..rows as usize {
+                    out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+                }
+                rb.Unmap(0, None);
+                out
+            };
+            // 512x512 RGBA8 with its 10 levels (about 1.3 MiB), the second 32 KiB after the first
+            let desc = console_desc(3, 512, 512, 1, 10, 28, 0x109);
+            let size = xg::Texture::new(&desc).unwrap().size() as usize;
+            let (va_a, va_b) = (base, base + 0x8000);
+            let fill = |from: usize, len: usize, seed: u8| {
+                for k in 0..len {
+                    *((from + k) as *mut u8) = seed.wrapping_add((k / 7) as u8).wrapping_mul(13);
+                }
+            };
+            fill(va_a, size, 0x11);
+            let a = place_tex(va_a, &desc);
+            refresh(queue.as_raw());
+            let b = place_tex(va_b, &desc);
+            // the title's data for B over the tail of A's memory
+            fill(va_b, size, 0x5A);
+            refresh(queue.as_raw());
+            let tex = xg::Texture::new(&desc).unwrap();
+            let (want_a, want_b) = (subresources(va_a, &tex), subresources(va_b, &tex));
+            let (mut equal_a, mut equal_b) = (0, 0);
+            for sub in 0..want_a.len() {
+                let (ga, gb) = (read_sub(&a, sub as u32), read_sub(&b, sub as u32));
+                println!("level {sub}: A {} of {} bytes as its memory ({} non-zero), B {} of {}", ga.iter().zip(&want_a[sub].data).filter(|(x, y)| x == y).count(), ga.len(), ga.iter().filter(|&&x| x != 0).count(), gb.iter().zip(&want_b[sub].data).filter(|(x, y)| x == y).count(), gb.len());
+                equal_a += (ga == want_a[sub].data) as usize;
+                equal_b += (gb == want_b[sub].data) as usize;
+            }
+            assert_eq!(equal_b, want_b.len(), "the newer texture holds its memory");
+            assert_eq!(equal_a, want_a.len(), "the older texture holds its memory too (it read zeros when it was retired)");
+            dev.GetDeviceRemovedReason().unwrap();
+        }
+    }
 }
