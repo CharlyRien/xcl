@@ -1090,6 +1090,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
             super::rtsum::after_indirect(this, sig, max, args, args_off, count_buf, count_off, gfx, with(this, |s| s.pso)); // LOCAL
+            if gfx { super::lcap::after_ei(this, args, args_off, max, super::rtsum::stride_of(sig), count_buf, count_off) } else { super::lcap::after_dispatch(this) } // LOCAL (agent H)
             if !gfx {
                 super::depth_uav::local_after_dispatch(this, raw_pso); // LOCAL agent I (the title's handle)
             }
@@ -2143,6 +2144,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::rtsum::fs_active() {
         local_fs_trace(this, [x, y, z]); // LOCAL (agent Z)
     }
+    super::lcap::note_groups([x, y, z]); // LOCAL (agent H)
     bind_abi(this, list, pso, false)?;
     // LOCAL diagnostic (`XCL_LOCAL_DUMP_CS_INPUTS`): what the title feeds this program; its GPU
     // read passes (before and after the dispatch) change the list's compute state, bound again
@@ -2159,6 +2161,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     };
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     list.Dispatch(x, y, z);
+    super::lcap::after_dispatch(this); // LOCAL (agent H)
     super::culprit::after_dispatch(list, mark);
     if super::local_inputs::after_dispatch(list, probe) {
         bind_abi(this, list, pso, false)?;
@@ -2205,6 +2208,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    super::lcap::on_bind(this, with(this, |s| s.pso), gfx, &io, table_at, &args[inline..]); // LOCAL (agent H)
     local_zwatch(this, layout.as_deref(), &args); // LOCAL (agent Z): compute and graphics binds
     if !gfx && super::rtsum::fs_active() {
         local_zprobe(this, &io, layout.as_deref(), &args); // LOCAL (agent Z)

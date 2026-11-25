@@ -158,6 +158,11 @@ pub unsafe fn bind(list: *mut c_void, n: u32, rtvs: *const usize, single: i32, d
     BOUND.lock().unwrap().get_or_insert_with(HashMap::new).insert(list as usize, (rts, ds));
 }
 
+/// LOCAL (agent H): the targets OMSetRenderTargets last bound on `list` (rts, ds)
+pub fn bound(list: *mut c_void) -> Option<(Vec<usize>, usize)> {
+    BOUND.lock().unwrap().as_ref()?.get(&(list as usize)).cloned()
+}
+
 pub fn clear_rtv(rtv: usize) {
     if !on() {
         return;

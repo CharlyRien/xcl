@@ -128,6 +128,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     let due = super::rtsum::on() && frame_dump_due(); // LOCAL
     present_now(Duration::ZERO, Some((queue as usize, res)));
     super::rtsum::on_present(queue, res, due); // LOCAL
+    super::lcap::on_present(queue as *mut c_void); // LOCAL (agent H)
 }
 
 thread_local! {

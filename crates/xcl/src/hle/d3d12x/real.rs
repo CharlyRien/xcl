@@ -1955,6 +1955,7 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
     let f: unsafe extern "system" fn(*mut c_void, *const D3D12_SAMPLER_DESC, u64) = std::mem::transmute(orig_fn(this, 22));
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| s.sampler) else { return f(this, desc, cpu) };
     f(this, desc, slot.pc_srv);
+    super::lcap::note_sampler(slot.pc_srv, slot.index, desc); // LOCAL (agent H)
     super::console_heap::write(&slot, &[0, 0, 0, slot.index & 0xFFF]);
 }
 
@@ -1976,6 +1977,7 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
     for k in 0..n as u64 {
         if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
             copy_words(&s, &d);
+            if d.sampler { super::lcap::note_sampler_copy(d.pc_srv, d.index, s.pc_srv) } else { super::lcap::note_view_copy(d.pc_srv, d.pc_uav, (d.shared_srv != 0).then_some(d.index), s.pc_srv, s.pc_uav) } // LOCAL (agent H)
         }
     }
     true
@@ -2184,6 +2186,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
     f(this, res, desc, slot.pc_srv);
+    super::lcap::note_view(slot.pc_srv, (slot.shared_srv != 0).then_some(slot.index), res, false, desc as *const u8, std::mem::size_of::<D3D12_SHADER_RESOURCE_VIEW_DESC>()); // LOCAL (agent H)
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
@@ -2511,6 +2514,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
     pc_uav(slot.pc_uav);
+    super::lcap::note_view(slot.pc_uav, (slot.shared_srv != 0).then_some(slot.index + 1), if no_uav { std::ptr::null_mut() } else { uav_res }, true, if no_uav { std::ptr::null() } else { uav_desc as *const u8 }, std::mem::size_of::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()); // LOCAL (agent H)
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&uav_res) else {
@@ -4875,6 +4879,7 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_graphics(*ppv as usize, desc);
         super::rtsum::note_graphics(*ppv as usize, desc); // LOCAL
+        super::lcap::note_graphics(*ppv as usize, desc); // LOCAL (agent H)
     }
     hr
 }
@@ -4930,6 +4935,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_compute(*ppv as usize, desc);
         super::rtsum::note_compute(*ppv as usize, desc); // LOCAL
+        super::lcap::note_compute(*ppv as usize, desc); // LOCAL (agent H)
     }
     hr
 }
@@ -5615,7 +5621,7 @@ fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
 /// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
 /// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
 /// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
-fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+pub(super) fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) { // LOCAL (agent H): pub(super) for lreplay
     // (and the console's D16S8 depth format the PC's: `device_x::pc_view_format`)
     g.DSVFormat = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(g.DSVFormat.0 as u32) as i32);
     for f in g.RTVFormats.iter_mut() {
@@ -5786,6 +5792,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
             if hr >= 0 && !ppv.is_null() {
                 super::culprit::note_graphics(*ppv as usize, &*d as *const _ as *const c_void);
                 super::rtsum::note_graphics(*ppv as usize, &*d as *const _ as *const c_void); // LOCAL
+                super::lcap::note_graphics(*ppv as usize, &*d as *const _ as *const c_void); // LOCAL (agent H)
             }
             return hr;
         }
@@ -6290,6 +6297,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
+    super::lcap::on_execute(this, std::slice::from_raw_parts(lists, n as usize), &mapped); // LOCAL (agent L)
     stop_if_device_removed();
 }
 

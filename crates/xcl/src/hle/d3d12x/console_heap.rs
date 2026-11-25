@@ -334,6 +334,11 @@ pub fn unregister(obj: usize) {
     }
 }
 
+/// LOCAL (agent H): the console view heap holding UMA address `p`: (start, bytes)
+pub fn heap_extent(p: usize) -> Option<(usize, usize)> {
+    HEAPS.lock().unwrap().iter().find(|h| !h.sampler && p >= h.shadow && p < h.shadow + (h.n * h.slot_bytes()) as usize).map(|h| (h.shadow, (h.n * h.slot_bytes()) as usize))
+}
+
 /// Whether heap `obj` holds samplers, and the 32-bit console address of its slots.
 pub fn base(obj: usize) -> Option<(bool, u32)> {
     HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| (h.sampler, h.shadow as u32))

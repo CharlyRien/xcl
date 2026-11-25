@@ -2952,6 +2952,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
     if list.is_null() {
         return;
     }
+    super::lcap::on_close(list); // LOCAL (agent H)
     super::depth_uav::local_before_close(list); // LOCAL agent I
     super::format_alias::before_close(list);
     if !PREDICATION_USED.load(Ordering::Acquire) {
@@ -6546,5 +6547,6 @@ pub(super) fn local_draw_state(list: *mut c_void) -> String {
     let b = &s.bindings;
     let vp = b.viewports.first().map(|v| format!("({},{} {}x{} z {}..{})", v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth));
     let sc = b.scissors.first().map(|r| format!("({},{})-({},{})", r.left, r.top, r.right, r.bottom));
-    format!("vp {} sc {} topo {:?} vb0 {:x?} ib {:x?}", vp.unwrap_or_else(|| "-".into()), sc.unwrap_or_else(|| "-".into()), b.topology, b.vertex_titles.get(&0), b.index_title)
+    // LOCAL (agent L): stencil reference, blend factor, rect list (appended: older readers parse the head)
+    format!("vp {} sc {} topo {:?} vb0 {:x?} ib {:x?} sref {:?} bf {:?} rect {}", vp.unwrap_or_else(|| "-".into()), sc.unwrap_or_else(|| "-".into()), b.topology, b.vertex_titles.get(&0), b.index_title, b.stencil, b.blend, b.rect_list)
 }
