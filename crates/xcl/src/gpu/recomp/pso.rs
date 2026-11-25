@@ -919,6 +919,12 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    console_mesh_in(blob, ps, split_wave64, mem_windows())
+}
+
+/// LOCAL (agent R): `console_mesh` with the title's memory windows given (the offline replay
+/// `lreplay` has no title; same translation, same caches).
+pub fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windows: u32) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
@@ -931,7 +937,7 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let rodata = local_rodata(f, p);
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
     if crate::gpu::dxil::kernel::enabled() {
-        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Mesh(ms.clone()), &rodata) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
@@ -943,7 +949,21 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    finish_two_pass(super::translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: mem_windows(), rodata, ..Default::default() })?, record, ps)
+    finish_two_pass(super::translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64, split_wave64, mem_windows: windows, rodata, ..Default::default() })?, record, ps)
+}
+
+/// LOCAL (agent R): the HLSL of the compute pass of a console MS and its record shape (the offline
+/// replay's dumps, notes and edited-HLSL overrides); `console_mesh_in` compiles the same text.
+#[cfg(test)]
+pub(crate) fn local_mesh_translation(blob: &[u8], split_wave64: bool, windows: u32) -> Result<(super::Translation, super::MsInterface), String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
+    let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
+    let Mode::Mesh(ms) = &mode else { return Err("the container is not an MS".into()) };
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let t = super::translate(code, &Options { mode: Mode::Mesh(ms.clone()), wave64: super::detect_wave64(code), split_wave64, mem_windows: windows, rodata: local_rodata(f, p), ..Default::default() })?;
+    Ok((t, ms.clone()))
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,

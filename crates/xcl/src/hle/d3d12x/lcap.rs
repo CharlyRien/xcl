@@ -51,6 +51,144 @@ fn cs_set() -> &'static [String] {
     V.get_or_init(|| prefixes("XCL_LOCAL_LCAP_CS", "520a7d5c"))
 }
 
+// ---------------------------------------------------------------------------------------
+// LOCAL (agent R): geometry capture. `XCL_LOCAL_LCAP_GEOM=<n>`: instead of the lighting stage, the
+// first run of at most n consecutive two-pass mesh draws on one list whose bound render targets
+// include one of format `XCL_LOCAL_LCAP_GEOM_FMT` (default 29, the sRGB G-buffer target), after
+// `XCL_LOCAL_LCAP_GEOM_SKIP` such draws were let through. Per draw: both stages' user data (io),
+// argument copies, what the stage's used-resource table names (`XCL_LOCAL_LCAP_SPEC2`, a file made by
+// `agentR/mkspec2.py`), the root descriptors' targets, the heap slots that words of the constants and
+// of the root descriptors' targets name (guesses, bounded), the records the compute pass wrote and
+// the rewritten indirect arguments; the bound targets before the run and after it.
+// ---------------------------------------------------------------------------------------
+fn geom_draws() -> u32 {
+    static A: OnceLock<u32> = OnceLock::new();
+    *A.get_or_init(|| env("XCL_LOCAL_LCAP_GEOM").and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+fn geom_num(k: &str, d: u64) -> u64 {
+    env(k).and_then(|v| v.trim().parse().ok()).unwrap_or(d)
+}
+
+#[derive(Default)]
+struct Spec2 {
+    /// (user-data dword of the table pointer, dword offset in the table, kind, descriptor dwords)
+    tables: Vec<(u8, u32, u8, u8)>,
+    /// root descriptors (64-bit address at the dword and the next)
+    roots: Vec<u8>,
+    /// root constants (first dword, count)
+    consts: Vec<(u8, u8)>,
+    heap: Option<u8>,
+}
+
+fn spec2(hash: u64, hw: u8) -> Option<&'static Spec2> {
+    static S: OnceLock<HashMap<(u64, u8), Spec2>> = OnceLock::new();
+    S.get_or_init(|| {
+        let mut m = HashMap::new();
+        let Some(text) = env("XCL_LOCAL_LCAP_SPEC2").and_then(|f| std::fs::read_to_string(f).ok()) else { return m };
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(h), Some(hw)) = (it.next().and_then(|h| u64::from_str_radix(h, 16).ok()), it.next().and_then(|h| h.parse::<u8>().ok())) else { continue };
+            let mut s = Spec2::default();
+            for t in it {
+                let p: Vec<&str> = t.split(':').collect();
+                let n = |k: usize| p.get(k).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                match p[0] {
+                    "t" => s.tables.push((n(1) as u8, n(2), n(3) as u8, n(4) as u8)),
+                    "r" => s.roots.push(n(1) as u8),
+                    "c" => s.consts.push((n(1) as u8, n(2) as u8)),
+                    "h" => s.heap = Some(n(1) as u8),
+                    _ => {}
+                }
+            }
+            m.insert((h, hw), s);
+        }
+        crate::xlog_info!("LOCAL lcap (geometry): {} stage specs loaded", m.len());
+        m
+    })
+    .get(&(hash, hw))
+}
+
+// ---------------------------------------------------------------------------------------
+// LOCAL (agent R): `XCL_LOCAL_OOW_DEMAND=1` (with `XCL_LOCAL_LCAP_SPEC2=<file>`, no capture needed): readable
+// copies ON DEMAND of the buffers a two-pass mesh draw's stages name in their descriptor tables when the
+// buffer lies in a GPU view of title memory (outside the memory windows, where a translated shader reads
+// zero). Found off game (captures R2 / R3): 92 of 168 mesh draws of a frame wrote one vertex per record
+// because one buffer of their mesh table (the meshlets) had no copy - the mirrors made at view creation
+// (`XCL_LOCAL_ATV_MIRROR`) stop at `XCL_LOCAL_ATV_CAP_MB` (500 MB of the 1030 MB the title makes views of),
+// while one frame's draws name 350 such buffers, 2 MB in all. At the bind of each stage: every used table
+// entry (the stage's used-resource table, from the spec file) that is a buffer descriptor whose address is
+// in a GPU view gets a mirror (`rtsum::mirror_range`, refilled at each present like the others) and the
+// descriptor in the title's table is rewritten to point at it, as `real::atv_view` does at creation.
+// ---------------------------------------------------------------------------------------
+static DEMAND_PSO: Mutex<Option<HashMap<usize, [u64; 2]>>> = Mutex::new(None);
+static DEMAND_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+pub fn demand_on() -> bool {
+    static A: OnceLock<bool> = OnceLock::new();
+    *A.get_or_init(|| env("XCL_LOCAL_OOW_DEMAND").is_some())
+}
+
+pub fn demand_note(pso: usize, ms: &[u8], ps: Option<&[u8]>) {
+    if demand_on() && pso != 0 {
+        DEMAND_PSO.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, [crate::gpu::shader::fnv64(ms), ps.map_or(0, crate::gpu::shader::fnv64)]);
+    }
+}
+
+/// a two-pass mesh stage of `pso` is about to be bound with the user data `io`
+pub unsafe fn demand_at_bind(pso: usize, compute: bool, io: &[u32]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !demand_on() {
+        return;
+    }
+    let real = super::pso_async::resolve(pso);
+    let Some(h) = DEMAND_PSO.lock().unwrap().as_ref().and_then(|m| [pso, real].iter().find_map(|p| m.get(p).copied())) else { return };
+    let (hash, hw) = if compute { (h[0], 7u8) } else { (h[1], 5u8) };
+    let Some(sp) = spec2(hash, hw) else { return };
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let base = u.base() & !0xFFFF_FFFF;
+    for &(dw, off, _, _) in &sp.tables {
+        let sg = if hw == 7 { dw as usize + super::console_list::first_sgpr_ms() - 8 } else { dw as usize };
+        let t = io.get(sg).copied().unwrap_or(0);
+        if t == 0 {
+            continue;
+        }
+        let p = (base | t as usize) + 4 * off as usize;
+        if !crate::gpu::shader::readable(p, 16) {
+            continue;
+        }
+        let w: [u32; 4] = std::array::from_fn(|k| (p as *const u32).add(k).read_unaligned());
+        if w[3] >> 28 >= 8 || w[3] == 0 {
+            continue;
+        }
+        let a = (w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32) as usize;
+        if a >> 32 == 0 || crate::hle::kernelx::mirrors::gpu_view_of(a).is_none() {
+            continue;
+        }
+        let stride = ((w[1] >> 16) & 0x3FFF) as usize;
+        let len = if stride == 0 { w[2] as usize } else { w[2] as usize * stride };
+        DEMAND_STATS[0].fetch_add(1, Relaxed);
+        if len == 0 || len > (geom_num("XCL_LOCAL_OOW_DEMAND_MAX_MB", 64) << 20) as usize {
+            DEMAND_STATS[3].fetch_add(1, Relaxed);
+            continue;
+        }
+        match super::rtsum::mirror_range(a, len, false, "ATV demand") {
+            Some(dst) => {
+                (p as *mut u32).write_unaligned(dst as u32);
+                (p as *mut u32).add(1).write_unaligned((w[1] & 0xFFFF_0000) | ((dst >> 32) as u32 & 0xFFFF));
+                let n = DEMAND_STATS[1].fetch_add(1, Relaxed) + 1;
+                let b = DEMAND_STATS[2].fetch_add(len as u64, Relaxed) + len as u64;
+                if n <= 4 || n.is_power_of_two() {
+                    crate::xlog_info!("LOCAL oow demand: {n} buffers outside the windows given a copy at a bind ({} KiB in all; last: {a:#x}+{len:#x} of the {} table at {p:#x} -> {dst:#x}); {} refused", b >> 10, if compute { "mesh" } else { "pixel" }, DEMAND_STATS[3].load(Relaxed));
+                }
+            }
+            None => {
+                DEMAND_STATS[3].fetch_add(1, Relaxed);
+            }
+        }
+    }
+}
+
 /// (user SGPR, dword offsets in its table) of the used table entries (agent S's decoder, union of
 /// the TL VS / PS permutations and of CS_GenerateMaterialMasks)
 fn slot_spec(gfx: bool) -> &'static [(usize, Vec<u32>)] {
@@ -184,6 +322,9 @@ fn view_of(index: u32) -> Option<View> {
 
 struct SavedPso {
     gfx: bool,
+    /// LOCAL (agent R): a two-pass mesh pipeline (blobs: MS, PS; desc: its state sub-objects) and its record text
+    mesh: bool,
+    extra: String,
     hashes: [u64; 2],
     desc: String,
     blobs: Vec<Vec<u8>>,
@@ -212,7 +353,7 @@ pub unsafe fn note_graphics(pso: usize, desc: *const c_void) {
         return;
     }
     let hp = ps.as_deref().map_or(0, crate::gpu::shader::fnv64);
-    let s = SavedPso { gfx: true, hashes: [hv, hp], desc: hexbytes(desc as *const u8, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()), blobs: [Some(vs), ps].into_iter().flatten().collect() };
+    let s = SavedPso { mesh: false, extra: String::new(), gfx: true, hashes: [hv, hp], desc: hexbytes(desc as *const u8, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()), blobs: [Some(vs), ps].into_iter().flatten().collect() };
     let n = {
         let mut g = PSOS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -234,8 +375,35 @@ pub unsafe fn note_compute(pso: usize, desc: *const c_void) {
     if !matches(h, cs_set()) {
         return;
     }
-    let s = SavedPso { gfx: false, hashes: [h, 0], desc: hexbytes(desc as *const u8, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()), blobs: vec![cs] };
+    let s = SavedPso { mesh: false, extra: String::new(), gfx: false, hashes: [h, 0], desc: hexbytes(desc as *const u8, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()), blobs: vec![cs] };
     PSOS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, s);
+}
+
+/// LOCAL (agent R): a two-pass mesh pipeline `pso` was made from the console MS `ms` and PS `ps`;
+/// `state`: the stream's other sub-objects as given to the driver (PC formats), `extra`: the record's shape
+pub fn note_mesh(pso: usize, ms: &[u8], ps: Option<&[u8]>, state: &[u8], extra: String) {
+    if !on() || geom_draws() == 0 || pso == 0 {
+        return;
+    }
+    let hashes = [crate::gpu::shader::fnv64(ms), ps.map_or(0, crate::gpu::shader::fnv64)];
+    let s = SavedPso { mesh: true, extra, gfx: true, hashes, desc: hexbytes(state.as_ptr(), state.len()), blobs: [Some(ms.to_vec()), ps.map(|p| p.to_vec())].into_iter().flatten().collect() };
+    let n = {
+        let mut g = PSOS.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        m.insert(pso, s);
+        m.len()
+    };
+    if n == 1 || n == 100 || n == 1000 {
+        crate::xlog_info!("LOCAL lcap (geometry): {n} mesh pipelines noted (last ms {:016x} ps {:016x} as {pso:#x})", hashes[0], hashes[1]);
+    }
+}
+
+/// LOCAL (agent R): (MS hash, PS hash) of a noted two-pass mesh pipeline
+fn saved_mesh(pso: usize) -> Option<[u64; 2]> {
+    let real = super::pso_async::resolve(pso);
+    let g = PSOS.lock().unwrap();
+    let m = g.as_ref()?;
+    [pso, real].iter().find_map(|p| m.get(p)).filter(|s| s.mesh).map(|s| s.hashes)
 }
 
 fn saved_hashes(pso: usize) -> Option<(bool, [u64; 2])> {
@@ -299,6 +467,18 @@ struct Cap {
     cs_presents: u32,
     man_written: usize,
     t_first: f64,
+    // LOCAL (agent R): geometry capture
+    /// the open draw of each list (its number), between its compute stage and its mesh stage
+    geom_pending: HashMap<usize, u32>,
+    geom_lists: HashSet<usize>,
+    /// a present was seen since the capture was armed (the capture starts at a frame's first draw)
+    geom_fresh: bool,
+    geom_presents: u32,
+    geom_over: u32,
+    geom_foreign: u32,
+    guess_bytes: u64,
+    reserve: u64,
+    trace: HashMap<usize, String>,
 }
 
 /// LOCAL (agent L): capture `k` goes to `<XCL_LOCAL_LCAP>/c<k>`
@@ -341,7 +521,8 @@ unsafe fn device() -> Option<ID3D12Device> {
 impl Cap {
     /// `n` bytes (aligned 512) in a readback chunk: (chunk, offset)
     unsafe fn alloc(&mut self, n: u64) -> Option<(usize, u64)> {
-        if self.bytes + n > budget() {
+        // LOCAL (agent R): `reserve` is kept for the targets copied at the end of a geometry capture
+        if self.bytes + n > budget().saturating_sub(self.reserve) {
             self.skipped += 1;
             return None;
         }
@@ -419,7 +600,26 @@ impl Cap {
         let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
         let d = res.GetDesc();
         let dhex = hexbytes(&d as *const _ as *const u8, std::mem::size_of::<D3D12_RESOURCE_DESC>());
-        let head = format!("tex {id} {phase} res {r:#x} ({}x{}x{} f{} mips {} flags {:#x} samples {}) why {why} desc {dhex}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Flags.0, d.SampleDesc.Count);
+        // LOCAL (agent R): the title's own bytes of a texture kept in step (first 64 KiB at its address,
+        // through the CPU view when it lies in a GPU view): non-zero bytes / bytes looked at
+        let title = if geom_draws() == 0 {
+            String::new()
+        } else {
+            match super::title_textures::address(r) {
+                None => " title none".to_string(),
+                Some(va) => {
+                    let src = crate::hle::kernelx::mirrors::source(va).unwrap_or(va);
+                    let m = 0x1_0000usize;
+                    if crate::gpu::shader::readable(src, m) {
+                        let b = std::slice::from_raw_parts(src as *const u8, m);
+                        format!(" title {va:#x} cpu_nz {}/{m}", b.iter().filter(|x| **x != 0).count())
+                    } else {
+                        format!(" title {va:#x} cpu_unreadable")
+                    }
+                }
+            }
+        };
+        let head = format!("tex {id} {phase} res {r:#x} ({}x{}x{} f{} mips {} flags {:#x} samples {}) why {why} evicted {}{title} desc {dhex}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Flags.0, d.SampleDesc.Count, super::vram::is_evicted(r));
         if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || d.SampleDesc.Count > 1 {
             self.man.push(format!("{head} skipped (buffer or MSAA)"));
             return;
@@ -490,11 +690,11 @@ impl Cap {
                 let dir = cap_dir(self.index);
                 let _ = std::fs::create_dir_all(&dir);
                 let names: Vec<String> = s.blobs.iter().enumerate().map(|(k, b)| {
-                    let n = format!("pso{id}_{}.bin", if !s.gfx { "cs" } else if k == 0 { "vs" } else { "ps" });
+                    let n = format!("pso{id}_{}.bin", if !s.gfx { "cs" } else if k == 0 { if s.mesh { "ms" } else { "vs" } } else { "ps" });
                     let _ = std::fs::write(dir.join(&n), b);
                     n
                 }).collect();
-                self.man.push(format!("pso {id} {} {:016x} {:016x} files {} desc {}", if s.gfx { "gfx" } else { "cs" }, s.hashes[0], s.hashes[1], names.join(","), s.desc));
+                self.man.push(format!("pso {id} {} {:016x} {:016x} files {} desc {}{}", if s.mesh { "mesh" } else if s.gfx { "gfx" } else { "cs" }, s.hashes[0], s.hashes[1], names.join(","), if s.desc.is_empty() { "none" } else { &s.desc }, s.extra));
             }
             None => self.man.push(format!("pso {id} unknown {pso:#x}")),
         }
@@ -563,6 +763,235 @@ impl Cap {
     }
 }
 
+impl Cap {
+    /// LOCAL (agent R): what a stage of a geometry draw reads, from its used-resource table (`spec2`):
+    /// the argument copy, the heaps and pointers the io words name (as `inputs`), its table entries
+    /// and what they name, its root descriptors' targets, and the heap slots that constants and the
+    /// first words of the root descriptors' targets name (guesses, within `XCL_LOCAL_LCAP_GUESS_MB`)
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn inputs2(&mut self, l: &ID3D12GraphicsCommandList, direct: bool, draw: u32, hash: u64, hw: u8, io: &[u32], table_at: usize, args: &[u8], phase: &'static str, uavs: &mut Vec<usize>) {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        let base = u.base() & !0xFFFF_FFFF;
+        self.range(l, &format!("args@{table_at:#x}"), table_at, args.len().max(16), phase, true);
+        // the first 64 KiB of every window (null and near-null addresses are read: run R2's notes)
+        for k in 0..4 {
+            let (wb, ws) = u.window(k);
+            if ws >= 0x1_0000 {
+                self.range(l, &format!("page0@{wb:#x}"), wb, 0x1_0000, phase, false);
+            }
+        }
+        let Some(sp) = spec2(hash, hw) else {
+            self.man.push(format!("nospec {hash:016x} hw {hw}"));
+            return;
+        };
+        let sg = |dw: u8| if hw == 7 { dw as usize + super::console_list::first_sgpr_ms() - 8 } else { dw as usize };
+        let word = |dw: u8| io.get(sg(dw)).copied().unwrap_or(0);
+        // the tables: their used span, then each used entry
+        let mut spans: HashMap<u8, (u32, u32)> = HashMap::new();
+        for &(dw, off, _, dsz) in &sp.tables {
+            let e = spans.entry(dw).or_insert((off, off + dsz as u32));
+            e.0 = e.0.min(off);
+            e.1 = e.1.max(off + dsz as u32);
+        }
+        for (&dw, &(lo, hi)) in &spans {
+            let t = word(dw);
+            if t != 0 {
+                self.range(l, &format!("table{dw}@{:#x}", base | t as usize), (base | t as usize) + 4 * lo as usize, 4 * (hi - lo) as usize, phase, true);
+            }
+        }
+        // the big raw buffers of the tables (1 MiB and more): a stage's constants are byte offsets of its
+        // material record in one of them (run R3: the record begins with the heap slots of its textures)
+        let mut big: Vec<(usize, usize)> = Vec::new();
+        for &(dw, off, kind, _) in &sp.tables {
+            let t = word(dw);
+            if t == 0 {
+                continue;
+            }
+            let p = (base | t as usize) + 4 * off as usize;
+            if crate::gpu::shader::readable(p, 16) {
+                let w: Vec<u32> = (0..4).map(|k| (p as *const u32).add(k).read_unaligned()).collect();
+                if w[3] >> 28 < 8 && w[3] != 0 {
+                    let mut a = (w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32) as usize;
+                    if a >> 32 == 0 && a != 0 {
+                        a |= base;
+                    }
+                    let stride = ((w[1] >> 16) & 0x3FFF) as usize;
+                    let n = if stride == 0 { w[2] as usize } else { w[2] as usize * stride };
+                    if n >= 1 << 20 && u.window_of(a).is_some() && !big.contains(&(a, n)) {
+                        big.push((a, n));
+                    }
+                }
+            }
+            self.slot(l, direct, &format!("hw{hw} t{dw}+{off} kind {kind}"), p, base, phase, uavs, geom_num("XCL_LOCAL_LCAP_BUF_MB", 16) << 20);
+        }
+        // the root descriptors' targets
+        let root_n = (geom_num("XCL_LOCAL_LCAP_ROOT_KB", 64) << 10) as usize;
+        let mut small: Vec<(String, Vec<u32>)> = Vec::new();
+        for &dw in &sp.roots {
+            let mut a = (word(dw) as u64 | (word(dw + 1) as u64) << 32) as usize;
+            if a == 0 {
+                self.man.push(format!("root hw{hw} dw{dw} null"));
+                continue;
+            }
+            if a >> 32 == 0 {
+                a |= base;
+            }
+            let inw = u.window_of(a).map(|k| {
+                let (wb, ws) = u.window(k);
+                root_n.min(wb + ws - a)
+            });
+            self.man.push(format!("root hw{hw} dw{dw} at {a:#x} {}", inw.map_or("NOT IN A WINDOW".to_string(), |n| format!("bytes {n:#x}"))));
+            if inw.is_none() {
+                self.man.push(format!("oowio {draw} {} {} ea {a:#x}", if hw == 7 { "c" } else { "m" }, sg(dw)));
+                if let Some(src) = crate::hle::kernelx::mirrors::source(a) {
+                    if self.ranges_done.insert((a as u64, "oow")) {
+                        let n = (0..=root_n / 0x1000).rev().map(|k| k * 0x1000).find(|&n| n == 0 || crate::gpu::shader::readable(src, n)).unwrap_or(0);
+                        if n > 0 && self.cpu.len() + n <= (geom_num("XCL_LOCAL_LCAP_OOW_MB", 300) << 20) as usize {
+                            let o = self.cpu.len();
+                            self.cpu.extend_from_slice(std::slice::from_raw_parts(src as *const u8, n));
+                            self.man.push(format!("oow ea {a:#x} bytes {n:#x} source {src:#x} cpu cpu.bin@{o:#x}"));
+                        } else {
+                            self.man.push(format!("oow ea {a:#x} source {src:#x} not copied (budget or not readable)"));
+                        }
+                    }
+                } else {
+                    self.man.push(format!("oow ea {a:#x} no CPU view"));
+                }
+            }
+            if let Some(n) = inw {
+                self.range(l, &format!("root@{a:#x}"), a, n, phase, false);
+                let m = 4096.min(n);
+                if crate::gpu::shader::readable(a, m) {
+                    small.push((format!("root{dw}"), (0..m / 4).map(|k| (a as *const u32).add(k).read_unaligned()).collect()));
+                }
+            }
+        }
+        for &(dw, n) in &sp.consts {
+            small.push((format!("const{dw}"), (0..n).map(|k| word(dw + k)).collect()));
+            for k in 0..n {
+                let c = word(dw + k) as usize;
+                if c == 0 || c % 4 != 0 {
+                    continue;
+                }
+                for &(a, len) in &big {
+                    if c + 128 <= len && crate::gpu::shader::readable(a + c, 128) {
+                        small.push((format!("mat{}@{:#x}", dw + k, a + c), (0..32).map(|j| ((a + c) as *const u32).add(j).read_unaligned()).collect()));
+                    }
+                }
+            }
+        }
+        // 4 KiB at every other io word that is an address in window 0 (as agent L's `inputs`: the sampler
+        // heap, ...); after the tables and the roots: a range is taken once per address
+        for &w in io.iter().take(40) {
+            if w >= 0x1_0000 {
+                let p = base | w as usize;
+                if super::console_heap::heap_extent(p).is_none() && u.window_of(p).is_some() {
+                    let (wb, ws) = u.window(u.window_of(p).unwrap());
+                    self.range(l, &format!("ptr@{p:#x}"), p, (4usize << 10).min(wb + ws - p), phase, false);
+                }
+            }
+        }
+        // heap slots named by those words (the stage indexes the view heap itself)
+        let Some(hdw) = sp.heap else { return };
+        let hb = word(hdw);
+        if hb == 0 {
+            self.man.push(format!("heapbase hw{hw} dw{hdw} null"));
+            return;
+        }
+        let hb = base | hb as usize;
+        let ext = super::console_heap::heap_extent(hb);
+        let slots = ext.map_or(0, |(start, bytes)| (start + bytes).saturating_sub(hb) / 32);
+        if let Some((start, bytes)) = ext {
+            self.range(l, &format!("heap@{start:#x}"), start, bytes.min(64 << 20), phase, false);
+        }
+        self.man.push(format!("heapbase hw{hw} dw{hdw} at {hb:#x} slots {slots}"));
+        let cap = geom_num("XCL_LOCAL_LCAP_GUESS_MB", 400) << 20;
+        let mut done: HashSet<usize> = HashSet::new();
+        for (src, words) in small {
+            let is_const = src.starts_with("const");
+            for (k, &w) in words.iter().enumerate() {
+                let cands: &[usize] = if is_const { &[w as usize, (w & 0x3FF) as usize, (w & 0xFFFF) as usize, (w >> 16) as usize] } else { &[w as usize] };
+                for &i in cands {
+                    if i == 0 || i >= slots || !done.insert(i) {
+                        continue;
+                    }
+                    let p = hb + 32 * i;
+                    if !crate::gpu::shader::readable(p, 32) {
+                        continue;
+                    }
+                    let w3 = (p as *const u32).add(3).read_unaligned();
+                    let w0 = (p as *const u32).read_unaligned();
+                    let image = w3 >> 28 >= 8;
+                    // an image slot: only one whose view is known; a buffer slot: only from a constant
+                    if image && !(4..0x10_0000).contains(&w0) || image && view_of(w0).is_none_or(|v| v.res == 0 || super::title_textures::address(v.res).is_none()) || !image && (!is_const || w3 == 0) {
+                        continue;
+                    }
+                    if self.guess_bytes > cap {
+                        self.man.push(format!("guess budget reached at {src}[{k}]"));
+                        return;
+                    }
+                    let before = self.bytes;
+                    self.slot(l, direct, &format!("hw{hw} guess {src}[{k}] heap {i}"), p, base, phase, uavs, 4 << 20);
+                    self.guess_bytes += self.bytes - before;
+                }
+            }
+        }
+    }
+
+    /// LOCAL (agent R): one console descriptor at `p` (as `inputs` reads a table entry): its line and what it names
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn slot(&mut self, l: &ID3D12GraphicsCommandList, direct: bool, what: &str, p: usize, base: usize, phase: &'static str, uavs: &mut Vec<usize>, buf_max: u64) {
+        if !crate::gpu::shader::readable(p, 32) {
+            self.man.push(format!("gslot {what} at {p:#x} not readable"));
+            return;
+        }
+        let w: Vec<u32> = (0..8).map(|k| (p as *const u32).add(k).read_unaligned()).collect();
+        let mut line = format!("gslot {what} at {p:#x} words {}", w.iter().map(|x| format!("{x:08x}")).collect::<Vec<_>>().join(" "));
+        if w[3] >> 28 >= 8 {
+            if w[0] < 0x10_0000 && w[0] >= 4 {
+                line += &format!(" image view {}", w[0]);
+                self.man.push(line);
+                self.image(l, direct, w[0], phase, uavs);
+                return;
+            }
+        } else if w[3] != 0 {
+            let mut a = (w[0] as u64 | ((w[1] & 0xFFFF) as u64) << 32) as usize;
+            if a >> 32 == 0 && a != 0 {
+                a |= base;
+            }
+            let stride = (w[1] >> 16) & 0x3FFF;
+            let n = if stride == 0 { w[2] as u64 } else { w[2] as u64 * stride as u64 };
+            let inw = crate::gpu::uma::get().and_then(|u| u.window_of(a)).is_some();
+            line += &format!(" buffer {a:#x} bytes {n:#x} stride {stride} {}", if inw { "in a window" } else { "NOT IN A WINDOW" });
+            self.man.push(line);
+            let n = n.min(buf_max) as usize;
+            if a != 0 && n > 0 && inw {
+                self.range(l, &format!("buf@{a:#x}"), a, n, phase, false);
+            } else if a != 0 && n > 0 {
+                // a buffer view outside the memory windows (a shader reads zero there): the bytes the
+                // title has at its CPU view, for the replay's "what if it were readable" (`oow=map`)
+                self.man.push(format!("oowslot at {p:#x} ea {a:#x} w0 {:08x} w1 {:08x}", w[0], w[1]));
+                let cap = (geom_num("XCL_LOCAL_LCAP_OOW_MB", 300) << 20) as usize;
+                if let Some(src) = crate::hle::kernelx::mirrors::source(a) {
+                    if self.ranges_done.insert((a as u64, "oow")) {
+                        if self.cpu.len() + n <= cap && crate::gpu::shader::readable(src, n) {
+                            let o = self.cpu.len();
+                            self.cpu.extend_from_slice(std::slice::from_raw_parts(src as *const u8, n));
+                            self.man.push(format!("oow ea {a:#x} bytes {n:#x} source {src:#x} cpu cpu.bin@{o:#x}"));
+                        } else {
+                            self.man.push(format!("oow ea {a:#x} bytes {n:#x} source {src:#x} not copied (budget or not readable)"));
+                        }
+                    }
+                } else {
+                    self.man.push(format!("oow ea {a:#x} bytes {n:#x} no CPU view"));
+                }
+            }
+            return;
+        }
+        self.man.push(line);
+    }
+}
+
 unsafe fn barrier_batch(l: &ID3D12GraphicsCommandList) {
     let uav = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE, Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }) } };
     let alias = D3D12_RESOURCE_BARRIER {
@@ -588,6 +1017,146 @@ pub fn note_groups(g: [u32; 3]) {
     }
 }
 
+static FIRST_CS: OnceLock<f64> = OnceLock::new();
+
+/// LOCAL (agent R, from agent H's / L's conditions in `on_bind`): whether a capture may start now
+fn armed(now: f64) -> bool {
+    let rel: Option<f64> = env("XCL_LOCAL_LCAP_AFTER_CS_S").and_then(|v| v.parse().ok());
+    if now < after_s() || rel.is_some_and(|r| FIRST_CS.get().is_none_or(|t| now < t + r)) {
+        return false;
+    }
+    // LOCAL (agent L): not before the gap after the previous capture
+    ((now * 1000.0) as u64) >= NEXT_ARM_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// LOCAL (agent R): whether `list`'s bound render targets include the geometry capture's format; its targets
+unsafe fn geom_targets(list: *mut c_void) -> (bool, Vec<usize>, usize) {
+    let (rts, ds) = super::rtsum::bound(list).unwrap_or_default();
+    let fmt_want = geom_num("XCL_LOCAL_LCAP_GEOM_FMT", 29) as i32;
+    let is_geom = rts.iter().any(|&r| {
+        let raw = r as *mut c_void;
+        r != 0 && ID3D12Resource::from_raw_borrowed(&raw).is_some_and(|x| x.GetDesc().Format.0 == fmt_want)
+    });
+    (is_geom, rts, ds)
+}
+
+/// LOCAL (agent R): a two-pass mesh stage is about to be bound on `list` (`compute`: its compute pass,
+/// else its mesh pass) with the user data `io`, the argument copy at `table_at` and the heap bases.
+/// The capture takes every such draw on the geometry targets, on every list, from the first one after
+/// a present until the lighting stage begins (`on_bind`).
+pub unsafe fn on_two_pass(list: *mut c_void, pso: usize, compute: bool, io: &[u32], table_at: usize, args: &[u8], heaps: [u32; 2]) {
+    if !on() || geom_draws() == 0 || !armed(crate::log::uptime()) {
+        return;
+    }
+    let mut g = CAP.lock().unwrap();
+    let c = g.get_or_insert_with(Cap::default);
+    if c.written || c.tl == St::Done || (c.tl == St::Idle && !c.geom_fresh) {
+        return;
+    }
+    let Some(direct) = list_ok(list) else { return };
+    let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return };
+    if !compute {
+        // the mesh stage of a draw whose compute stage was taken
+        let Some(k) = c.geom_pending.remove(&(list as usize)) else { return };
+        let Some(hashes) = saved_mesh(pso) else { return };
+        c.stage_now = 1;
+        c.man.push(format!("gmesh {k} table {table_at:#x} io {}", io.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(" ")));
+        barrier_batch(l);
+        let mut uavs = Vec::new();
+        c.inputs2(l, direct, k, hashes[1], 5, io, table_at, args, "before", &mut uavs);
+        barrier_batch(l);
+        return;
+    }
+    let (is_geom, rts, ds) = geom_targets(list);
+    if !is_geom {
+        return;
+    }
+    if c.draws >= geom_draws() {
+        c.geom_over += 1;
+        return;
+    }
+    let Some(hashes) = saved_mesh(pso) else {
+        c.man.push(format!("unnoted mesh pipeline {pso:#x} on list {:#x}: draw not captured", list as usize));
+        return;
+    };
+    c.stage_now = 1;
+    if c.tl == St::Idle {
+        c.note_frame = PRESENTS.load(std::sync::atomic::Ordering::Relaxed);
+        c.t_first = crate::log::uptime();
+        c.tl = St::Active;
+        c.tl_list = 0;
+        c.reserve = geom_num("XCL_LOCAL_LCAP_RESERVE_MB", 240) << 20;
+        crate::xlog_info!("LOCAL lcap (geometry): frame capture starts on list {:#x} at present {}", list as usize, c.note_frame);
+    }
+    let t = c.trace.entry(list as usize).or_default();
+    if t.len() < 6000 {
+        t.push('M');
+    }
+    c.geom_lists.insert(list as usize);
+    barrier_batch(l);
+    // every target met, before: copied once, at its first use in the capture
+    for r in rts.iter().copied().chain((ds != 0).then_some(ds)) {
+        if r != 0 && !c.tl_targets.contains(&r) {
+            c.tl_targets.push(r);
+            let id = c.res_id(r);
+            c.man.push(format!("gtarget {id} {}", if r == ds { "ds" } else { "rt" }));
+            c.tex(l, direct, r, "before", "target");
+        }
+    }
+    let k = c.draws;
+    c.draws += 1;
+    let id = c.pso(pso);
+    let ids: Vec<String> = rts.iter().chain(std::iter::once(&ds)).map(|&r| if r == 0 { "-".to_string() } else { c.res_id(r).to_string() }).collect();
+    c.man.push(format!("gdraw {k} list {:#x} pso {id} targets {} heaps {:x} {:x} table {table_at:#x} state {} io {}", list as usize, ids.join(","), heaps[0], heaps[1], super::list_x::local_draw_state(list), io.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(" ")));
+    let mut uavs = Vec::new();
+    c.inputs2(l, direct, k, hashes[0], 7, io, table_at, args, "before", &mut uavs);
+    c.geom_pending.insert(list as usize, k);
+    barrier_batch(l);
+}
+
+/// LOCAL (agent R): right after the compute pass of a two-pass mesh draw on `list`: the records it wrote
+/// (the first `XCL_LOCAL_LCAP_REC_KB` of `res`, default 256) and, for an ExecuteIndirect, the rewritten
+/// arguments of its two passes (`scaled`: buffer, compute command at, mesh command at, stride, offset
+/// of the DispatchMesh argument); `groups`: of a direct DispatchMesh.
+pub unsafe fn after_ms_compute(list: *mut c_void, res: usize, record_bytes: u64, split: u32, scaled: Option<(usize, u64, u64, u32, u32)>, groups: u32) {
+    if !on() || geom_draws() == 0 {
+        return;
+    }
+    let mut g = CAP.lock().unwrap();
+    let Some(c) = g.as_mut() else { return };
+    if c.tl != St::Active {
+        return;
+    }
+    let Some(&k) = c.geom_pending.get(&(list as usize)) else { return };
+    let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return };
+    let raw = res as *mut c_void;
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
+    c.stage_now = 1;
+    // whole records
+    let n = (geom_num("XCL_LOCAL_LCAP_REC_KB", 256) << 10).min(r.GetDesc().Width) / record_bytes.max(1) * record_bytes.max(1);
+    let mut line = format!("grec {k} record_bytes {record_bytes} split {split} groups {groups}");
+    barrier_batch(l);
+    if n > 0 {
+        if let Some((ch, at)) = c.alloc(n) {
+            l.CopyBufferRegion(c.chunks[ch].rb.as_ref().unwrap(), at, r, 0, n);
+            line += &format!(" bytes {n:#x} file chunk{ch}.bin@{at:#x}");
+        }
+    }
+    if let Some((sb, at_c, at_m, stride, off)) = scaled {
+        let sraw = sb as *mut c_void;
+        if let Some(sr) = ID3D12Resource::from_raw_borrowed(&sraw) {
+            let st = (stride as u64 + 3) & !3;
+            if let Some((ch, at)) = c.alloc(2 * st) {
+                l.CopyBufferRegion(c.chunks[ch].rb.as_ref().unwrap(), at, sr, at_c, st);
+                l.CopyBufferRegion(c.chunks[ch].rb.as_ref().unwrap(), at + st, sr, at_m, st);
+                line += &format!(" args chunk{ch}.bin@{at:#x} stride {st} offset {off}");
+            }
+        }
+    }
+    barrier_batch(l);
+    c.man.push(line);
+}
+
 /// `bind_abi` after the io words are made (before the pipeline is set).
 pub unsafe fn on_bind(list: *mut c_void, pso: usize, gfx: bool, io: &[u32], table_at: usize, args: &[u8]) {
     if !on() {
@@ -596,18 +1165,39 @@ pub unsafe fn on_bind(list: *mut c_void, pso: usize, gfx: bool, io: &[u32], tabl
     // `XCL_LOCAL_LCAP_AFTER_CS_S=<s>`: armed that long after the first dispatch of the mask program
     // (the world's first lighting frame), and not before `XCL_LOCAL_LCAP_AFTER_S` (runs h4 / h5: the
     // world arrived at 98-118 s and the device was lost 25-42 s later)
-    static FIRST_CS: OnceLock<f64> = OnceLock::new();
     let now = crate::log::uptime();
     if !gfx && FIRST_CS.get().is_none() && saved_hashes(pso).is_some_and(|(gx, h)| !gx && matches(h[0], cs_set())) {
         let _ = FIRST_CS.set(now);
         crate::xlog_info!("LOCAL lcap: first dispatch of the mask program at {now:.3} s");
     }
-    let rel: Option<f64> = env("XCL_LOCAL_LCAP_AFTER_CS_S").and_then(|v| v.parse().ok());
-    if now < after_s() || rel.is_some_and(|r| FIRST_CS.get().is_none_or(|t| now < t + r)) {
+    if !armed(now) {
         return;
     }
-    // LOCAL (agent L): not before the gap after the previous capture
-    if ((now * 1000.0) as u64) < NEXT_ARM_MS.load(std::sync::atomic::Ordering::Relaxed) {
+    // LOCAL (agent R): the geometry capture takes two-pass mesh draws (`on_two_pass`); here: it ends at the
+    // first bind of the lighting stage (the mask program or a tiled-lighting draw), where the targets are
+    // copied again; other translated draws on the geometry targets are counted (not captured)
+    if geom_draws() > 0 {
+        let mut g = CAP.lock().unwrap();
+        let Some(c) = g.as_mut() else { return };
+        if c.written || c.tl != St::Active {
+            return;
+        }
+        let lighting = saved_hashes(pso).is_some_and(|(gx, h)| if gx { gfx && matches(h[0], vs_set()) } else { !gfx && matches(h[0], cs_set()) });
+        if lighting {
+            if let (Some(direct), Some(l)) = (list_ok(list), ID3D12GraphicsCommandList::from_raw_borrowed(&list)) {
+                c.tl_list = list as usize;
+                c.man.push(format!("gend list {:#x} foreign {} over {}", list as usize, c.geom_foreign, c.geom_over));
+                end_tl(c, l, direct, if gfx { "the lighting draws begin" } else { "the mask program is bound" });
+            }
+            return;
+        }
+        if gfx && geom_targets(list).0 {
+            c.geom_foreign += 1;
+            let t = c.trace.entry(list as usize).or_default();
+            if t.len() < 6000 {
+                t.push('G');
+            }
+        }
         return;
     }
     let mut g = CAP.lock().unwrap();
@@ -685,6 +1275,7 @@ pub unsafe fn on_bind(list: *mut c_void, pso: usize, gfx: bool, io: &[u32], tabl
 
 unsafe fn end_tl(c: &mut Cap, l: &ID3D12GraphicsCommandList, direct: bool, why: &str) {
     c.stage_now = 1;
+    c.reserve = 0; // LOCAL (agent R)
     barrier_batch(l);
     for r in c.tl_targets.clone() {
         c.tex(l, direct, r, "after", "target");
@@ -779,6 +1370,14 @@ pub unsafe fn on_execute(queue: *mut c_void, raw: &[*mut c_void], mapped: &[*mut
         return;
     }
     let has = |l: usize| l != 0 && (raw.iter().any(|x| *x as usize == l) || mapped.iter().any(|x| *x as usize == l));
+    // LOCAL (agent R): the order the lists with captured geometry draws are submitted in
+    if geom_draws() > 0 && c.tl != St::Idle {
+        for x in raw.iter().chain(mapped.iter()) {
+            if c.geom_lists.remove(&(*x as usize)) {
+                c.man.push(format!("gexec {:#x}", *x as usize));
+            }
+        }
+    }
     if c.cs == St::Done && !c.cs_exec && has(c.cs_list) {
         c.cs_exec = true;
     }
@@ -840,6 +1439,26 @@ unsafe fn try_flush(c: &mut Cap, q: &ID3D12CommandQueue, from: &str) {
         format!("windows {}", super::real::uma_window_vas().iter().map(|v| format!("{v:#x}")).collect::<Vec<_>>().join(" ")),
     ];
     lines.extend(c.man.iter().cloned());
+    // LOCAL (agent R): the binds seen on the lists with the geometry targets (M mesh draw, G other draw, C dispatch)
+    for (lst, t) in &c.trace {
+        lines.push(format!("trace list {lst:#x} {t}"));
+    }
+    if geom_draws() > 0 && fin {
+        if let Some(v) = VIEWS.lock().unwrap().as_ref() {
+            let mut all: Vec<(u32, View)> = v.by_index.iter().filter_map(|(i, h)| Some((*i, *v.by_handle.get(h)?))).filter(|x| x.1.res != 0 && !x.1.uav).collect();
+            all.sort_by_key(|x| x.0);
+            let (mut ev, mut text) = (0, String::new());
+            for (i, w) in &all {
+                let e = super::vram::is_evicted(w.res);
+                ev += e as u32;
+                text += &format!("{i} {:#x} f{} {}\n", w.res, u32::from_le_bytes(w.desc[..4].try_into().unwrap()), e as u8);
+            }
+            lines.push(format!("allviews {} srv views with a resource, {ev} of an evicted texture (file views.txt: index, resource, view format, evicted)", all.len()));
+            let dir = cap_dir(c.index);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("views.txt"), text);
+        }
+    }
     if let Some(v) = VIEWS.lock().unwrap().as_ref() {
         let mut s: Vec<(u32, String)> = v.samp_by_index.iter().filter_map(|(i, h)| Some((*i, v.samp_by_handle.get(h)?.clone()))).collect();
         s.sort();
@@ -928,12 +1547,29 @@ pub unsafe fn on_present(queue: *mut c_void) {
     }
     let n = PRESENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut g = CAP.lock().unwrap();
+    if geom_draws() > 0 && g.is_none() && armed(crate::log::uptime()) {
+        *g = Some(Cap::default()); // LOCAL (agent R)
+    }
     let Some(c) = g.as_mut() else { return };
     if c.written {
         return;
     }
     // LOCAL (agent L): the present count is only the fallback for a list whose submission was not seen
     let _ = n;
+    // LOCAL (agent R)
+    if geom_draws() > 0 {
+        if c.tl == St::Idle && armed(crate::log::uptime()) {
+            c.geom_fresh = true;
+        } else if c.tl == St::Active {
+            c.geom_presents += 1;
+            if c.geom_presents >= 2 {
+                c.man.push(format!("gend present foreign {} over {} (no lighting bind seen: targets not copied after)", c.geom_foreign, c.geom_over));
+                c.tl = St::Done;
+                c.tl_exec = true;
+                crate::xlog_info!("LOCAL lcap (geometry): frame capture ends at a present after {} draws; {} MB", c.draws, c.bytes >> 20);
+            }
+        }
+    }
     if c.cs == St::Done {
         c.cs_presents += 1;
     }
@@ -949,7 +1585,10 @@ pub unsafe fn on_present(queue: *mut c_void) {
 /// ExecuteCommandLists: no XCL hook, no XCL lock)
 unsafe fn read_chunks(dev: &ID3D12Device, q: &ID3D12CommandQueue, chunks: &[(usize, ID3D12Resource, u64)], dir: &std::path::Path) -> (u64, Vec<usize>) {
     use std::io::Write;
-    const PIECE: u64 = 64 << 20;
+    // LOCAL (agent R): `XCL_LOCAL_LCAP_PIECE_MB` (default 64): each piece waits its turn behind the title's own
+    // work on the queue (run R3: 0,75 s a piece), so bigger pieces write a capture sooner
+    #[allow(non_snake_case)]
+    let PIECE: u64 = geom_num("XCL_LOCAL_LCAP_PIECE_MB", 64).clamp(16, 1024) << 20;
     let mut done: Vec<usize> = Vec::new();
     let mut total = 0u64;
     let Ok(alloc) = dev.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT) else { return (0, done) };

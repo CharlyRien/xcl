@@ -5398,6 +5398,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+    let local_ps_src = ps; // LOCAL (agent R): the console PS, for `lcap::note_mesh`
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -5412,6 +5413,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = StreamOut::default();
+    let mut local_state = StreamOut::default(); // LOCAL (agent R)
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
     out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
     if let Some(p) = &ps {
@@ -5429,12 +5431,24 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
                     p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
                 }
                 out.raw(*ty, &p, palign == 8);
+                local_state.raw(*ty, &p, palign == 8); // LOCAL (agent R)
                 continue;
             }
             out.raw(*ty, payload, palign == 8);
+            // LOCAL (agent R): the state sub-objects without pointers (no shader, input layout, stream output, view instancing)
+            if ![1, 3, 4, 5, 6, 7, 12, 22].contains(ty) {
+                local_state.raw(*ty, payload, palign == 8);
+            }
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    // LOCAL (agent R): the pipeline's shaders, state and record shape for the geometry capture
+    let local_extra = format!(" rec {} split {} threads {} maxv {} maxp {} vdw {}", tp.record.record_dwords(), tp.mesh_groups_per_record, tp.record.threads, tp.record.max_vertices, tp.record.max_primitives, tp.record.vert_dwords());
+    let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
+    if hr >= 0 && !ppv.is_null() {
+        super::lcap::note_mesh(*ppv as usize, ms, local_ps_src, &local_state.0, local_extra);
+        super::lcap::demand_note(*ppv as usize, ms, local_ps_src);
+    }
+    Some(hr)
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline

@@ -623,6 +623,8 @@ unsafe fn bind_two_pass_stage(
     let table_at = copy(&args[inline..])?;
     let heaps = if std::env::var_os("XCL_LOCAL_TWO_PASS_NO_HEAPS").is_some() { [0; 2] } else { heaps };
     let io = two_pass_io_heaps(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
+    super::lcap::demand_at_bind(with(this, |s| s.pso), compute_pass, &io); // LOCAL (agent R): XCL_LOCAL_OOW_DEMAND
+    super::lcap::on_two_pass(this, with(this, |s| s.pso), compute_pass, &io, table_at, &args[inline..], heaps); // LOCAL (agent R)
     // LOCAL (agent N): `XCL_LOCAL_MS_CPU=N`: the first N two-pass compute binds log what the CPU view of
     // unified memory holds now (record time) where the retail MS reads its counts (see `local_ms_probe`)
     // LOCAL (agent U): how many mesh compute binds have the view-heap flag and a nonzero view-heap base
@@ -875,6 +877,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             list.Dispatch(n, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
+            super::lcap::after_ms_compute(this, res_buf.as_raw() as usize, record_bytes, tp.mesh_groups_per_record, None, n); // LOCAL (agent R)
             local_ms_probe(this, list, &tp, &res_buf, record_bytes); // LOCAL
             super::rtsum::two_pass_headers(this, &res_buf, record_bytes, n.min(4) as u64, format!("direct DispatchMesh {groups} groups, record {record_bytes} B")); // LOCAL
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
@@ -984,6 +987,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                         let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
                         pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
                         emit_uav_barrier(list, Some(&res_buf));
+                        if compute {
+                            // LOCAL (agent R)
+                            super::lcap::after_ms_compute(this, res_buf.as_raw() as usize, record_bytes, tp.mesh_groups_per_record, Some((scaled.as_raw() as usize, at + k as u64 * msig.byte_stride as u64, at + commands as u64 + k as u64 * msig.byte_stride as u64, msig.byte_stride, msig.mesh_offset)), 0);
+                        }
                         if compute && k == 0 {
                             local_ms_probe(this, list, &tp, &res_buf, record_bytes); // LOCAL
                             super::rtsum::two_pass_headers(this, &res_buf, record_bytes, 4, format!("ExecuteIndirect(DispatchMesh) command 0 of {max}, record {record_bytes} B")); // LOCAL

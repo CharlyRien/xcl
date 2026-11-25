@@ -29,6 +29,8 @@ use windows::Win32::Graphics::Dxgi::*;
 
 use crate::gpu::recomp;
 
+mod geom; // LOCAL (agent R): the geometry pass (two-pass mesh draws)
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
@@ -105,6 +107,9 @@ struct ViewL {
 
 struct Pso {
     gfx: bool,
+    /// LOCAL (agent R): a two-pass mesh pipeline (files: MS, PS; desc: its state sub-objects)
+    #[allow(dead_code)]
+    mesh: bool,
     hashes: [u64; 2],
     files: Vec<String>,
     desc: Vec<u8>,
@@ -134,7 +139,23 @@ struct Capture {
     missing: usize,
     complete: Vec<String>,
     rec_info: Vec<String>,
+    // LOCAL (agent R): geometry capture
+    gdraws: Vec<geom::GDraw>,
+    evicted: HashMap<u32, bool>,
+    /// (texture, is the depth target) of every target the geometry draws had bound
+    gtargets: Vec<(u32, bool)>,
+    /// the lists with geometry draws, in the order they were submitted
+    gexec: Vec<u64>,
+    /// buffers outside the memory windows: (address, the title's bytes at its CPU view)
+    oow: Vec<(u64, Vec<u8>)>,
+    /// descriptors naming them: (descriptor address, buffer address, descriptor word 1)
+    oowslots: Vec<(u64, u64, u32)>,
+    /// root descriptors naming them: (draw, compute stage, first io word, address)
+    oowio: Vec<(u32, bool, usize, u64)>,
 }
+
+/// LOCAL (agent R): with `oow=map`: where each buffer outside the windows was put (old address -> new)
+static OOW_MAP: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
 
 fn words(s: &str) -> Vec<u32> {
     s.split_whitespace().map(|w| u32::from_str_radix(w, 16).unwrap_or(0)).collect()
@@ -143,7 +164,7 @@ fn words(s: &str) -> Vec<u32> {
 fn load(dir: &Path) -> Capture {
     let man = std::fs::read_to_string(dir.join("manifest.txt")).expect("manifest.txt");
     let mut f = Files { dir: dir.to_path_buf(), cache: HashMap::new(), missing: 0 };
-    let mut c = Capture { uma_hi: 4, ranges: vec![], texs: vec![], descs: HashMap::new(), views: vec![], samplers: vec![], psos: HashMap::new(), dispatch: None, targets: (vec![], 0), draws: vec![], missing: 0, complete: vec![], rec_info: vec![] };
+    let mut c = Capture { uma_hi: 4, ranges: vec![], texs: vec![], descs: HashMap::new(), views: vec![], samplers: vec![], psos: HashMap::new(), dispatch: None, targets: (vec![], 0), draws: vec![], missing: 0, complete: vec![], rec_info: vec![], gdraws: vec![], evicted: HashMap::new(), gtargets: vec![], gexec: vec![], oow: vec![], oowslots: vec![], oowio: vec![] };
     let mut recs: HashMap<u32, Vec<[u32; 4]>> = HashMap::new();
     for l in man.lines() {
         let first = l.split_whitespace().next().unwrap_or("");
@@ -160,6 +181,9 @@ fn load(dir: &Path) -> Capture {
                 let id: u32 = it[1].parse().unwrap();
                 let desc: D3D12_RESOURCE_DESC = unsafe { pod(&unhex(tok(l, "desc").unwrap()).unwrap()) };
                 c.descs.insert(id, desc);
+                if let Some(e) = tok(l, "evicted") {
+                    c.evicted.insert(id, e == "true");
+                }
                 if let (Some(file), Some(total)) = (tok(l, "file"), tok(l, "total")) {
                     let total = hex(total) as usize;
                     if let Some(bytes) = f.try_get(file, total) {
@@ -183,7 +207,7 @@ fn load(dir: &Path) -> Capture {
                 if it[2] == "unknown" {
                     continue;
                 }
-                c.psos.insert(it[1].parse().unwrap(), Pso { gfx: it[2] == "gfx", hashes: [hex(it[3]), hex(it[4])], files: tok(l, "files").unwrap().split(',').map(String::from).collect(), desc: unhex(tok(l, "desc").unwrap()).unwrap() });
+                c.psos.insert(it[1].parse().unwrap(), Pso { mesh: it[2] == "mesh", gfx: it[2] == "gfx", hashes: [hex(it[3]), hex(it[4])], files: tok(l, "files").unwrap().split(',').map(String::from).collect(), desc: unhex(tok(l, "desc").unwrap()).unwrap() });
             }
             "dispatch" => {
                 let it: Vec<&str> = l.split_whitespace().collect();
@@ -214,6 +238,24 @@ fn load(dir: &Path) -> Capture {
                     recs: vec![],
                 });
             }
+            "gdraw" | "gmesh" | "grec" => geom::parse_line(first, l, &mut f, &mut c.gdraws),
+            "gtarget" => {
+                let it: Vec<&str> = l.split_whitespace().collect();
+                c.gtargets.push((it[1].parse().unwrap(), it[2] == "ds"));
+            }
+            "gexec" => c.gexec.push(hex(l.split_whitespace().nth(1).unwrap())),
+            "oow" => {
+                if let (Some(ea), Some(n), Some(file)) = (tok(l, "ea"), tok(l, "bytes"), tok(l, "cpu")) {
+                    if let Some(b) = f.try_get(file, hex(n) as usize) {
+                        c.oow.push((hex(ea), b));
+                    }
+                }
+            }
+            "oowio" => {
+                let it: Vec<&str> = l.split_whitespace().collect();
+                c.oowio.push((it[1].parse().unwrap(), it[2] == "c", it[3].parse().unwrap(), hex(it[5])));
+            }
+            "oowslot" => c.oowslots.push((hex(tok(l, "at").unwrap()), hex(tok(l, "ea").unwrap()), hex(tok(l, "w1").unwrap()) as u32)),
             "records" => {
                 let it: Vec<&str> = l.split_whitespace().collect();
                 // LOCAL (agent L): every record of the call (stride from the line), and the GPU's count
@@ -233,6 +275,10 @@ fn load(dir: &Path) -> Capture {
     for d in c.draws.iter_mut() {
         d.recs = recs.get(&d.k).cloned().unwrap_or_default();
         d.rec = d.recs.first().copied();
+    }
+    // LOCAL (agent R): a first-format geometry capture (run R1) names its targets in one line
+    if c.gtargets.is_empty() && !c.gdraws.is_empty() {
+        c.gtargets = c.targets.0.iter().enumerate().map(|(k, id)| (*id, k >= c.targets.1)).collect();
     }
     c.missing = f.missing;
     c.complete = man.lines().filter(|l| l.starts_with("complete ")).map(String::from).collect();
@@ -313,6 +359,80 @@ impl Gpu {
         }
         self.keep.push(l.cast().unwrap());
     }
+}
+
+/// LOCAL (agent R): DXGI formats that can view one another (same typeless family)
+fn format_family(f: i32) -> i32 {
+    match f {
+        1..=4 => 1,
+        5..=8 => 5,
+        9..=14 => 9,
+        15..=18 => 15,
+        19..=22 => 19,
+        23..=25 => 23,
+        27..=32 => 27,
+        33..=38 => 33,
+        39..=43 => 39,
+        44..=47 => 44,
+        48..=52 => 48,
+        53..=59 => 53,
+        60..=64 => 60,
+        70..=72 => 70,
+        73..=75 => 73,
+        76..=78 => 76,
+        79..=81 => 79,
+        82..=84 => 82,
+        87 | 90 | 91 => 87,
+        88 | 92 | 93 => 88,
+        94..=96 => 94,
+        97..=99 => 97,
+        x => x,
+    }
+}
+
+/// LOCAL (agent R): whether a captured view description can be a view of a resource of description `d`
+fn view_fits(b: &[u8], uav: bool, d: &D3D12_RESOURCE_DESC) -> bool {
+    let w = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let (fmt, dim) = (w(0) as i32, w(4));
+    let res_dim = d.Dimension.0; // 1 buffer, 2 1D, 3 2D, 4 3D
+    if fmt != 0 && res_dim != 1 && format_family(fmt) != format_family(d.Format.0) {
+        return false;
+    }
+    let want = if uav {
+        match dim {
+            1 => 1,
+            2 | 3 => 2,
+            4 | 5 => 3,
+            8 => 4,
+            _ => return false,
+        }
+    } else {
+        match dim {
+            1 => 1,
+            2 | 3 => 2,
+            4..=6 | 8 | 9 => 3,
+            7 => 4,
+            _ => return false,
+        }
+    };
+    if want != res_dim {
+        return false;
+    }
+    // mip range of a texture SRV (union at 16: most detailed mip, mip levels)
+    if !uav && res_dim != 1 && matches!(dim, 4 | 5 | 7 | 8 | 9) {
+        let (first, n) = (w(16), w(20));
+        if first >= d.MipLevels as u32 || (n != u32::MAX && first + n > d.MipLevels as u32) {
+            return false;
+        }
+    }
+    if uav && res_dim != 1 && w(8) >= d.MipLevels as u32 {
+        return false;
+    }
+    // a cube view needs 6 layers
+    if !uav && matches!(dim, 8 | 9) && d.DepthOrArraySize < 6 {
+        return false;
+    }
+    true
 }
 
 fn planes(f: i32) -> u32 {
@@ -504,6 +624,7 @@ fn lreplay() {
     let out = env("XCL_LREPLAY_OUT").map(PathBuf::from).unwrap_or_else(|| dir.join("replay"));
     let _ = std::fs::create_dir_all(&out);
     println!("lreplay: {} | {} ranges, {} texture copies, {} views, {} samplers, {} pipelines, dispatch {}, {} draws; loaded in {:.1} s", dir.display(), cap.ranges.len(), cap.texs.len(), cap.views.len(), cap.samplers.len(), cap.psos.len(), cap.dispatch.is_some(), cap.draws.len(), t_start.elapsed().as_secs_f64());
+    println!("lreplay: {} geometry draws (two-pass mesh)", cap.gdraws.len());
     println!("lreplay: {} entries without bytes on disk (skipped); complete lines: {:?}; records: {}", cap.missing, cap.complete, cap.rec_info.iter().take(3).cloned().collect::<Vec<_>>().join(" | "));
     let Some((dev, name)) = device() else {
         recomp::runner::skip_test("no GPU");
@@ -535,8 +656,10 @@ fn lreplay() {
 }
 
 unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out: &Path) {
-    let do_cs = mode == "cs" || mode == "both";
-    let do_tl = mode == "tl" || mode == "both";
+    // LOCAL (agent R): a geometry capture is replayed by `geom::run` (no compute stage, writable targets)
+    let geom = !cap.gdraws.is_empty();
+    let do_cs = !geom && (mode == "cs" || mode == "both");
+    let do_tl = geom || mode == "tl" || mode == "both";
     let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
     let mut g = Gpu { dev: dev.clone(), queue, fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(), fv: 0, alloc: dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap(), keep: vec![] };
     // ---- windows: the phase's ranges (the compute's first, the draws' over them)
@@ -546,6 +669,39 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
         // the draws' own argument copies and tables too (they do not overlap the compute's argument copy)
         placed.extend(cap.ranges.iter().filter(|r| r.phase == "before"));
     }
+    // LOCAL (agent R): directive `oow=map`: what if the buffers outside the memory windows were readable?
+    // Their bytes (the title's CPU view at the capture) go into free space of window 2 and the descriptors
+    // that name them are rewritten to point there (what a mirror of the range does in the title).
+    let mut extra: Vec<Range> = Vec::new();
+    if geom && directive("oow").as_deref() == Some("map") {
+        let w = 2u32;
+        let mut at = placed.iter().filter(|r| r.w == w).map(|r| r.off + r.bytes.len() as u64).max().unwrap_or(0);
+        at = ((at + 0xFFFF) & !0xFFFF) + (16 << 20);
+        let mut map: HashMap<u64, u64> = HashMap::new();
+        for (ea, bytes) in &cap.oow {
+            if map.contains_key(ea) || at + bytes.len() as u64 >= (1 << 32) - (1 << 20) {
+                continue;
+            }
+            map.insert(*ea, ((cap.uma_hi + w) as u64) << 32 | at);
+            extra.push(Range { w, off: at, phase: "before".into(), bytes: bytes.clone() });
+            at = (at + bytes.len() as u64 + 0xFFFF) & !0xFFFF;
+        }
+        let mut patched = 0;
+        for (p, ea, w1) in &cap.oowslots {
+            let Some(n) = map.get(ea) else { continue };
+            let pw = ((p >> 32) as u32).wrapping_sub(cap.uma_hi);
+            if pw >= 4 {
+                continue;
+            }
+            let mut b = (*n as u32).to_le_bytes().to_vec();
+            b.extend_from_slice(&((w1 & 0xFFFF_0000) | ((n >> 32) as u32 & 0xFFFF)).to_le_bytes());
+            extra.push(Range { w: pw, off: p & 0xFFFF_FFFF, phase: "before".into(), bytes: b });
+            patched += 1;
+        }
+        *OOW_MAP.lock().unwrap() = Some(map.clone());
+        summary(format!("override oow=map: {} buffers outside the windows made readable ({} MB), {patched} of {} descriptors rewritten", map.len(), extra.iter().map(|r| r.bytes.len()).sum::<usize>() >> 20, cap.oowslots.len()));
+    }
+    let placed: Vec<&Range> = placed.iter().copied().chain(extra.iter()).collect();
     const TILE: u64 = 65536;
     const WIN: u64 = 1 << 32;
     let mut wins: Vec<ID3D12Resource> = Vec::new();
@@ -629,9 +785,12 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
     let tex_pref: Vec<&str> = if do_cs { vec!["csbefore", "before", "csafter", "after"] } else { vec!["before", "csafter", "csbefore", "after"] };
     let mut ids: Vec<u32> = cap.views.iter().filter_map(|v| v.res).collect();
     ids.extend(cap.targets.0.iter().copied());
+    ids.extend(cap.gtargets.iter().map(|t| t.0));
     ids.sort();
     ids.dedup();
     let (rt_ids, ds_id) = (cap.targets.0[..cap.targets.1.min(cap.targets.0.len())].to_vec(), cap.targets.0.get(cap.targets.1).copied());
+    // LOCAL (agent R): a geometry capture names its targets one by one
+    let (rt_ids, ds_id) = if geom { (cap.gtargets.iter().filter(|t| !t.1).map(|t| t.0).collect(), cap.gtargets.iter().find(|t| t.1).map(|t| t.0)) } else { (rt_ids, ds_id) };
     let mut res: HashMap<u32, (ID3D12Resource, D3D12_RESOURCE_STATES)> = HashMap::new();
     let mut missing = Vec::new();
     for id in ids {
@@ -655,7 +814,9 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
             continue;
         }
         let r = r.unwrap();
-        let state = if ds {
+        let state = if ds && geom && cap.gtargets.iter().any(|t| t.1 && t.0 == id) {
+            D3D12_RESOURCE_STATE_DEPTH_WRITE
+        } else if ds {
             if do_cs && !do_tl { D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE } else { D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE }
         } else if rt_ids.contains(&id) && do_tl && !do_cs {
             D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -688,6 +849,10 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
         l.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, state)]);
         g.run(l);
         drop(keep_up);
+        // LOCAL (agent R): name the texture whose upload loses the device
+        if let Err(e) = dev.GetDeviceRemovedReason() {
+            panic!("device removed after the upload of tex {id} ({}x{}x{} f{} mips {} flags {:#x} dim {}; data {:?} bytes): {e}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Flags.0, d.Dimension.0, data.map(|t| t.bytes.len()));
+        }
         res.insert(id, (r, state));
     }
     if !missing.is_empty() {
@@ -695,6 +860,8 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
     }
     // ---- descriptor heaps
     let max_idx = cap.views.iter().map(|v| v.idx).max().unwrap_or(0).max(8) + 2;
+    // LOCAL (agent R): the geometry shaders index the heap themselves: every index the title's shared heap has
+    let max_idx = if geom { max_idx.max(1_000_000) } else { max_idx };
     let dh: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: max_idx, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).unwrap();
     let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
     let h_at = |i: u32| {
@@ -708,12 +875,30 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
     let null_srv = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
     let null_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
     let (mut made, mut nulls) = (0, 0);
+    let mut stale: Vec<u32> = Vec::new();
+    if geom {
+        // a null view wherever the capture has none (an index read without a captured view reads zero)
+        let t0 = Instant::now();
+        for i in 4..max_idx {
+            dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&null_srv), h_at(i));
+        }
+        println!("  {} null views in {:.2} s", max_idx - 4, t0.elapsed().as_secs_f64());
+    }
     for v in &cap.views {
         if v.idx < 4 {
             continue;
         }
         let vdir = directive(&format!("view{}", v.idx));
         let r = v.res.and_then(|id| res.get(&id)).map(|x| &x.0).filter(|_| vdir.as_deref() != Some("null"));
+        // LOCAL (agent R): a view the capture's map pairs with a resource it cannot be a view of (the slot is
+        // stale: its resource went and another one took its address) is a null view, counted
+        let r = r.filter(|r| {
+            let ok = v.desc.as_ref().is_none_or(|b| view_fits(b, v.uav, &r.GetDesc()));
+            if !ok {
+                stale.push(v.idx);
+            }
+            ok
+        });
         let mut vdesc = v.desc.clone();
         if let (Some(f), Some(b)) = (vdir.as_deref().and_then(|x| x.strip_prefix("fmt:")).and_then(|x| x.parse::<u32>().ok()), vdesc.as_mut()) {
             b[..4].copy_from_slice(&f.to_le_bytes());
@@ -747,8 +932,19 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
                 }
             }
         }
+        // LOCAL (agent R): name the view whose creation loses the device
+        if let Err(e) = dev.GetDeviceRemovedReason() {
+            let rd = v.res.and_then(|id| cap.descs.get(&id));
+            panic!("device removed at view {} ({}) of tex {:?} ({:?}) desc {:?}: {e}", v.idx, if v.uav { "uav" } else { "srv" }, v.res, rd.map(|d| (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Flags.0)), v.desc.as_ref().map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>()));
+        }
     }
     println!("  view heap {max_idx} descriptors: {made} views made, {nulls} null");
+    if !stale.is_empty() {
+        summary(format!("stale views (description does not fit the resource now at that address; made null): {} {:?}", stale.len(), &stale[..stale.len().min(40)]));
+    }
+    if let Err(e) = dev.GetDeviceRemovedReason() {
+        panic!("device removed while the views were made: {e}");
+    }
     let smax = cap.samplers.iter().map(|s| s.0).max().unwrap_or(0) + 1;
     let sh: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, NumDescriptors: smax.min(2048), Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).unwrap();
     let sinc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
@@ -759,8 +955,12 @@ unsafe fn replay(cap: &Capture, dev: &ID3D12Device, name: &str, mode: &str, out:
             dev.CreateSampler(s, h);
         }
     }
-    let res_buf = buf(dev, 1 << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    let res_buf = buf(dev, if geom { geom::res_bytes() } else { 1 << 20 }, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
     let windows = 4 | recomp::HEAP_WINDOWS;
+    if geom {
+        geom::run(&mut g, cap, &res, &wins, &dh, &sh, &res_buf, windows, out);
+        return;
+    }
     // ---- the compute program
     if do_cs {
         if let Some((pid, groups, io)) = &cap.dispatch {
