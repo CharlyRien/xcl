@@ -179,6 +179,7 @@ pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void, clobbered_gf
     }
     if bound_pso != 0 {
         let resolved = super::pso_async::resolve_for_bind(bound_pso);
+        super::pso_budget::bind(list, resolved); // LOCAL agent P (#2403)
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
         if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE {
             if let Some((true, static_bias)) = device_x::base_depth_bias_info(bound_pso) {
@@ -2664,6 +2665,9 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         });
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
+            // LOCAL agent P (#2403): a new recording, with its initial pipeline
+            super::pso_budget::list_reset(spare);
+            super::pso_budget::bind(spare, init_pso);
             reset_copy_scratch(spare);
             next_pc = Some(spare);
         }
@@ -3234,6 +3238,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    // LOCAL agent P (#2403): a new recording, with its initial pipeline
+    super::pso_budget::list_reset(target);
+    super::pso_budget::bind(target, init_pso);
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
@@ -3338,6 +3345,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         };
         if let Some(base) = need_restore_base {
             let resolved = super::pso_async::resolve_for_bind(base);
+            super::pso_budget::bind(this, resolved); // LOCAL agent P (#2403)
             pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
         }
         if !need_native_call {
@@ -3382,6 +3390,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     };
     if let Some(base) = restore {
         let resolved = super::pso_async::resolve_for_bind(base);
+        super::pso_budget::bind(this, resolved); // LOCAL agent P (#2403)
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
     }
 }
@@ -3422,6 +3431,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
         None => (bound_pso, false),
     };
     let resolved = super::pso_async::resolve_for_bind(target);
+    super::pso_budget::bind(list, resolved); // LOCAL agent P (#2403)
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
@@ -3811,6 +3821,9 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     if hr < 0 {
         return hr;
     }
+    // LOCAL agent P (#2403): a new recording, with its initial pipeline
+    super::pso_budget::list_reset(this);
+    super::pso_budget::bind(this, resolved);
 
     reset_copy_scratch(this);
     super::format_alias::list_reset(this as usize);

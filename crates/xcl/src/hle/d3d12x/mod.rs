@@ -39,6 +39,7 @@ mod lreplay; // LOCAL (agent H): offline replay of the lighting capture
 pub mod null;
 pub mod present;
 pub mod pso_async;
+pub mod pso_budget; // LOCAL agent P (#2403)
 pub mod real;
 mod shader_cache_session;
 pub mod sparse;

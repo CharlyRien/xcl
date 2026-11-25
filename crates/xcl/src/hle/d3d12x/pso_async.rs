@@ -30,7 +30,20 @@ struct Pending {
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
+    /// LOCAL agent P (`pso_budget`): the stand-in this is the real pipeline of
+    standin: usize,
+    /// LOCAL agent P (`pso_budget`): builds the real pipeline again after `evict` (None: not
+    /// evictable)
+    rebuild: Mutex<Option<Rebuild>>,
+    /// LOCAL agent P (`pso_budget`): the real pipeline was released to keep the driver's code
+    /// heap small; the next `resolve` builds it again (`revive`)
+    evicted: std::sync::atomic::AtomicBool,
+    /// LOCAL agent P: one `evict` or `revive` at a time
+    revive_lock: Mutex<()>,
 }
+
+/// LOCAL agent P (`pso_budget`): builds a pipeline again (its raw pointer, 0 = failed).
+pub type Rebuild = Box<dyn Fn() -> usize + Send>;
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
 #[derive(Default)]
@@ -119,6 +132,10 @@ fn complete(p: &Pending, real: usize) {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
+        // LOCAL agent P: known to the budget before any thread can bind it
+        if !p.orphan.load(Ordering::Acquire) {
+            super::pso_budget::built(p.standin, real, p.rebuild.lock().unwrap().is_some());
+        }
     }
     let orphan = {
         let mut done = p.done.lock().unwrap();
@@ -132,6 +149,7 @@ fn complete(p: &Pending, real: usize) {
     };
     // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
     if orphan {
+        super::pso_budget::forget(real); // LOCAL agent P
         release(real);
     }
 }
@@ -201,7 +219,13 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, true, 0, None);
+}
+
+/// LOCAL agent P: `submit` / `submit_lazy` (`lazy`) with `rebuild`, which builds the real
+/// pipeline again after `pso_budget` released it (`evict`).
+pub fn submit_rebuildable(standin: usize, compute: bool, job: Job, key: u64, lazy: bool, rebuild: Rebuild) {
+    submit_as(standin, compute, job, !lazy, key, Some(rebuild));
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -218,7 +242,7 @@ pub fn lazy() -> bool {
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`),
 /// and for every compute pipeline (after those: `Preload`; `XCL_PRELOAD_COMPUTE=0`: not).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, false, key, None);
 }
 
 /// Whether a compute pipeline no earlier run used is built ahead (`Preload`;
@@ -229,7 +253,7 @@ fn preload_compute() -> bool {
     *C.get_or_init(|| std::env::var("XCL_PRELOAD_COMPUTE").map_or(true, |v| v.trim() != "0"))
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, rebuild: Option<Rebuild>) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -242,6 +266,10 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         late: Default::default(),
         demand: Default::default(),
+        standin,
+        rebuild: Mutex::new(rebuild),
+        evicted: Default::default(),
+        revive_lock: Mutex::new(()),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -613,6 +641,7 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    revive(&p); // LOCAL agent P
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
@@ -635,6 +664,7 @@ pub fn resolve_wait(pso: usize) -> usize {
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    revive(&p); // LOCAL agent P
     p.note_use();
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
@@ -711,14 +741,66 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    // LOCAL agent P: no `revive` after this (it would store into a Pending nobody reads)
+    let _revive = p.revive_lock.lock().unwrap();
     let done = p.done.lock().unwrap();
-    if *done {
+    let real = if *done {
         p.real.swap(0, Ordering::AcqRel)
     } else {
         // the worker stores its result into a Pending nobody will read: mark it orphaned
         p.orphan.store(true, Ordering::Release);
         0
+    };
+    p.orphan.store(true, Ordering::Release);
+    drop(done);
+    if real != 0 {
+        super::pso_budget::forget(real); // LOCAL agent P
     }
+    real
+}
+
+/// LOCAL agent P (`pso_budget`): `real`, the built pipeline of stand-in `standin`, is released by
+/// the caller; the next `resolve` of the stand-in builds it again (`revive`). False (nothing
+/// changed): the stand-in is gone, its pipeline is another one, or it cannot be built again.
+pub fn evict(standin: usize, real: usize) -> bool {
+    let Some(p) = entry(standin) else { return false };
+    let _g = p.revive_lock.lock().unwrap();
+    if p.rebuild.lock().unwrap().is_none() || p.orphan.load(Ordering::Acquire) || p.real.load(Ordering::Acquire) != real || real == 0 {
+        return false;
+    }
+    // (`evicted` first: a `resolve` that reads 0 then builds it again)
+    p.evicted.store(true, Ordering::Release);
+    p.real.store(0, Ordering::Release);
+    true
+}
+
+/// LOCAL agent P: an evicted pipeline is built again here, by the thread that resolves it.
+fn revive(p: &Arc<Pending>) {
+    if !p.evicted.load(Ordering::Acquire) {
+        return;
+    }
+    let _g = p.revive_lock.lock().unwrap();
+    if !p.evicted.load(Ordering::Acquire) || p.real.load(Ordering::Acquire) != 0 || p.orphan.load(Ordering::Acquire) {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let r = p.rebuild.lock().unwrap().as_ref().map_or(0, |f| f());
+    let took = t.elapsed();
+    if r != 0 {
+        // known to the budget before any thread can bind it
+        super::pso_budget::built(p.standin, r, true);
+        p.real.store(r, Ordering::Release);
+    }
+    p.evicted.store(false, Ordering::Release);
+    super::pso_budget::revived(p.standin, r, p.compute, took);
+}
+
+/// LOCAL agent P: whether `standin`'s real pipeline is built and not evicted (tests).
+#[doc(hidden)]
+pub fn built_now(standin: usize) -> Option<usize> {
+    let p = entry(standin)?;
+    let r = p.real.load(Ordering::Acquire);
+    (r != 0 && !p.evicted.load(Ordering::Acquire)).then_some(r)
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.

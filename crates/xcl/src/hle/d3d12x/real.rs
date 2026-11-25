@@ -2857,6 +2857,9 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
     if hr >= 0 {
+        // LOCAL agent P (#2403): a new recording, with its initial pipeline
+        super::pso_budget::list_reset(this);
+        super::pso_budget::bind(this, resolved as usize);
         super::list_x::on_pc_reset(this);
     }
     hr
@@ -3013,7 +3016,16 @@ macro_rules! creator {
 creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
 creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [a1, a2]);
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
-creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+creator!(dev_create_command_list_local_inner, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
+/// LOCAL agent P (#2403): as the creator above, and the pipeline budget learns the new list's
+/// initial pipeline (integration agent I: without agent X's allocator probe, not in this tree).
+pub(super) unsafe extern "system" fn dev_create_command_list(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_command_list_local_inner(this, a1, a2, a3, a4, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::pso_budget::bind(*ppv, a4);
+    }
+    hr
+}
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
 
 /// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
@@ -4857,6 +4869,22 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    // LOCAL agent P (`pso_budget`): the description is kept to build the pipeline again
+    if super::pso_budget::enabled() {
+        let owned = std::sync::Arc::new(Mutex::new(owned));
+        let make = move || -> usize {
+            let owned = owned.lock().unwrap();
+            let mut out: *mut c_void = std::ptr::null_mut();
+            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+                out as usize
+            } else {
+                0
+            }
+        };
+        let again = make.clone();
+        super::pso_async::submit_rebuildable(*ppv as usize, compute, Box::new(make), key, super::pso_async::lazy(), Box::new(again));
+        return Some(hr);
+    }
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -5983,14 +6011,86 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let bound = super::pso_async::resolve_for_bind(pso as usize) as *mut c_void;
+    super::pso_budget::bind(this, bound as usize); // LOCAL agent P (#2403)
+    f(this, bound);
+    local_code_note(bound); // LOCAL agent H (#2403)
     super::list_x::on_set_pipeline_state(this, pso as usize);
+}
+
+/// LOCAL agent H, not for upstream: `XCL_LOCAL_CODE_IN_USE=1` - issue #2403: NVIDIA's driver keeps
+/// the machine code of the pipelines in use (first use to release) in one heap of at most 512 MB.
+/// Sums the driver's compiled code (`GetCachedBlob`) of every PC pipeline the first time a list
+/// binds it, and logs the total each time it passes a multiple of 16 MB (`LOCAL code in use:`)
+/// and at a device removal. Releases are not followed (an upper bound of the code in use; a
+/// pipeline at a reused address is not counted again).
+static CODE_IN_USE: Mutex<Option<(HashSet<usize>, u64, u64)>> = Mutex::new(None);
+
+pub(super) fn local_code_in_use_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("XCL_LOCAL_CODE_IN_USE").is_ok_and(|v| v.trim() == "1"))
+}
+
+unsafe fn local_code_note(pso: *mut c_void) {
+    if !local_code_in_use_enabled() || pso.is_null() {
+        return;
+    }
+    if CODE_IN_USE.lock().unwrap().as_ref().is_some_and(|(seen, _, _)| seen.contains(&(pso as usize))) {
+        return;
+    }
+    let size = driver_code_bytes(pso);
+    let mut g = CODE_IN_USE.lock().unwrap();
+    let (seen, total, n) = g.get_or_insert_with(|| (HashSet::new(), 0, 0));
+    if !seen.insert(pso as usize) {
+        return;
+    }
+    let before = *total;
+    *total += size;
+    *n += 1;
+    if *total >> 24 != before >> 24 {
+        crate::xlog_info!("LOCAL code in use: {:.1} MB in {} pipelines bound so far (this one {:#x}, {} KB)", *total as f64 / 1048576.0, *n, pso as usize, size >> 10);
+    }
+}
+
+/// LOCAL (agents H, P; #2403): the size of a pipeline's compiled code by the driver
+/// (`GetCachedBlob`; an adopted one through its PC method).
+pub(super) unsafe fn driver_code_bytes(pso: *mut c_void) -> u64 {
+    if pso.is_null() {
+        return 0;
+    }
+    if is_adopted(pso) {
+        type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+        let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
+        let mut raw = std::ptr::null_mut();
+        if get(pso, &mut raw) < 0 || raw.is_null() {
+            0
+        } else {
+            ID3DBlob::from_raw(raw).GetBufferSize() as u64
+        }
+    } else {
+        ID3D12PipelineState::from_raw_borrowed(&pso).and_then(|p| p.GetCachedBlob().ok()).map_or(0, |b| b.GetBufferSize() as u64)
+    }
+}
+
+/// LOCAL agent P: the compute pass XCL keeps with pipeline `pso` (a real one, not a stand-in).
+pub(super) fn two_pass_compute(pso: usize) -> Option<usize> {
+    TWO_PASS.lock().unwrap().as_ref()?.get(&pso).map(|t| t.compute)
+}
+
+/// The `XCL_LOCAL_CODE_IN_USE` total, for the removal report.
+pub(super) fn local_code_in_use_line() -> Option<String> {
+    if !local_code_in_use_enabled() {
+        return None;
+    }
+    CODE_IN_USE.lock().unwrap().as_ref().map(|(_, total, n)| format!("LOCAL code in use at the removal: {:.1} MB in {n} pipelines bound so far", *total as f64 / 1048576.0))
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
-    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    let resolved = super::pso_async::resolve_for_bind(pso as usize);
+    super::pso_budget::bind(this, resolved); // LOCAL agent P (#2403)
+    f(this, resolved as *mut c_void);
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
 }
@@ -6035,6 +6135,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::pso_budget::list_release(this); // LOCAL agent P (#2403)
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
     }
@@ -6473,6 +6574,12 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    if let Some(l) = local_code_in_use_line() {
+        crate::xlog_error!("{l}"); // LOCAL agent H (#2403)
+    }
+    if let Some(l) = super::pso_budget::removal_line() {
+        crate::xlog_error!("{l}"); // LOCAL agent P (#2403)
+    }
     super::culprit::on_device_removed();
     super::local_inputs::on_device_removed();
     unsafe {
