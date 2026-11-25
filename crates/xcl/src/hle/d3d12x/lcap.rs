@@ -741,6 +741,16 @@ impl Cap {
                     uavs.push(v.res);
                 }
                 self.tex(l, direct, v.res, phase, &format!("view{idx}"));
+                // LOCAL (agent Li): a format-alias reader: its writers (line + texels), for `alias<W>=<R>` in the replay
+                if !v.uav {
+                    for (w, what) in super::format_alias::local_writers_of(v.res) {
+                        self.tex(l, direct, w, phase, &format!("alias-writer-of-view{idx}"));
+                        let line = format!("alias reader {} view {idx} writer {} {what}", self.res_id(v.res), self.res_id(w));
+                        if !self.man.contains(&line) {
+                            self.man.push(line);
+                        }
+                    }
+                }
             }
             if self.views_done.insert(idx) {
                 let id = if v.res == 0 { u32::MAX } else { self.res_id(v.res) };

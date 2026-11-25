@@ -1170,6 +1170,18 @@ pub(super) unsafe fn local_note_bind(list: *mut c_void, io: &[u32]) {
     NAMED.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().extend(writers);
 }
 
+/// LOCAL (agent Li, capture): the writers of the alias pairs whose reader is `res`, with the writer's
+/// owner, its tracked PC state and the reader's owner (`lcap` notes them and copies the writers)
+pub(super) fn local_writers_of(res: usize) -> Vec<(usize, String)> {
+    let g = TABLE.lock().unwrap();
+    let Some(t) = g.as_ref() else { return Vec::new() };
+    t.pairs
+        .iter()
+        .filter(|p| p.reader == res)
+        .map(|p| (p.writer, format!("writer-owner {:?} writer-state {:?} reader-owner {:?} buffer-through {}", p.writer_owner, t.by_res.get(&p.writer).and_then(TrackedTex::uniform_state), p.reader_owner, p.buffer_through)))
+        .collect()
+}
+
 /// LOCAL (agent Li): whether the writer of `p` was named on `list` since its last sync
 fn local_named(list: usize, p: &AliasPair) -> bool {
     p.writer_owner == Owner::TitlePlaced && NAMED.lock().unwrap().as_ref().and_then(|m| m.get(&list)).is_some_and(|s| s.contains(&p.writer))
