@@ -878,7 +878,9 @@ unsafe fn log_cap(c: &Cap) {
                 h_prims += np as u64;
             }
         }
-        crate::xlog_info!("eicap: frame {f} two-pass records (vertices, primitives) {:x?} | {text}", hs);
+        // LOCAL (agent N): header dwords 2 / 3 (`XCL_LOCAL_MS_PROBE`: r0 = (s17, s18), r1 = (V#.x, V#.y), r2 = (V#.z, count), r3 = (entry 0, entry 1))
+        let probe: Vec<(u32, u32)> = (0..*n).map(|k| (w(base + 24 + 16 * k), w(base + 28 + 16 * k))).collect();
+        crate::xlog_info!("eicap: frame {f} two-pass records (vertices, primitives) {:x?} probe {:x?} | {text}", hs, probe);
     }
     c.rb.Unmap(0, None);
     crate::xlog_info!(
@@ -893,6 +895,11 @@ unsafe fn log_cap(c: &Cap) {
         c.calls.len() - g_calls,
         c.draws.len()
     );
+}
+
+/// LOCAL (agent N): a frame is being captured and has room for record headers (`bind::local_ms_probe`).
+pub fn capturing() -> bool {
+    on() && cap_frames() > 0 && CAP.lock().unwrap().as_ref().is_some_and(|c| c.used < SLOTS && c.hdrs.len() < 400)
 }
 
 /// LOCAL (agent J): a direct two-pass DispatchMesh of `groups` (x·y·z) in a captured frame.

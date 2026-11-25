@@ -8125,3 +8125,62 @@ fn gpu_compute_coherent_and_cached_loads() {
         }
     }
 }
+
+/// LOCAL: a retail NGG mesh program (`XCL_LOCAL_MS_BIN` = its container, kept outside the tree)
+/// run as XCL's two-pass compute pass with inputs built from its code: a descriptor table at
+/// 0x100 (s17, 32-bit) whose first V# is the meshlet buffer (dword 0 = count, entry g at
+/// 16g + 12: vertices - 1 in [6:0], primitives - 1 in [13:7]), s[18:19] = a raw vertex-stream
+/// table (zeros). The record headers must carry the entries' counts. Split and native forms.
+#[test]
+fn gpu_local_retail_ms_counts() {
+    let Some(path) = std::env::var_os("XCL_LOCAL_MS_BIN") else { return };
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    let blob = std::fs::read(path).unwrap();
+    let ps = super::dxc::compile("float4 main(float4 p : SV_Position) : SV_Target0 { return 1.0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let entries = [(64u32, 100u32), (32, 50), (128, 128), (3, 1)];
+    let mut mem = vec![0u32; 0x4000];
+    // table at 0x100: V# 0 = meshlet buffer at 0x1000, 0x20 / 0x60 = constants at 0x2000
+    for (at, base) in [(0x100usize, 0x1000u32), (0x120, 0x2000), (0x160, 0x2000)] {
+        mem[at / 4..at / 4 + 4].copy_from_slice(&[base, 0, 0x1000, 0]);
+    }
+    mem[0x1000 / 4] = entries.len() as u32;
+    for (g, (v, p)) in entries.iter().enumerate() {
+        mem[(0x1000 + 16 * g + 12) / 4] = (v - 1) | ((p - 1) << 7);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[17] = 0x100;
+    sg[18] = 0x3000;
+    let splits: Vec<bool> = if runner::wave64_supported().unwrap_or(false) { vec![false, true] } else { vec![true] };
+    for split in splits {
+        let tp = super::pso::console_mesh(&blob, None, split).unwrap();
+        let (_, rec) = runner::mesh_draw(&tp.cs, &tp.ms, &ps, entries.len() as u32, tp.record.record_dwords(), &sg, &mem, 32, [0.0; 4]).unwrap();
+        let rd = tp.record.record_dwords();
+        let got: Vec<(u32, u32)> = (0..entries.len()).map(|g| (rec[g * rd], rec[g * rd + 1])).collect();
+        println!("split {split}: {got:?}");
+        assert_eq!(got, entries.to_vec(), "split {split}");
+    }
+}
+
+/// LOCAL: `bind::LOCAL_MS_PROBE_HLSL` reads the table, V#, count and entries as the retail MS does
+/// (its stores redirected from the record buffer into memory at 0x3800, 4-dword records).
+#[test]
+fn gpu_local_ms_probe_reads_the_meshlet_entries() {
+    if !gpu_ready() {
+        return;
+    }
+    let src = crate::hle::d3d12x::bind::LOCAL_MS_PROBE_HLSL.replace("XCL_RD", "4u").replace("res.Store((k * rd", "m0.Store(0x3800u + (k * rd");
+    let dxil = super::dxc::compile(&src, "main", "cs_6_6", &[]).unwrap();
+    let mut mem = vec![0u32; 0x1000];
+    mem[0x100 / 4..0x100 / 4 + 4].copy_from_slice(&[0x1000, 0, 0x1000, 0]);
+    mem[0x1000 / 4] = 2;
+    mem[(0x1000 + 12) / 4] = 63 | (99 << 7);
+    mem[(0x1000 + 28) / 4] = 31 | (49 << 7);
+    let mut sg = vec![0u32; 128];
+    sg[17] = 0x100;
+    sg[18] = 0x3000;
+    let m = runner::dispatch(&dxil, [1, 1, 1], &sg, &mem).unwrap();
+    let r: Vec<u32> = (0..4).flat_map(|k| [m[0x3800 / 4 + k * 4 + 2], m[0x3800 / 4 + k * 4 + 3]]).collect();
+    assert_eq!(r, vec![0x100, 0x3000, 0x1000, 0, 0x1000, 2, 63 | (99 << 7), 31 | (49 << 7)]);
+}

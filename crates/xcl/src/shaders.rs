@@ -856,6 +856,42 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    // LOCAL: `--local-mesh-dump <dir>` with `XCL_LOCAL_MESH_HASHES=h1,h2`: for each console MS container
+    // with that fnv64, write the container, its NGG program's disassembly and the two-pass compute HLSL
+    // (split wave64 and not)
+    if let Some(dir) = args.iter().position(|a| a == "--local-mesh-dump").and_then(|i| args.get(i + 1)) {
+        let want = std::env::var("XCL_LOCAL_MESH_HASHES").unwrap_or_default();
+        let dir = Path::new(dir);
+        let _ = std::fs::create_dir_all(dir);
+        let mut seen = HashSet::new();
+        for i in 0..input.len() {
+            let (_, blob) = input.get(i);
+            let Some(blob) = blob else { continue };
+            let h = format!("{:016x}", shader::fnv64(&blob));
+            if !want.split(',').any(|w| w.trim() == h) || !seen.insert(h.clone()) {
+                continue;
+            }
+            let _ = std::fs::write(dir.join(format!("{h}.bin")), &blob);
+            let Some(sh) = xbox::parse(&blob) else { println!("{h}: not parsed"); continue };
+            let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)) else { println!("{h}: no NGG"); continue };
+            let Some(recomp::Mode::Mesh(ms)) = recomp::interface(&blob, &sh, f) else { println!("{h}: no MS interface"); continue };
+            let p = &f.programs[0];
+            let code = &f.data[p.offset..p.offset + p.len];
+            let mut dis = format!("// {ms:?}\n// wave64 {}\n", recomp::detect_wave64(code));
+            for l in crate::gpu::rdna2::disassemble(code, 0, false) {
+                dis.push_str(&format!("{:6x}: {}\n", l.pc, l.text));
+            }
+            let _ = std::fs::write(dir.join(format!("{h}.s")), dis);
+            for split in [true, false] {
+                match recomp::translate_mesh(code, ms.clone(), recomp::detect_wave64(code), split, 4) {
+                    Ok(t) => { let _ = std::fs::write(dir.join(format!("{h}.split{}.hlsl", split as u8)), &t.hlsl); }
+                    Err(e) => println!("{h} split {split}: {e}"),
+                }
+            }
+            println!("{h}: dumped ({} B code)", code.len());
+        }
+        return 0;
+    }
     if let Some(dir) = export_dir {
         let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
             Some(Ok(h)) => Some(h),

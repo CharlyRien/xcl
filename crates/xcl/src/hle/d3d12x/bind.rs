@@ -372,6 +372,90 @@ unsafe fn emit_uav_barrier(list: &ID3D12GraphicsCommandList, res: Option<&ID3D12
     std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.UAV).pResource);
 }
 
+// LOCAL (agent N): `XCL_LOCAL_MS_PROBE=1` – in a captured frame (rtsum EICAP), right after a two-pass
+// compute pass and with its root arguments still bound, a one-thread pass reads what the retail
+// title's MS programs read for their counts: the 32-bit descriptor table in s17, its first V# (the
+// meshlet buffer), that buffer's dword 0 (count) and entries 0 / 1 (dword at 16g + 12: vertices - 1
+// in [6:0], primitives - 1 in [13:7]), and writes them into the unused header dwords 2 / 3 of
+// records 0..3: r0 = (s17, s18), r1 = (V#.x, V#.y), r2 = (V#.z, count), r3 = (entry 0, entry 1).
+pub(crate) const LOCAL_MS_PROBE_HLSL: &str = r#"RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer res : register(u1);
+RWByteAddressBuffer m0 : register(u2);
+RWByteAddressBuffer m1 : register(u3);
+RWByteAddressBuffer m2 : register(u4);
+RWByteAddressBuffer m3 : register(u5);
+static const uint rd = XCL_RD;
+uint ld(uint hi, uint lo) {
+    uint w = hi == 0u ? 0u : hi - io.Load(448u);
+    lo &= ~3u;
+    if (w == 0u) return m0.Load(lo);
+    if (w == 1u) return m1.Load(lo);
+    if (w == 2u) return m2.Load(lo);
+    if (w == 3u) return m3.Load(lo);
+    return 0xEEEEEEEEu;
+}
+[numthreads(1, 1, 1)]
+void main() {
+    uint t = io.Load(68u);
+    uint4 v = uint4(ld(0u, t), ld(0u, t + 4u), ld(0u, t + 8u), ld(0u, t + 12u));
+    uint bhi = v.y & 0xFFFFu, blo = v.x;
+    uint cnt = v.z != 0u ? ld(bhi, blo) : 0xBAD0BAD0u;
+    uint e0 = v.z > 12u ? ld(bhi, blo + 12u) : 0xBAD0BAD0u;
+    uint e1 = v.z > 28u ? ld(bhi, blo + 28u) : 0xBAD0BAD0u;
+    uint d[8] = { t, io.Load(72u), v.x, v.y, v.z, cnt, e0, e1 };
+    for (uint k = 0u; k < 4u; k++) {
+        res.Store((k * rd + 2u) * 4u, d[2u * k]);
+        res.Store((k * rd + 3u) * 4u, d[2u * k + 1u]);
+    }
+}
+"#;
+
+unsafe fn local_ms_probe(this: *mut c_void, list: &ID3D12GraphicsCommandList, tp: &super::real::TwoPassPso, res: &ID3D12Resource, record_bytes: u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("XCL_LOCAL_MS_PROBE").is_some()) || !super::rtsum::capturing() {
+        return;
+    }
+    static CACHE: Mutex<Option<HashMap<(usize, usize, u32), Option<ID3D12PipelineState>>>> = Mutex::new(None);
+    let Some(dev) = super::real::list_device(this) else { return };
+    let rd = (record_bytes / 4) as u32;
+    let key = (dev.as_raw() as usize, tp.compute_rs, rd);
+    let pso = {
+        let mut c = CACHE.lock().unwrap();
+        let m = c.get_or_insert_with(HashMap::new);
+        m.entry(key)
+            .or_insert_with(|| {
+                let rs_raw = tp.compute_rs as *mut c_void;
+                let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw)?;
+                let dxil = match crate::gpu::recomp::dxc::compile_cached(&LOCAL_MS_PROBE_HLSL.replace("XCL_RD", &format!("{rd}u")), "main", "cs_6_6") {
+                    Ok(d) => d.0,
+                    Err(e) => {
+                        crate::xlog_warn!("ms probe: {e}");
+                        return None;
+                    }
+                };
+                let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                let r: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
+                std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
+                match r {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        crate::xlog_warn!("ms probe pso: {e}");
+                        None
+                    }
+                }
+            })
+            .clone()
+    };
+    let Some(pso) = pso else { return };
+    list.SetPipelineState(&pso);
+    list.Dispatch(1, 1, 1);
+    emit_uav_barrier(list, Some(res));
+}
+
 unsafe fn emit_transition(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     let mut b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -693,6 +777,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             list.Dispatch(n, 1, 1);
             emit_uav_barrier(list, Some(&res_buf));
+            local_ms_probe(this, list, &tp, &res_buf, record_bytes); // LOCAL
             super::rtsum::two_pass_headers(this, &res_buf, record_bytes, n.min(4) as u64, format!("direct DispatchMesh {groups} groups, record {record_bytes} B")); // LOCAL
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
             pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
@@ -779,6 +864,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                         pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
                         emit_uav_barrier(list, Some(&res_buf));
                         if compute && k == 0 {
+                            local_ms_probe(this, list, &tp, &res_buf, record_bytes); // LOCAL
                             super::rtsum::two_pass_headers(this, &res_buf, record_bytes, 4, format!("ExecuteIndirect(DispatchMesh) command 0 of {max}, record {record_bytes} B")); // LOCAL
                         }
                     }
