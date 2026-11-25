@@ -4637,6 +4637,7 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     let hr = graphics_pso(this, desc, riid, ppv, false);
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_graphics(*ppv as usize, desc);
+        super::rtsum::note_graphics(*ppv as usize, desc); // LOCAL
     }
     hr
 }
@@ -4691,6 +4692,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let hr = create_compute_pso(this, desc, riid, ppv);
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_compute(*ppv as usize, desc);
+        super::rtsum::note_compute(*ppv as usize, desc); // LOCAL
     }
     hr
 }
@@ -5546,6 +5548,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
             let hr = graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true);
             if hr >= 0 && !ppv.is_null() {
                 super::culprit::note_graphics(*ppv as usize, &*d as *const _ as *const c_void);
+                super::rtsum::note_graphics(*ppv as usize, &*d as *const _ as *const c_void); // LOCAL
             }
             return hr;
         }

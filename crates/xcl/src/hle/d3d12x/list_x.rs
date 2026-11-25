@@ -6361,3 +6361,14 @@ mod tests {
         }
     }
 }
+
+/// LOCAL diagnostic (`rtsum` ExecuteIndirect capture): the list's first viewport, scissor,
+/// topology, title vertex buffer 0 and index buffer, as text
+pub(super) fn local_draw_state(list: *mut c_void) -> String {
+    let g = LISTS.lock().unwrap();
+    let Some(s) = g.as_ref().and_then(|m| m.get(&(list as usize))) else { return "no list state".into() };
+    let b = &s.bindings;
+    let vp = b.viewports.first().map(|v| format!("({},{} {}x{} z {}..{})", v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth));
+    let sc = b.scissors.first().map(|r| format!("({},{})-({},{})", r.left, r.top, r.right, r.bottom));
+    format!("vp {} sc {} topo {:?} vb0 {:x?} ib {:x?}", vp.unwrap_or_else(|| "-".into()), sc.unwrap_or_else(|| "-".into()), b.topology, b.vertex_titles.get(&0), b.index_title)
+}

@@ -1094,6 +1094,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_signature(*ppv as usize, list.last().map(|a| a[0]));
         super::rtsum::note_signature(*ppv as usize, list.last().map(|a| a[0])); // LOCAL
+        super::rtsum::note_stride(*ppv as usize, u32::from_le_bytes(pc[0..4].try_into().unwrap())); // LOCAL
         if needs_root {
             super::bind::note_root_changing_signature(*ppv as usize);
         } else if let Some(idx) = list.iter().position(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32) {

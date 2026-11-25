@@ -285,6 +285,7 @@ pub unsafe fn on_present(queue: *mut c_void, res: usize, dump: bool) {
             if *r == res { " (presented)" } else { "" }
         );
     }
+    eicap_present(queue, n, total(DRAW_EI)); // ExecuteIndirect capture
     if dump {
         if let Some(dir) = std::env::var_os("XCL_LOCAL_RTSUM_DUMP_DIR") {
             let max: usize = std::env::var("XCL_LOCAL_RTSUM_DUMP_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(14);
@@ -564,5 +565,293 @@ unsafe fn write_target(p: &Pending, dir: &std::path::Path, frame: u64, k: usize)
         hi,
         if nonfinite > 0 { format!(", {nonfinite} non-finite channel values") } else { String::new() },
         if decoded { "" } else { " (not decoded)" }
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// LOCAL: ExecuteIndirect capture (`XCL_LOCAL_EICAP_FRAMES=n`, default off): the first n frames
+// after `XCL_LOCAL_RTSUM_AFTER_S` that follow a frame with at least 100 indirect draws get, after
+// each translated ExecuteIndirect, a copy of its count and first argument records (on the
+// title's list, so as the GPU has them after that call) into a readback buffer; read and logged
+// two presents later. Never freed (a list run late must not write freed memory).
+// ---------------------------------------------------------------------------------------
+
+static STRIDES: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+static GFX: Mutex<Option<HashMap<usize, [u64; 2]>>> = Mutex::new(None);
+static CSH: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+pub fn note_stride(sig: usize, stride: u32) {
+    if on() && sig != 0 {
+        STRIDES.lock().unwrap().get_or_insert_with(HashMap::new).insert(sig, stride);
+    }
+}
+
+unsafe fn shader_hash(b: &D3D12_SHADER_BYTECODE) -> u64 {
+    let (p, n) = (b.pShaderBytecode as usize, b.BytecodeLength);
+    if p == 0 || n == 0 || !crate::gpu::shader::readable(p, n) {
+        return 0;
+    }
+    crate::gpu::shader::fnv64(std::slice::from_raw_parts(p as *const u8, n))
+}
+
+pub unsafe fn note_graphics(pso: usize, desc: *const c_void) {
+    if !on() || pso == 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return;
+    }
+    let d = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    let h = [shader_hash(&d.VS), shader_hash(&d.PS)];
+    std::mem::forget(d);
+    GFX.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, h);
+}
+
+pub unsafe fn note_compute(pso: usize, desc: *const c_void) {
+    if !on() || pso == 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return;
+    }
+    let d = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let h = shader_hash(&d.CS);
+    std::mem::forget(d);
+    CSH.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, h);
+}
+
+fn shaders(pso: usize) -> String {
+    let real = super::pso_async::resolve(pso);
+    if let Some(h) = [pso, real].iter().find_map(|p| GFX.lock().unwrap().as_ref().and_then(|m| m.get(p).copied())) {
+        return format!("vs {:016x} ps {:016x}", h[0], h[1]);
+    }
+    if let Some(h) = [pso, real].iter().find_map(|p| CSH.lock().unwrap().as_ref().and_then(|m| m.get(p).copied())) {
+        return format!("cs {h:016x}");
+    }
+    format!("pso {pso:#x} (shaders not seen)")
+}
+
+const SLOT: u64 = 256;
+const SLOTS: u64 = 8192;
+
+struct EiCall {
+    slot: u64,
+    text: String,
+    stride: u32,
+    max: u32,
+    has_count: bool,
+    gfx: bool,
+    args_len: u64,
+    last: u32,
+}
+
+struct Cap {
+    frame: u64,
+    rb: ID3D12Resource,
+    used: u64,
+    calls: Vec<EiCall>,
+    draws: Vec<String>,
+}
+
+static CAP: Mutex<Option<Cap>> = Mutex::new(None);
+static PENDING: Mutex<Vec<Cap>> = Mutex::new(Vec::new());
+static CAPTURED: AtomicU64 = AtomicU64::new(0);
+
+fn cap_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_LOCAL_EICAP_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn after_indirect(list: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64, gfx: bool, pso: usize) {
+    if !on() || cap_frames() == 0 {
+        return;
+    }
+    let mut g = CAP.lock().unwrap();
+    let Some(c) = g.as_mut() else { return };
+    if c.used >= SLOTS {
+        return;
+    }
+    if super::list_x::tracked_list_type(list).is_none_or(|t| t == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+        return;
+    }
+    let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return };
+    let stride = STRIDES.lock().unwrap().as_ref().and_then(|m| m.get(&sig).copied()).unwrap_or(0);
+    let last = SIGS.lock().unwrap().as_ref().and_then(|m| m.get(&sig).copied()).unwrap_or(u32::MAX);
+    let slot = c.used;
+    c.used += 1;
+    let base = slot * SLOT;
+    let (araw, craw) = (args as *mut c_void, count_buf as *mut c_void);
+    let mut args_len = 0;
+    if let Some(a) = ID3D12Resource::from_raw_borrowed(&araw) {
+        let want = (stride as u64 * max.min(4) as u64).min(SLOT - 16);
+        let w = a.GetDesc().Width;
+        args_len = want.min(w.saturating_sub(args_off)) & !3;
+        if args_len > 0 {
+            l.CopyBufferRegion(&c.rb, base + 16, a, args_off, args_len);
+        }
+    }
+    let has_count = count_buf != 0;
+    if let Some(cb) = ID3D12Resource::from_raw_borrowed(&craw) {
+        if count_off + 4 <= cb.GetDesc().Width {
+            l.CopyBufferRegion(&c.rb, base, cb, count_off, 4);
+        }
+    }
+    let rts = BOUND.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize)).cloned());
+    let tgt = rts.map(|(r, d)| format!("rt {:x?} ds {d:#x}", r)).unwrap_or_default();
+    let text = format!(
+        "list {:#x} {} {} args {args:#x}+{args_off:#x} count {count_buf:#x}+{count_off:#x}; {tgt}; {}",
+        list as usize,
+        sig_name(last),
+        shaders(pso),
+        if gfx { super::list_x::local_draw_state(list) } else { String::new() }
+    );
+    c.calls.push(EiCall { slot, text, stride, max, has_count, gfx, args_len, last });
+}
+
+pub fn direct_draw(list: *mut c_void, pso: usize, a: (bool, u32, u32, u32, i32)) {
+    if !on() || cap_frames() == 0 {
+        return;
+    }
+    let mut g = CAP.lock().unwrap();
+    let Some(c) = g.as_mut() else { return };
+    if c.draws.len() >= 2000 {
+        return;
+    }
+    let rts = BOUND.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize)).cloned());
+    let tgt = rts.map(|(r, d)| format!("rt {:x?} ds {d:#x}", r)).unwrap_or_default();
+    c.draws.push(format!(
+        "list {:#x} {} {} count {} x{} first {} base {}; {tgt}; {}",
+        list as usize,
+        if a.0 { "DrawIndexed" } else { "Draw" },
+        shaders(pso),
+        a.1,
+        a.2,
+        a.3,
+        a.4,
+        super::list_x::local_draw_state(list)
+    ));
+}
+
+/// At each present (`on_present`, after the summary): close / open captures, log old ones.
+unsafe fn eicap_present(queue: *mut c_void, n: u64, prev_ei_draws: u64) {
+    if cap_frames() == 0 {
+        return;
+    }
+    // a capture that covered the frame just presented
+    if let Some(mut c) = CAP.lock().unwrap().take() {
+        c.frame = n;
+        PENDING.lock().unwrap().push(c);
+    }
+    if CAPTURED.load(Ordering::Relaxed) < cap_frames() && prev_ei_draws >= 100 {
+        let dev_raw = super::real::device_raw();
+        if let Some(dev) = ID3D12Device::from_raw_borrowed(&dev_raw) {
+            let bd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: SLOT * SLOTS,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            if dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).is_ok() {
+                if let Some(rb) = rb {
+                    // marker: a slot the GPU never wrote keeps it
+                    let mut m: *mut c_void = std::ptr::null_mut();
+                    if rb.Map(0, None, Some(&mut m)).is_ok() && !m.is_null() {
+                        std::ptr::write_bytes(m as *mut u8, 0xCD, (SLOT * SLOTS) as usize);
+                        rb.Unmap(0, None);
+                    }
+                    CAPTURED.fetch_add(1, Ordering::Relaxed);
+                    crate::xlog_info!("eicap: capturing the frame after present {n}");
+                    *CAP.lock().unwrap() = Some(Cap { frame: 0, rb, used: 0, calls: Vec::new(), draws: Vec::new() });
+                }
+            }
+        }
+    }
+    // captures two presents old: wait for the present queue, then log
+    let ready: Vec<Cap> = {
+        let mut p = PENDING.lock().unwrap();
+        let (r, keep): (Vec<Cap>, Vec<Cap>) = p.drain(..).partition(|c| c.frame + 2 <= n);
+        *p = keep;
+        r
+    };
+    if ready.is_empty() {
+        return;
+    }
+    let dev_raw = super::real::device_raw();
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&dev_raw) else { return };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    if let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+        let _ = q.Signal(&fence, 1);
+        let event = CreateEventW(None, false, false, None).ok();
+        if let Err(e) = crate::gpu::fence::wait(&fence, 1, dev, event, 20000) {
+            crate::xlog_warn!("eicap: present queue not done ({e}); reading anyway (unwritten slots show cdcdcdcd)");
+        }
+        if let Some(e) = event {
+            let _ = windows::Win32::Foundation::CloseHandle(e);
+        }
+    }
+    for c in ready {
+        log_cap(&c);
+        std::mem::forget(c); // the buffer is never freed (see above)
+    }
+}
+
+unsafe fn log_cap(c: &Cap) {
+    let mut m: *mut c_void = std::ptr::null_mut();
+    if c.rb.Map(0, None, Some(&mut m)).is_err() || m.is_null() {
+        return;
+    }
+    let w = |o: u64| ((m as *const u8).add(o as usize) as *const u32).read_unaligned();
+    let f = c.frame;
+    let (mut g_calls, mut g_zero_count, mut g_zero_inst, mut g_unwritten, mut g_work) = (0usize, 0, 0, 0, 0);
+    let mut c_zero = 0;
+    for e in &c.calls {
+        let base = e.slot * SLOT;
+        let count = if e.has_count { Some(w(base)) } else { None };
+        let words: Vec<u32> = (0..e.args_len / 4).map(|k| w(base + 16 + 4 * k)).collect();
+        let unwritten = words.first() == Some(&0xCDCD_CDCD) || count == Some(0xCDCD_CDCD);
+        // the draw / dispatch at the end of each record
+        let tail: usize = match e.last {
+            0 | 2 => 4,
+            1 => 5,
+            _ => 0,
+        };
+        let tail = if e.last == 2 { 3 } else { tail };
+        let per = (e.stride / 4) as usize;
+        let recs: Vec<Vec<u32>> = if per >= tail && per > 0 && tail > 0 { words.chunks(per).filter(|r| r.len() == per).map(|r| r[per - tail..].to_vec()).collect() } else { Vec::new() };
+        let n_eff = count.map_or(e.max, |c| c.min(e.max));
+        if e.gfx {
+            g_calls += 1;
+            if unwritten {
+                g_unwritten += 1;
+            } else if n_eff == 0 {
+                g_zero_count += 1;
+            } else if recs.first().is_some_and(|r| r[0] == 0 || r[1] == 0) {
+                g_zero_inst += 1;
+            } else {
+                g_work += 1;
+            }
+        } else if !unwritten && (n_eff == 0 || recs.first().is_some_and(|r| r.iter().take(3).any(|&v| v == 0))) {
+            c_zero += 1;
+        }
+        crate::xlog_info!(
+            "eicap: frame {f} #{} {}: max {} count {:?} stride {} records {:x?}{} | {}",
+            e.slot,
+            if e.gfx { "gfx" } else { "cs" },
+            e.max,
+            count.map(|c| if c == 0xCDCD_CDCD { "unwritten".to_string() } else { c.to_string() }),
+            e.stride,
+            recs.iter().take(4).collect::<Vec<_>>(),
+            if unwritten { " (slot never written)" } else { "" },
+            e.text
+        );
+    }
+    c.rb.Unmap(0, None);
+    for (k, d) in c.draws.iter().enumerate() {
+        crate::xlog_info!("eicap: frame {f} direct draw {k}: {d}");
+    }
+    crate::xlog_info!(
+        "eicap: frame {f} summary: {g_calls} indirect draws: {g_zero_count} with count 0, {g_zero_inst} with a first record of 0 vertices/instances, {g_work} with work, {g_unwritten} not executed by read time; {} indirect dispatches ({c_zero} with no groups); {} direct draws",
+        c.calls.len() - g_calls,
+        c.draws.len()
     );
 }

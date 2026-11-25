@@ -787,6 +787,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     count(DRAWS);
                     local_mesh(2, 1);
                     super::rtsum::indirect(this, sig, "two-pass mesh"); // LOCAL
+                    super::rtsum::after_indirect(this, sig, max, args, args_off, count_buf, count_off, true, pso); // LOCAL (the title's mesh arguments)
                     local_mesh(7, max as u64);
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
                     let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -873,6 +874,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             // its draws or groups are in the argument buffer (`max` records)
             let mark = super::culprit::begin(this, || super::culprit::indirect_op(this, sig, max, count_buf != 0));
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+            super::rtsum::after_indirect(this, sig, max, args, args_off, count_buf, count_off, gfx, with(this, |s| s.pso)); // LOCAL
             super::culprit::end(this, mark)
         }
         Err(e) => {
@@ -1105,6 +1107,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         Ok(()) => {
             count(DRAWS);
             super::rtsum::draw(this, super::rtsum::DRAW_TR); // LOCAL
+            super::rtsum::direct_draw(this, pso, DRAW_ARGS.with(|d| d.get())); // LOCAL
             Some(list)
         }
         Err(e) => {
