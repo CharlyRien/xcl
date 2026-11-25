@@ -993,7 +993,9 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
 /// when `None` (global UAV barrier), deduplicate against `bind::activity()`.
 pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<&[usize]>) {
     let local = local_alias_at_use() && ACTIVE_PAIRS.load(Ordering::Relaxed) != 0; // LOCAL agent I
-    if (ACTIVE_PLACED_UAV_PAIRS.load(Ordering::Relaxed) == 0 && !local) || list.is_null() {
+    // LOCAL agent Li: only the pairs whose writer a bind on this list named (`local_note_bind`)
+    let on_read = !local && local_alias_on_read() && NAMED.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| !s.is_empty());
+    if (ACTIVE_PLACED_UAV_PAIRS.load(Ordering::Relaxed) == 0 && !local && !on_read) || list.is_null() {
         return;
     }
     let Some(ty) = list_x::tracked_list_type(list) else {
@@ -1025,7 +1027,7 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
                 .iter()
                 .copied()
                 .filter(|p| {
-                    (p.writer_owner == Owner::PlacedUav || (local && local_alias_pair(t, p))) // LOCAL agent I
+                    (p.writer_owner == Owner::PlacedUav || (local && local_alias_pair(t, p)) || (on_read && local_named(list as usize, p))) // LOCAL agent I, agent Li
                         && p.device == dev_raw
                         && specific_targets.is_none_or(|targets| targets.contains(&p.writer))
                 })
@@ -1033,6 +1035,7 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
             None => return,
         }
     };
+    let mut synced_writers: Vec<usize> = Vec::new(); // LOCAL agent Li
     for pair in pairs {
         // LOCAL agent I: a title-placed writer is in the state its own transitions left (enhanced
         // barriers: its initial one), not UNORDERED_ACCESS
@@ -1053,6 +1056,15 @@ pub(super) unsafe fn on_uav_barrier(list: *mut c_void, specific_targets: Option<
             }
         }
         sync_pair(list, &dev, ty, pair, ws);
+        if on_read {
+            synced_writers.push(pair.writer);
+        }
+    }
+    // LOCAL agent Li: those writers are clean again on this list (all their readers were copied above)
+    if let Some(s) = NAMED.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        for w in synced_writers {
+            s.remove(&w);
+        }
     }
 }
 
@@ -1073,7 +1085,7 @@ fn local_alias_pair(t: &AliasTable, p: &AliasPair) -> bool {
 
 /// LOCAL agent I: before Close, the same sync as at a UAV barrier (forced: no activity check).
 pub(super) unsafe fn local_alias_before_close(list: *mut c_void) {
-    if !local_alias_at_use() || list.is_null() {
+    if !(local_alias_at_use() || local_alias_on_read()) || list.is_null() {
         return;
     }
     if let Some(m) = LIST_STATES.lock().unwrap().as_mut() {
@@ -1082,6 +1094,85 @@ pub(super) unsafe fn local_alias_before_close(list: *mut c_void) {
         }
     }
     on_uav_barrier(list, None);
+    if let Some(m) = NAMED.lock().unwrap().as_mut() {
+        m.remove(&(list as usize));
+    }
+}
+
+/// LOCAL (agent Li) `XCL_LOCAL_ALIAS_ON_READ=1`: a format-aliased pair whose writer is a title placed texture
+/// is synced only after that writer may have been written: when a bind on a list names the writer in a
+/// descriptor table its user data points at (any T# of the first 64 slots of each table whose view index
+/// names the writer: `console_heap::resource_of_index`), the next UAV barrier on that list (the title's
+/// enhanced barriers come as one global UAV barrier) or its close copies the writer into every reader of
+/// its pairs, every level and layer (`sync_pair`). No width filter, and none of the copies of
+/// `XCL_LOCAL_ALIAS_AT_USE` for writers nothing names. Meant for the title's 9-9-9-5 light chain: the
+/// diffuse light written as R32_UINT by `CS_ScreenProbes_TemporalResolve` and read as R9G9B9E5 by the
+/// lighting draws and by itself in the next frame, the probe atlas (2048x456, 4 levels), the sky cache
+/// (128x128x6), the volumes.
+pub(super) fn local_alias_on_read() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_LOCAL_ALIAS_ON_READ").is_some())
+}
+
+/// LOCAL (agent Li): list -> title writers of pairs named by a bind on it since its last sync
+static NAMED: Mutex<Option<HashMap<usize, HashSet<usize>>>> = Mutex::new(None);
+
+/// LOCAL (agent Li): a translated bind on `list` with user data `io` (32-bit console addresses)
+pub(super) unsafe fn local_note_bind(list: *mut c_void, io: &[u32]) {
+    if !local_alias_on_read() || ACTIVE_PAIRS.load(Ordering::Relaxed) == 0 || list.is_null() {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let base = u.base() & !0xFFFF_FFFF;
+    let mut named: Vec<usize> = Vec::new();
+    let mut seen_tables: Vec<usize> = Vec::new();
+    for &w in io.iter().take(32) {
+        if w < 0x10000 {
+            continue;
+        }
+        let p = base | w as usize;
+        let Some((start, bytes)) = super::console_heap::heap_extent(p) else { continue };
+        if seen_tables.contains(&p) {
+            continue;
+        }
+        seen_tables.push(p);
+        let end = (start + bytes).min(p + 64 * 32);
+        if end <= p || !crate::gpu::shader::readable(p, end - p) {
+            continue;
+        }
+        let mut q = p;
+        while q + 32 <= end {
+            let w3 = ((q + 12) as *const u32).read_unaligned();
+            if w3 >> 28 >= 8 {
+                if let Some(r) = super::console_heap::resource_of_index((q as *const u32).read_unaligned()) {
+                    named.push(r);
+                }
+            }
+            q += 32;
+        }
+    }
+    if named.is_empty() {
+        return;
+    }
+    let writers: Vec<usize> = {
+        let g = TABLE.lock().unwrap();
+        let Some(t) = g.as_ref() else { return };
+        named.into_iter().filter(|r| t.pairs.iter().any(|p| p.writer == *r && p.writer_owner == Owner::TitlePlaced)).collect()
+    };
+    if writers.is_empty() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_power_of_two() {
+        crate::xlog_info!("LOCAL alias-on-read: a bind on list {list:p} names title writers {writers:x?} (#{})", n + 1);
+    }
+    NAMED.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().extend(writers);
+}
+
+/// LOCAL (agent Li): whether the writer of `p` was named on `list` since its last sync
+fn local_named(list: usize, p: &AliasPair) -> bool {
+    p.writer_owner == Owner::TitlePlaced && NAMED.lock().unwrap().as_ref().and_then(|m| m.get(&list)).is_some_and(|s| s.contains(&p.writer))
 }
 
 /// Sync format-aliased readers for title-owned writers that just transitioned out of write state.

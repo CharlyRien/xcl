@@ -420,6 +420,11 @@ static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
+    // LOCAL (agent Li): the index map is kept from the start for `XCL_LOCAL_ALIAS_ON_READ`
+    if !s.sampler && !super::present::trace_frame() && super::format_alias::local_alias_on_read() {
+        note_index(s, res);
+        return;
+    }
     if s.sampler || !super::present::trace_frame() {
         return;
     }
