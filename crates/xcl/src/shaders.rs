@@ -1194,6 +1194,17 @@ impl Pipelines {
         use crate::hle::d3d12x::real::driver_cache;
         let path = driver_cache::path(&c.dxil, desc.Flags.0);
         let cached = path.as_deref().and_then(driver_cache::load);
+        // LOCAL, not for upstream: `XCL_LOCAL_PIPELINES_TRUST_CACHE=1` – a program with a driver
+        // blob on disk is counted as done without asking the driver to load it, so a stopped and
+        // restarted precompile reaches new work in seconds instead of minutes
+        if cached.is_some() && std::env::var_os("XCL_LOCAL_PIPELINES_TRUST_CACHE").is_some() {
+            *self.running.0.lock().unwrap() -= 1;
+            self.running.1.notify_one();
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            self.made.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
