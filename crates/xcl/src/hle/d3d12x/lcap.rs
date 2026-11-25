@@ -57,8 +57,12 @@ fn cs_set() -> &'static [String] {
 // (unchanged: `XCL_LOCAL_LCAP_AFTER_S` / `_AFTER_CS_S` after the mask program), the first one whose
 // used-resource table names as a UAV image (kind 3, 8 dwords) a T# whose word 0 is one of these indices,
 // instead of the first `XCL_LOCAL_LCAP_CS` program; its table slots come from the same file. Meant for
-// the R32_UINT textures behind the R9G9B9E5 light views the tiled-lighting draws read (views 2524 / 2530
-// / 2592 / 2598 of captures L4 and R4 have their R32_UINT companions at 2520 / 2526 / 2588 / 2594).
+// the R32_UINT textures behind the R9G9B9E5 light views the tiled-lighting draws read: in L4 / R4 each
+// light texture has an R32_UINT read view, an R32_UINT UAV slot and the R9G9B9E5 view, (2520, 2522, 2524),
+// (2526, 2528, 2530), (2588, 2590, 2592), (2594, 2596, 2598), (2750, 2752, 2754); the UAV slots' T#s (word 0
+// = 2522, 2528, 2590, 2596, 2752) are what a writer's table holds (L4 c1: the table of
+// indirect_diffuse_lighting CS_ScreenProbes_TemporalResolve at 0x44d6f1460, s5+160..184). Every compute
+// pipeline is noted (hashes, containers) while this is set.
 // Whatever the arming, each compute bind that names one is logged (`LOCAL lcap uavwatch`: the first 64,
 // then each new program / index), so one run also says which programs write those textures and when.
 // An ExecuteIndirect dispatch has no groups here (`groups 0 0 0`): its argument records follow
@@ -418,7 +422,9 @@ pub unsafe fn note_compute(pso: usize, desc: *const c_void) {
     let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
     let Some(cs) = blob(&d.CS) else { return };
     let h = crate::gpu::shader::fnv64(&cs);
-    if !matches(h, cs_set()) {
+    // LOCAL (agent Li): with `XCL_LOCAL_LCAP_CS_UAV`, every compute pipeline (the watch needs their hashes;
+    // the title's compute containers are about 16 MB in all)
+    if !matches(h, cs_set()) && uav_watch().is_empty() {
         return;
     }
     let s = SavedPso { mesh: false, extra: String::new(), gfx: false, hashes: [h, 0], desc: hexbytes(desc as *const u8, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()), blobs: vec![cs] };
