@@ -1425,7 +1425,9 @@ pub unsafe fn oow_copy_root_views(layout: Option<&super::console_list::Layout>, 
     let p = g.get_or_insert_with(|| CopyPool { base: 0, next: 0, map: HashMap::new(), copied: 0, reused: 0, full: 0, seg: 0, seg_fence: Vec::new(), fence: None, value: 0, blocked: 0, faults: 0 });
     // the pool: retried (256 / 128 / 64 MB) until the coherent window has room, at most once per frame
     if p.base == 0 && p.full == 0 {
-        for mb in [256usize, 128, 64] {
+        // LOCAL (agent G): `XCL_LOCAL_OOW_COPY_POOL_MB` (256): with segments, one frame gets pool / segments
+        let want: usize = std::env::var("XCL_LOCAL_OOW_COPY_POOL_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256);
+        for mb in [want, want / 2, want / 4].into_iter().filter(|&m| m >= 16) {
             if let Some(b) = super::sparse::alloc(mb << 20, 0x1_0000).map(|q| q.0) {
                 if u.is_sparse(b) {
                     p.base = b;
