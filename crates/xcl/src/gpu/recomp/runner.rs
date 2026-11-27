@@ -1527,8 +1527,9 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
         }
         // the windows as raw UAVs at MEM_HEAP_BASE.. of a shader-visible heap
-        // (`Options::heap_windows`; programs with the root-UAV switch ignore it)
-        let win_count = arena.windows.len().clamp(crate::gpu::uma::MAX_WINDOWS, crate::gpu::uma::MAX_HEAP_WINDOWS);
+        // (`Options::heap_windows`; programs with the root-UAV switch ignore it), null views in
+        // the slots past the arena's windows, as `console_heap::set_window_views`
+        let win_count = crate::gpu::uma::MAX_HEAP_WINDOWS;
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -1539,10 +1540,12 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             .map_err(e)?;
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
         for k in 0..win_count {
-            let (b, size) = bufs.get(k).map_or((&mem_buf, arena.windows[0].1), |b| (b, arena.windows[k].1));
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
-            dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
+            match (bufs.get(k), arena.windows.get(k)) {
+                (Some(b), Some(w)) => dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(w.1 as u64)), h),
+                _ => dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(crate::gpu::uma::GRAIN as u64)), h),
+            }
         }
         for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
