@@ -1,0 +1,149 @@
+From cbd3a88d0c36cbdfaafa11987aeaaccb73c63ffa Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:57:06 +0100
+Subject: [PATCH 20/23] Lab: tests that touch process-wide lab state are
+ serialized (review item 6)
+
+Tests that flip a process-wide lab switch, swap or hold the sparse
+STATE, or read counters other tests move now hold
+sparse::lab_test_lock (cargo runs tests in parallel; the switch tests
+and the STATE swaps of the v2 test could take each other's state). The
+Map copy fence left set by MapCopy::new / map_copy_submit is put back
+to none after each test that sets it (MapCopyReset), so a later unmap
+on another test's device does not wait on it. Tests only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/sparse.rs | 32 +++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index 2caeb4e5..da5538c5 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -3412,6 +3412,7 @@ mod tests {
+     /// not wait for the state, and the next `lock_state` lets the buffer go.
+     #[test]
+     fn a_buffer_released_while_the_state_is_held_does_not_wait_for_it() {
++        let _serial = lab_test_lock();
+         const RES: usize = 0x7ff0_dead_0000;
+         assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
+         drop(lock_state());
+@@ -3574,6 +3575,7 @@ mod tests {
+     /// waiting for (a list's `Reset` against an upload's allocator `Reset`, with `XCL_DRED=1`).
+     #[test]
+     fn the_queue_is_answered_while_the_state_is_locked() {
++        let _serial = lab_test_lock();
+         let held = STATE.lock().unwrap();
+         let (tx, rx) = std::sync::mpsc::channel();
+         let asked = std::thread::spawn(move || {
+@@ -4278,6 +4280,7 @@ mod tests {
+     /// more than 65 535 of them (two dispatches).
+     #[test]
+     fn gpu_sparse_scatter_lands_the_bytes_the_copies_land() {
++        let _serial = lab_test_lock();
+         use windows_sys::Win32::System::Memory::MEM_RELEASE;
+         unsafe {
+             if crate::gpu::recomp::dxc::create_instance().is_none() {
+@@ -4588,6 +4591,17 @@ mod tests {
+         }
+     }
+ 
++    /// Puts the Map copy fence (left by `MapCopy::new` / `map_copy_submit`) back to none, also on a
++    /// panic: a later unmap on another test's device must not wait on it.
++    struct MapCopyReset;
++
++    impl Drop for MapCopyReset {
++        fn drop(&mut self) {
++            MAP_COPY_SIGNALLED.store(0, Ordering::Release);
++            *MAP_COPY_FENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
++        }
++    }
++
+     /// A D3D12 device for the lab switch tests (WARP if there is no GPU).
+     unsafe fn lab_device() -> ID3D12Device {
+         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+@@ -4618,6 +4632,7 @@ mod tests {
+     /// tries the lock for ~2 ms. On it reads the PC's value and does not wait for that lock.
+     #[test]
+     fn a_direct_fence_probe_reads_the_same_value_without_the_hooks_wait() {
++        let _serial = lab_test_lock();
+         use crate::hle::d3d12x::real;
+         unsafe {
+             let dev = lab_device();
+@@ -4666,6 +4681,8 @@ mod tests {
+     /// out by both), and only once all that was on the state's queue before it is done.
+     #[test]
+     fn a_map_copy_on_the_copy_queue_reads_what_the_state_queue_copy_reads() {
++        let _serial = lab_test_lock();
++        let _reset = MapCopyReset;
+         use windows_sys::Win32::System::Memory::MEM_RELEASE;
+         unsafe {
+             let (base, mut s) = test_state_with_reserved(2);
+@@ -4740,6 +4757,7 @@ mod tests {
+     /// lab `XCL_SPARSE_MAP_NOWAIT`: off unless the environment says 1 (the tests run with it unset).
+     #[test]
+     fn the_map_switch_is_off_unless_set() {
++        let _serial = lab_test_lock();
+         set_map_nowait(None);
+         if std::env::var_os("XCL_SPARSE_MAP_NOWAIT").is_none() {
+             assert!(!map_nowait(), "off by default");
+@@ -4821,6 +4839,7 @@ mod tests {
+     /// the state, as does any address of the envelope with the switch off (the old path).
+     #[test]
+     fn use_range_outside_the_lazy_buffers_does_not_take_the_state() {
++        let _serial = lab_test_lock();
+         const A: usize = 0x7e00_0000_0000;
+         let bufs = [(0x1usize, A, TILE), (0x2usize, A + 8 * TILE, 2 * TILE)];
+         let old = (LAZY_BUFS[0].load(Ordering::Acquire), LAZY_BUFS[1].load(Ordering::Acquire));
+@@ -4847,6 +4866,7 @@ mod tests {
+     /// plain fence with the switch on and off.
+     #[test]
+     fn a_fast_fence_completed_reads_the_same_values() {
++        let _serial = lab_test_lock();
+         use crate::hle::d3d12x::real;
+         unsafe {
+             let dev = lab_device();
+@@ -4876,6 +4896,7 @@ mod tests {
+     /// readback thread (printed, not asserted: that thread may land it meanwhile).
+     #[test]
+     fn a_v2_fence_probe_lands_finished_copies_back_as_the_hook_did() {
++        let _serial = lab_test_lock();
+         use crate::hle::d3d12x::real;
+         use windows_sys::Win32::System::Memory::MEM_RELEASE;
+         unsafe {
+@@ -4939,6 +4960,7 @@ mod tests {
+     /// part holds zeros around the runs, the same with the scatter as with the copies.
+     #[test]
+     fn gpu_sparse_scatter_unaligned_runs_and_clears_land_the_copies_bytes() {
++        let _serial = lab_test_lock();
+         use windows_sys::Win32::System::Memory::MEM_RELEASE;
+         unsafe {
+             if crate::gpu::recomp::dxc::create_instance().is_none() {
+@@ -5013,6 +5035,7 @@ mod tests {
+     /// `RETIRED_TABLES` and are released by `drop_retired_tables` (from `before_execute`, lock let go).
+     #[test]
+     fn scatter_tables_are_not_adopted_and_go_outside_the_lock() {
++        let _serial = lab_test_lock();
+         use crate::hle::d3d12x::real;
+         unsafe {
+             let dev = lab_device();
+@@ -5097,14 +5120,7 @@ mod tests {
+     fn an_unmap_waits_for_the_map_copies_before_it() {
+         use windows_sys::Win32::System::Memory::MEM_RELEASE;
+         let _serial = lab_test_lock();
+-        struct Reset;
+-        impl Drop for Reset {
+-            fn drop(&mut self) {
+-                MAP_COPY_SIGNALLED.store(0, Ordering::Release);
+-                *MAP_COPY_FENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+-            }
+-        }
+-        let _reset = Reset;
++        let _reset = MapCopyReset;
+         unsafe {
+             let (base, mut s) = test_state_with_reserved(1);
+             assert!(!VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+-- 
+2.46.0.windows.1
+
