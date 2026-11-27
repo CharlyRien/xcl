@@ -1,0 +1,2267 @@
+From d7e2e4a0a586b03909a2881301b10699d6d3a1d2 Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 06:28:04 +0100
+Subject: [PATCH 01/14] Lab: XCL_THREAD_SAMPLE and XCL_CALL_STATS - where the
+ CPU time goes, without elevation
+
+XCL_THREAD_SAMPLE=<from s>,<period ms>,<count> (+ XCL_THREAD_SAMPLE_FILE): every period, each
+other thread's cycle time (QueryThreadCycleTime) and, when it ran, its RIP and up to 7 return
+addresses (stopped only for GetThreadContext and a 16 KiB stack copy, unwound afterwards from the
+copy with RtlVirtualUnwind); a thread that did not run and waits in ntdll / win32u is not stopped.
+Written to a binary file with the modules (full paths) and thread names; counts in the log.
+
+XCL_CALL_STATS=1[,<s>]: calls and time by kind of the Win32 / D3D12 calls around the title's
+submits (write watch, VirtualQuery / VirtualProtect, ReadProcessMemory, Map / Unmap, fences,
+queue Signal / Wait, UpdateTileMappings, XCL's copy recordings, ECLs, STATE / TEXTURES / REFRESH
+lock waits) and timers over the parts of the submit hook and of the refresh; totals in the log.
+
+Both off unless set. No translator source touched (identity 793bcfdace7b0c74).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/eh.rs                        |   2 +-
+ crates/xcl/src/gpu/fence.rs                 |   2 +-
+ crates/xcl/src/gpu/texture.rs               |  12 +-
+ crates/xcl/src/hle/d3d12x/call_stats.rs     | 303 ++++++++
+ crates/xcl/src/hle/d3d12x/cpu_writes.rs     |  12 +-
+ crates/xcl/src/hle/d3d12x/list_x.rs         |  15 +-
+ crates/xcl/src/hle/d3d12x/mod.rs            |   1 +
+ crates/xcl/src/hle/d3d12x/real.rs           |  59 +-
+ crates/xcl/src/hle/d3d12x/sparse.rs         |  56 +-
+ crates/xcl/src/hle/d3d12x/title_textures.rs |  86 +--
+ crates/xcl/src/hle/d3d12x/vram.rs           |  30 +-
+ crates/xcl/src/hle/d3d12x/watch_trap.rs     |  12 +-
+ crates/xcl/src/host.rs                      |   2 +
+ crates/xcl/src/lib.rs                       |   1 +
+ crates/xcl/src/thread_sample.rs             | 757 ++++++++++++++++++++
+ 15 files changed, 1218 insertions(+), 132 deletions(-)
+ create mode 100644 crates/xcl/src/hle/d3d12x/call_stats.rs
+ create mode 100644 crates/xcl/src/thread_sample.rs
+
+diff --git a/crates/xcl/src/eh.rs b/crates/xcl/src/eh.rs
+index 7fb4f975..739dd4c0 100644
+--- a/crates/xcl/src/eh.rs
++++ b/crates/xcl/src/eh.rs
+@@ -588,7 +588,7 @@ extern "system" {
+ }
+ 
+ /// A thread's description (SetThreadDescription – engines name their threads).
+-unsafe fn thread_name(h: *mut std::ffi::c_void) -> String {
++pub(crate) unsafe fn thread_name(h: *mut std::ffi::c_void) -> String {
+     let mut p: *mut u16 = std::ptr::null_mut();
+     if GetThreadDescription(h, &mut p) < 0 || p.is_null() {
+         return String::new();
+diff --git a/crates/xcl/src/gpu/fence.rs b/crates/xcl/src/gpu/fence.rs
+index 4d702802..4f342b1f 100644
+--- a/crates/xcl/src/gpu/fence.rs
++++ b/crates/xcl/src/gpu/fence.rs
+@@ -74,7 +74,7 @@ pub(crate) unsafe fn wait(
+     let start = Instant::now();
+     let mut remaining = timeout_ms;
+     loop {
+-        let status = WaitForSingleObject(event, remaining);
++        let status = crate::hle::d3d12x::call_stats::cs!(EventWait, WaitForSingleObject(event, remaining));
+         let error = (status == WAIT_FAILED).then(Error::from_thread);
+         let completed = completed_value(fence, dev)?;
+         if let Some(e) = error {
+diff --git a/crates/xcl/src/gpu/texture.rs b/crates/xcl/src/gpu/texture.rs
+index 8a662490..9f9c5280 100644
+--- a/crates/xcl/src/gpu/texture.rs
++++ b/crates/xcl/src/gpu/texture.rs
+@@ -257,7 +257,7 @@ impl Uploader {
+         drop(self.staging.take());
+         let b = buffer(dev, cap)?;
+         let mut p = std::ptr::null_mut();
+-        b.Map(0, None, Some(&mut p)).map_err(err)?;
++        crate::hle::d3d12x::call_stats::cs!(Map, b.Map(0, None, Some(&mut p))).map_err(err)?;
+         self.staging = Some((b.clone(), p as *mut u8, cap));
+         Ok((b, p as *mut u8))
+     }
+@@ -308,7 +308,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
+     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
+     up.value += 1;
+     let copy_error = |e| format!("texture copy: {e}");
+-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
++    crate::hle::d3d12x::call_stats::cs!(QueueSignal, queue.Signal(&up.fence, up.value)).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
+         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
+         // uploader next time) – freeing them under the GPU removed the device
+@@ -343,9 +343,9 @@ pub unsafe fn record_upload_states(
+     let l = layout(dev, res, subs, before, after)?;
+     let up = buffer(dev, l.total)?;
+     let mut p = std::ptr::null_mut();
+-    up.Map(0, None, Some(&mut p)).map_err(err)?;
++    crate::hle::d3d12x::call_stats::cs!(Map, up.Map(0, None, Some(&mut p))).map_err(err)?;
+     record_into(list, res, subs, &l, before, after, &up, p as *mut u8, 0);
+-    up.Unmap(0, None);
++    crate::hle::d3d12x::call_stats::cs!(Unmap, up.Unmap(0, None));
+     Ok(up)
+ }
+ 
+@@ -414,7 +414,7 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
+         };
+         let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + fp.Offset, Footprint: fp.Footprint };
+         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed } };
+-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
++        crate::hle::d3d12x::call_stats::cs!(RecCopyTexture, list.CopyTextureRegion(&dst, 0, 0, 0, &src, None));
+     }
+     let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
+     if !back.is_empty() {
+@@ -438,7 +438,7 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
+     let copy_error = |e| format!("texture copy: {e}");
+     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+         .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
++    crate::hle::d3d12x::call_stats::cs!(QueueSignal, queue.Signal(&fence, 1)).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+     fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
+ }
+ 
+diff --git a/crates/xcl/src/hle/d3d12x/call_stats.rs b/crates/xcl/src/hle/d3d12x/call_stats.rs
+new file mode 100644
+index 00000000..bd068f4f
+--- /dev/null
++++ b/crates/xcl/src/hle/d3d12x/call_stats.rs
+@@ -0,0 +1,303 @@
++//! lab: `XCL_CALL_STATS=1[,<seconds>]` – how many Win32 / D3D12 calls XCL makes around the
++//! title's submits, and their time, by kind; and timers over the parts of the submit hook
++//! (`real::q_execute_command_lists`) and of the refresh. Off unless set.
++//!
++//! Each counted call or part adds 1 and its nanoseconds to its kind (two relaxed adds), once for
++//! all threads and once more when the current thread is inside a title ExecuteCommandLists
++//! (the "in submits" bank). Times nest: a part counts the calls made inside it too. A lock is
++//! first tried: got at once, it counts a call and no time; else the wait is timed. Every
++//! `<seconds>` (5) the log has the totals since the start, with the presents so far, in one line:
++//! `call stats at <s> s, <presents> presents: <name> <calls> <us> [<calls in submits> <us in
++//! submits>]; …` (S/tools/callstats.py takes two such lines apart and gives them a frame).
++
++use std::cell::Cell;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, MutexGuard, OnceLock};
++use std::time::{Duration, Instant};
++
++macro_rules! kinds {
++    ($($id:ident = $name:literal),* $(,)?) => {
++        /// What is counted.
++        #[allow(non_camel_case_types, clippy::upper_case_acronyms, dead_code)]
++        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++        #[repr(usize)]
++        pub(crate) enum C { $($id),* }
++        pub(crate) const NAMES: &[&str] = &[$($name),*];
++    };
++}
++
++kinds! {
++    // Win32 calls
++    GetWriteWatch = "GetWriteWatch",
++    VirtualProtect = "VirtualProtect",
++    VirtualQuery = "VirtualQuery",
++    ReadProcessMemory = "ReadProcessMemory",
++    ReadCommitted = "read_committed",
++    // D3D12 calls
++    Map = "Resource::Map",
++    Unmap = "Resource::Unmap",
++    TitleFenceSignal = "title Fence::Signal",
++    TitleFenceSetEvent = "title Fence::SetEventOnCompletion",
++    TitleFenceCompleted = "title Fence::GetCompletedValue",
++    FenceCompleted = "XCL fence_completed",
++    FenceSetEvent = "XCL Fence::SetEventOnCompletion",
++    EventWait = "XCL WaitForSingleObject (fence event)",
++    QueueSignal = "XCL Queue::Signal",
++    QueueWait = "XCL Queue::Wait",
++    UpdateTileMappings = "UpdateTileMappings",
++    CopyTiles = "CopyTiles",
++    RecCopyBuffer = "XCL CopyBufferRegion recorded",
++    RecCopyTexture = "XCL CopyTextureRegion recorded",
++    OwnExecute = "ECL of XCL's own lists (hook)",
++    TitleExecute = "ECL of the title (hook)",
++    DriverExecute = "ECL driver call (title)",
++    // locks
++    LockState = "lock sparse STATE",
++    LockTextures = "lock TEXTURES",
++    LockRefresh = "lock REFRESH",
++    // parts of the submit hook
++    MapLists = "hook: pc_list / record_deferred / push_segments",
++    ReviveListed = "hook: revive_listed",
++    Refresh = "hook: refresh_for",
++    NoteQueueForLists = "hook: note_queue_for_lists",
++    GpuProfileNoteQueue = "hook: gpu_profile::note_queue",
++    ExecuteWithWaits = "hook: execute_with_waits_on (all)",
++    WaitAllOn = "hook: wait_all_on",
++    NoteResubmits = "hook: alloc_pool::note_resubmits",
++    CopyScratchSubmitted = "after: copy_scratch_submitted",
++    AllocPoolExecuted = "after: alloc_pool::executed",
++    SignalWrite64Fences = "after: signal_write64_fences",
++    ReadbackSparseWrites = "after: readback_sparse_writes",
++    CpuWritesAfter = "after: cpu_writes_after",
++    RemovedProbe = "hook: removed_probe (all)",
++    Submitted = "hook: title_textures::submitted",
++    PresentNoteExecute = "hook: present::note_execute",
++    // parts of the refresh
++    LookJoin = "refresh: look_join covered / submit_done",
++    RecheckViewSources = "refresh: recheck_gpu_view_sources",
++    WatchRanges = "refresh: cached_watch_ranges",
++    Look = "refresh: look (write watch)",
++    SortDirty = "refresh: sort / dedup the written pages",
++    ViewHeaps = "refresh: look_at_view_heaps",
++    SparseBeforeExecute = "refresh: sparse::before_execute",
++    VramBeforeExecute = "refresh: vram::before_execute",
++    RecheckStreamed = "refresh: recheck_streamed_unwatched",
++    Filter = "refresh: texture filter",
++    Revive = "refresh: vram::revive",
++    SeedRecheck = "refresh: seed_stream_recheck",
++    UploadAll = "refresh: upload_all",
++}
++
++pub(crate) const N: usize = NAMES.len();
++
++/// `cs!(Kind, expr)`: `expr`, timed as `C::Kind` (nothing but `expr` when off).
++macro_rules! cs {
++    ($k:ident, $e:expr) => {{
++        let _cs = $crate::hle::d3d12x::call_stats::time($crate::hle::d3d12x::call_stats::C::$k);
++        $e
++    }};
++}
++pub(crate) use cs;
++
++
++/// [calls, ns] of every kind: all threads, and inside a title submit
++static ALL: [[AtomicU64; 2]; N] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; N];
++static IN_SUBMIT: [[AtomicU64; 2]; N] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; N];
++
++thread_local! {
++    /// the current thread is inside a title ExecuteCommandLists
++    static SUBMIT: Cell<bool> = const { Cell::new(false) };
++}
++
++#[cfg(test)]
++thread_local! {
++    static TEST_ON: Cell<bool> = const { Cell::new(false) };
++}
++
++/// `1` or `1,<seconds>`: the log's period (5 s); anything else: off.
++pub(crate) fn parse(v: &str) -> Option<u64> {
++    let mut f = v.trim().split(',');
++    if f.next()?.trim() != "1" {
++        return None;
++    }
++    match f.next() {
++        None => Some(5),
++        Some(s) => s.trim().parse::<u64>().ok().filter(|&s| s >= 1 && f.next().is_none()),
++    }
++}
++
++fn period() -> Option<u64> {
++    static P: OnceLock<Option<u64>> = OnceLock::new();
++    *P.get_or_init(|| {
++        let p = std::env::var("XCL_CALL_STATS").ok().and_then(|v| parse(&v));
++        #[cfg(not(test))]
++        if let Some(s) = p {
++            let _ = std::thread::Builder::new().name("xcl-call-stats".into()).spawn(move || loop {
++                std::thread::sleep(Duration::from_secs(s));
++                crate::xlog_info!("{}", line(crate::log::uptime(), super::present::activity().0, &snapshot()));
++            });
++            crate::xlog_info!("call stats: Win32 / D3D12 calls and parts of the submit counted, totals in the log every {s} s (XCL_CALL_STATS)");
++        }
++        p
++    })
++}
++
++#[inline]
++pub(crate) fn on() -> bool {
++    #[cfg(test)]
++    if TEST_ON.with(|c| c.get()) {
++        return true;
++    }
++    period().is_some()
++}
++
++pub(crate) fn add(c: C, d: Duration) {
++    let ns = d.as_nanos() as u64;
++    let i = c as usize;
++    ALL[i][0].fetch_add(1, Ordering::Relaxed);
++    ALL[i][1].fetch_add(ns, Ordering::Relaxed);
++    if SUBMIT.with(|s| s.get()) {
++        IN_SUBMIT[i][0].fetch_add(1, Ordering::Relaxed);
++        IN_SUBMIT[i][1].fetch_add(ns, Ordering::Relaxed);
++    }
++}
++
++/// Times its kind until dropped (nothing when off).
++pub(crate) struct Timer(Option<(C, Instant)>);
++
++impl Drop for Timer {
++    fn drop(&mut self) {
++        if let Some((c, t)) = self.0 {
++            add(c, t.elapsed());
++        }
++    }
++}
++
++#[inline]
++pub(crate) fn time(c: C) -> Timer {
++    Timer(on().then(|| (c, Instant::now())))
++}
++
++/// `f`, timed as `c`.
++#[inline]
++#[allow(dead_code)]
++pub(crate) fn timed<R>(c: C, f: impl FnOnce() -> R) -> R {
++    let _t = time(c);
++    f()
++}
++
++/// `m` locked; the wait counted as `c` (a lock got at once: a call, no time).
++pub(crate) fn lock<'a, T>(m: &'a Mutex<T>, c: C) -> MutexGuard<'a, T> {
++    if !on() {
++        return m.lock().unwrap();
++    }
++    match m.try_lock() {
++        Ok(g) => {
++            add(c, Duration::ZERO);
++            g
++        }
++        Err(std::sync::TryLockError::WouldBlock) => {
++            let t = Instant::now();
++            let g = m.lock().unwrap();
++            add(c, t.elapsed());
++            g
++        }
++        Err(std::sync::TryLockError::Poisoned(e)) => panic!("{e}"),
++    }
++}
++
++/// While alive, the current thread is inside a title ExecuteCommandLists (the "in submits" bank).
++pub(crate) struct InSubmit(bool);
++
++impl Drop for InSubmit {
++    fn drop(&mut self) {
++        let was = self.0;
++        SUBMIT.with(|s| s.set(was));
++    }
++}
++
++pub(crate) fn in_submit() -> InSubmit {
++    InSubmit(SUBMIT.with(|s| s.replace(true)))
++}
++
++/// [all calls, all ns, in-submit calls, in-submit ns] of every kind.
++pub(crate) fn snapshot() -> Vec<[u64; 4]> {
++    (0..N)
++        .map(|i| [ALL[i][0].load(Ordering::Relaxed), ALL[i][1].load(Ordering::Relaxed), IN_SUBMIT[i][0].load(Ordering::Relaxed), IN_SUBMIT[i][1].load(Ordering::Relaxed)])
++        .collect()
++}
++
++/// The log line of a snapshot (kinds never counted left out).
++pub(crate) fn line(uptime: f64, presents: u64, s: &[[u64; 4]]) -> String {
++    let parts: Vec<String> = s
++        .iter()
++        .enumerate()
++        .filter(|(_, v)| v[0] > 0)
++        .map(|(i, v)| format!("{} {} {} [{} {}]", NAMES[i], v[0], v[1] / 1000, v[2], v[3] / 1000))
++        .collect();
++    format!("call stats at {uptime:.1} s, {presents} presents: {}", parts.join("; "))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn delta(a: &[[u64; 4]], b: &[[u64; 4]], c: C) -> [u64; 4] {
++        let i = c as usize;
++        std::array::from_fn(|k| b[i][k] - a[i][k])
++    }
++
++    #[test]
++    fn the_switch_is_one_with_a_period() {
++        assert_eq!(parse("1"), Some(5));
++        assert_eq!(parse(" 1 , 10 "), Some(10));
++        assert_eq!(parse("0"), None);
++        assert_eq!(parse("1,0"), None);
++        assert_eq!(parse("1,x"), None);
++        assert_eq!(parse("1,5,6"), None);
++        assert_eq!(parse(""), None);
++        assert_eq!(NAMES.len(), C::UploadAll as usize + 1, "one name a kind");
++    }
++
++    #[test]
++    fn timers_locks_and_the_submit_bank_add_up() {
++        // off (this thread): nothing is counted
++        let s0 = snapshot();
++        timed(C::Look, || std::thread::sleep(Duration::from_millis(2)));
++        assert_eq!(delta(&s0, &snapshot(), C::Look), [0; 4]);
++        TEST_ON.with(|c| c.set(true));
++        let s0 = snapshot();
++        timed(C::Look, || std::thread::sleep(Duration::from_millis(10)));
++        {
++            let _s = in_submit();
++            let _t = time(C::Look);
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        // the bank ends with the guard
++        timed(C::Look, || ());
++        let d = delta(&s0, &snapshot(), C::Look);
++        assert_eq!((d[0], d[2]), (3, 1));
++        assert!(d[1] >= 15_000_000 && d[3] >= 5_000_000 && d[3] < d[1], "{d:?}");
++        // a lock got at once: a call and no time; one held by another thread: the wait
++        let m = std::sync::Arc::new(Mutex::new(0u32));
++        drop(lock(&m, C::LockTextures));
++        let m2 = m.clone();
++        let (tx, rx) = std::sync::mpsc::channel();
++        let h = std::thread::spawn(move || {
++            let _g = m2.lock().unwrap();
++            tx.send(()).unwrap();
++            std::thread::sleep(Duration::from_millis(30));
++        });
++        rx.recv().unwrap();
++        *lock(&m, C::LockTextures) += 1;
++        h.join().unwrap();
++        let d = delta(&s0, &snapshot(), C::LockTextures);
++        assert_eq!(d[0], 2);
++        assert!(d[1] >= 20_000_000, "the wait was timed: {d:?}");
++        TEST_ON.with(|c| c.set(false));
++        let l = line(12.34, 7, &snapshot());
++        assert!(l.starts_with("call stats at 12.3 s, 7 presents: "), "{l}");
++        assert!(l.contains("refresh: look (write watch) "), "{l}");
++        assert!(!l.contains("CopyTiles"), "kinds never counted are left out: {l}");
++    }
++}
+diff --git a/crates/xcl/src/hle/d3d12x/cpu_writes.rs b/crates/xcl/src/hle/d3d12x/cpu_writes.rs
+index 52f9b653..b9cc8a6e 100644
+--- a/crates/xcl/src/hle/d3d12x/cpu_writes.rs
++++ b/crates/xcl/src/hle/d3d12x/cpu_writes.rs
+@@ -60,8 +60,8 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
+         let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
+             let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+             for job in rx {
+-                if super::real::fence_completed(&job.fence) < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
+-                    th::WaitForSingleObject(event, WAIT_MS);
++                if super::real::fence_completed(&job.fence) < job.value && super::call_stats::cs!(FenceSetEvent, job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void))).is_ok() {
++                    super::call_stats::cs!(EventWait, th::WaitForSingleObject(event, WAIT_MS));
+                     if super::real::fence_completed(&job.fence) < job.value {
+                         static LATE: AtomicU64 = AtomicU64::new(0);
+                         let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+@@ -95,7 +95,7 @@ unsafe fn write_now(va: usize, words: &[u32]) {
+         let _trap = super::watch_trap::guard(va, bytes);
+         use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-        if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
++        if super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 || m.State != MEM_COMMIT {
+             return;
+         }
+         if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + bytes {
+@@ -119,7 +119,7 @@ unsafe fn u64_writable_now(va: usize) -> bool {
+     let _trap = super::watch_trap::guard(va, 8);
+     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
++    if super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 || m.State != MEM_COMMIT {
+         return false;
+     }
+     m.Protect & PAGE_GUARD == 0
+@@ -152,7 +152,7 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
+     let _trap = super::watch_trap::guard(va, bytes);
+     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+-    let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
++    let found = unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) } != 0;
+     found
+         && m.State == MEM_COMMIT
+         && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+@@ -181,7 +181,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
+             }
+         };
+         entry.value += 1;
+-        if q.Signal(&entry.fence, entry.value).is_err() {
++        if super::call_stats::cs!(QueueSignal, q.Signal(&entry.fence, entry.value)).is_err() {
+             return;
+         }
+         Job { fence: entry.fence.clone(), value: entry.value, writes }
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index 1e8a64e8..7b0d13b9 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -1941,7 +1941,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
+         match action {
+             SignalAction::Skip => {}
+             SignalAction::GpuSignal => {
+-                if let Err(e) = q.Signal(&fence, val) {
++                if let Err(e) = super::call_stats::cs!(QueueSignal, q.Signal(&fence, val)) {
+                     crate::xlog_warn!("D3D12.X: Write64 fence Signal({va:#x}, {val:#x}) failed ({e}) – signalling on CPU");
+                     let _ = fence.Signal(val);
+                 }
+@@ -2145,7 +2145,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
+         )
+     });
+ 
+-    if let Err(e) = q.Wait(&fence, w.value) {
++    if let Err(e) = super::call_stats::cs!(QueueWait, q.Wait(&fence, w.value)) {
+         let mut g = SYNC_GRAPH.lock().unwrap();
+         if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&w.va)) {
+             if let Some(pos) = cell.armed_waits.iter().rposition(|aw| aw.val == w.value && aw.waiting_queue == q_raw && aw.wait_seq == wait_seq) {
+@@ -2199,6 +2199,7 @@ unsafe fn wait_or_bridge(queue: *mut c_void, w: &PendingWait, list_writes: &[(u6
+ }
+ 
+ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
++    let _cs = super::call_stats::time(super::call_stats::C::WaitAllOn);
+     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
+     let timeout = wait_timeout();
+@@ -2522,7 +2523,7 @@ pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_
+         }
+         let (fence, value) = cache.fences.get_mut(&key)?;
+         let next = *value + 1;
+-        q.Signal(&*fence, next).ok()?;
++        super::call_stats::cs!(QueueSignal, q.Signal(&*fence, next)).ok()?;
+         *value = next;
+         Some((fence.clone(), next))
+     })();
+@@ -2623,11 +2624,11 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
+     .ok()?;
+     let b = b?;
+     let mut p: *mut c_void = std::ptr::null_mut();
+-    b.Map(0, None, Some(&mut p)).ok()?;
++    super::call_stats::cs!(Map, b.Map(0, None, Some(&mut p))).ok()?;
+     for chunk in std::slice::from_raw_parts_mut(p as *mut u8, len as usize).chunks_exact_mut(16) {
+         chunk.copy_from_slice(&pat);
+     }
+-    b.Unmap(0, None);
++    super::call_stats::cs!(Unmap, b.Unmap(0, None));
+     let raw = b.as_raw() as usize;
+     cache.push((pat, b, len));
+     Some(raw)
+@@ -2764,7 +2765,7 @@ unsafe fn ensure_timestamp_readback(dev: &ID3D12Device, pool: &mut TimestampPool
+     dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).ok()?;
+     let rb = rb?;
+     let mut ptr: *mut c_void = std::ptr::null_mut();
+-    rb.Map(0, None, Some(&mut ptr)).ok()?;
++    super::call_stats::cs!(Map, rb.Map(0, None, Some(&mut ptr))).ok()?;
+     if ptr.is_null() {
+         return None;
+     }
+@@ -4333,7 +4334,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void,
+                     let data = (title != 0 && crate::gpu::shader::readable(title as usize, n)).then(|| std::slice::from_raw_parts(title as *const u8, n).iter().filter(|&&b| b != 0).count());
+                     let win = crate::gpu::uma::get().and_then(|u| u.window_of(title as usize).map(|w| (w, u.window(w), u.is_sparse(title as usize))));
+                     let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-                    let q = crate::hle::kernelx::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
++                    let q = super::call_stats::cs!(VirtualQuery, crate::hle::kernelx::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)));
+                     crate::xlog_info!(
+                         "frame trace: vertex buffer #{i} slot {}: title {title:#x} → PC {:#x}, {} bytes, stride {}; non-zero in the first {n} bytes (CPU view): {data:?}; window (index, (base, size), sparse) {win:x?}; memory state {:#x} protect {:#x} (query {q})",
+                         start + k as u32,
+diff --git a/crates/xcl/src/hle/d3d12x/mod.rs b/crates/xcl/src/hle/d3d12x/mod.rs
+index ef8c7681..2de641b9 100644
+--- a/crates/xcl/src/hle/d3d12x/mod.rs
++++ b/crates/xcl/src/hle/d3d12x/mod.rs
+@@ -10,6 +10,7 @@
+ #![allow(non_snake_case)]
+ 
+ mod alloc_pool;
++pub(crate) mod call_stats;
+ mod clamp_runs;
+ pub mod bind;
+ pub mod console_heap;
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 3919e1d8..0794c02e 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -1566,7 +1566,7 @@ pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[
+             // (whether the title has CPU pages at its address: then it may write the buffer there,
+             // and nothing carries those writes to the sparse windows yet)
+             let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-            windows_sys::Win32::System::Memory::VirtualQuery(va as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
++            super::call_stats::cs!(VirtualQuery, windows_sys::Win32::System::Memory::VirtualQuery(va as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)));
+             let committed = mbi.State == 0x1000;
+             static COMMITTED: AtomicU64 = AtomicU64::new(0);
+             let c = COMMITTED.fetch_add(committed as u64, Ordering::Relaxed) + committed as u64;
+@@ -8406,6 +8406,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
+ /// with every submitting thread behind it.
+ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+     const PC_GET_COMPLETED_VALUE: usize = 8;
++    let _cs = super::call_stats::time(super::call_stats::C::FenceCompleted);
+     let p = fence.as_raw();
+     let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
+         std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
+@@ -8418,6 +8419,7 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+ /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
+ /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
+ unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
++    let _cs = super::call_stats::time(super::call_stats::C::TitleFenceCompleted);
+     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+     let v = f(this);
+     super::sparse::settle_readbacks_try();
+@@ -8454,6 +8456,7 @@ unsafe extern "system" fn fence_wait_fired(ctx: *mut c_void, _timed_out: bool) {
+ /// (a blocking wait) settles them after it.
+ unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+     use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE};
++    let _cs = super::call_stats::time(super::call_stats::C::TitleFenceSetEvent);
+     let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+     if event.is_null() || !super::sparse::readbacks_async() {
+         let hr = f(this, value, event);
+@@ -8487,6 +8490,7 @@ unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value
+ 
+ /// Fence::Signal (CPU)
+ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
++    let _cs = super::call_stats::time(super::call_stats::C::TitleFenceSignal);
+     let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+     let hr = f(this, value);
+     super::fence_x::note_cpu_signal(this as usize);
+@@ -8506,19 +8510,27 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
+     // (`pso_async::title_held`)
+     let _in_pc = super::pso_async::pc_call();
+     let submit_t0 = std::time::Instant::now();
++    // lab (`XCL_CALL_STATS`): the whole hook, the title's lists and XCL's own apart; the calls
++    // made inside a title's submit go to the "in submits" bank too
++    use super::call_stats::{cs, C as Cs};
++    let own = super::title_textures::is_own_work();
++    let _cs_whole = super::call_stats::time(if own { Cs::OwnExecute } else { Cs::TitleExecute });
++    let _cs_bank = (!own && super::call_stats::on()).then(super::call_stats::in_submit);
+     // console-shaped lists run as the PC lists they were translated into (split title lists expand
+     // into all of their recorded PC segments in exact chronological order)
+     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+-    for &l in std::slice::from_raw_parts(lists, n as usize) {
+-        if let Some(pc) = super::console_list::pc_list(l) {
+-            mapped.push(pc);
+-        } else {
+-            super::list_x::record_deferred(l);
+-            if !super::title_list::push_segments(l, &mut mapped) {
+-                mapped.push(l);
++    cs!(MapLists, {
++        for &l in std::slice::from_raw_parts(lists, n as usize) {
++            if let Some(pc) = super::console_list::pc_list(l) {
++                mapped.push(pc);
++            } else {
++                super::list_x::record_deferred(l);
++                if !super::title_list::push_segments(l, &mut mapped) {
++                    mapped.push(l);
++                }
+             }
+         }
+-    }
++    });
+     removed_probe("execute: start");
+     // page budget: evicted textures these lists transition are mapped again, uploaded below.
+     // Not for XCL's own lists: the zeroing of target pages submits under the pages lock, and a
+@@ -8526,35 +8538,37 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
+     // (lab run G1: the title stood still from 72 s, its watchdog ended it at 101 s; the stalls of
+     // F1 / F2 / T2 look the same, not checked). They are mapped again at the title's next submit.
+     if !super::title_textures::is_own_work() {
+-        super::title_textures::revive_listed(&mapped);
++        cs!(ReviveListed, super::title_textures::revive_listed(&mapped));
+     }
+     removed_probe("execute: after revive_listed");
+     // textures in title memory the CPU wrote since: uploaded again first
+-    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
++    cs!(Refresh, super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize)));
+     removed_probe("execute: after refresh");
+-    super::list_x::note_queue_for_lists(this as usize, &mapped);
+-    super::gpu_profile::note_queue(this);
++    cs!(NoteQueueForLists, super::list_x::note_queue_for_lists(this as usize, &mapped));
++    cs!(GpuProfileNoteQueue, super::gpu_profile::note_queue(this));
++    let cs_waits = super::call_stats::time(Cs::ExecuteWithWaits);
+     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
+         removed_probe("execute: before the PC call");
+-        let _ = super::alloc_pool::note_resubmits(this, chunk);
++        let _ = cs!(NoteResubmits, super::alloc_pool::note_resubmits(this, chunk));
+         let t = std::time::Instant::now();
+-        f(this, chunk.len() as u32, chunk.as_ptr());
++        cs!(DriverExecute, f(this, chunk.len() as u32, chunk.as_ptr()));
+         let t1 = std::time::Instant::now();
+         super::submit_cost::driver(t1 - t);
+         removed_probe("execute: after the PC call");
+-        super::list_x::copy_scratch_submitted(this, chunk);
+-        super::alloc_pool::executed(this, chunk);
++        cs!(CopyScratchSubmitted, super::list_x::copy_scratch_submitted(this, chunk));
++        cs!(AllocPoolExecuted, super::alloc_pool::executed(this, chunk));
+         removed_probe("execute: after alloc_pool::executed");
+-        super::list_x::signal_write64_fences(this, chunk);
+-        super::list_x::readback_sparse_writes(this, chunk);
++        cs!(SignalWrite64Fences, super::list_x::signal_write64_fences(this, chunk));
++        cs!(ReadbackSparseWrites, super::list_x::readback_sparse_writes(this, chunk));
+         removed_probe("execute: after readback_sparse_writes");
+-        super::list_x::cpu_writes_after(this, chunk);
++        cs!(CpuWritesAfter, super::list_x::cpu_writes_after(this, chunk));
+         removed_probe("execute: after cpu_writes_after");
+         super::submit_cost::after(t1.elapsed());
+     });
++    drop(cs_waits);
+     // the next uploads into textures kept in step start from the states these lists leave
+-    super::title_textures::submitted(&mapped);
+-    super::present::note_execute(this, &mapped);
++    cs!(Submitted, super::title_textures::submitted(&mapped));
++    cs!(PresentNoteExecute, super::present::note_execute(this, &mapped));
+     removed_probe("execute: end");
+     stop_if_device_removed();
+     super::submit_cost::done(submit_t0);
+@@ -8716,6 +8730,7 @@ pub fn removed_probe(site: &'static str) {
+     if !*ON.get_or_init(|| std::env::var("XCL_REMOVED_PROBE").is_ok_and(|v| v.trim() == "1")) {
+         return;
+     }
++    let _cs = super::call_stats::time(super::call_stats::C::RemovedProbe);
+     let raw = device_raw();
+     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+     if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index f73a3911..2f601913 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -111,7 +111,7 @@ unsafe fn query_tile_holes(tile: usize) -> u16 {
+     while cur < end {
+         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+         // SAFETY: `VirtualQuery` inspects process virtual memory metadata without dereferencing `cur`.
+-        let n = VirtualQuery(cur as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
++        let n = super::call_stats::cs!(VirtualQuery, VirtualQuery(cur as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()));
+         if n == 0 || mbi.RegionSize == 0 {
+             break;
+         }
+@@ -510,8 +510,8 @@ unsafe fn wait_fence(fence: &ID3D12Fence, target: u64) -> bool {
+             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {at})");
+             return false;
+         }
+-        if !event.is_invalid() && fence.SetEventOnCompletion(target, event).is_ok() {
+-            WaitForSingleObject(event, left);
++        if !event.is_invalid() && super::call_stats::cs!(FenceSetEvent, fence.SetEventOnCompletion(target, event)).is_ok() {
++            super::call_stats::cs!(EventWait, WaitForSingleObject(event, left));
+         } else {
+             std::thread::sleep(std::time::Duration::from_millis(1));
+         }
+@@ -979,7 +979,7 @@ impl State {
+                 counts.push(run);
+                 i += run as usize;
+             }
+-            self.queue.UpdateTileMappings(
++            super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
+                 res,
+                 coords.len() as u32,
+                 Some(coords.as_ptr()),
+@@ -990,7 +990,7 @@ impl State {
+                 Some(offsets.as_ptr()),
+                 Some(counts.as_ptr()),
+                 D3D12_TILE_MAPPING_FLAG_NONE,
+-            );
++            ));
+         }
+         super::real::removed_probe("sparse: after map_tiles");
+     }
+@@ -1019,7 +1019,7 @@ impl State {
+             counts.push(run);
+             i += run as usize;
+         }
+-        self.queue.UpdateTileMappings(
++        super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
+             res,
+             coords.len() as u32,
+             Some(coords.as_ptr()),
+@@ -1030,7 +1030,7 @@ impl State {
+             None,
+             Some(counts.as_ptr()),
+             D3D12_TILE_MAPPING_FLAG_NONE,
+-        );
++        ));
+     }
+ 
+     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
+@@ -1091,7 +1091,7 @@ impl State {
+     #[inline]
+     unsafe fn signal(&mut self) {
+         self.value += 1;
+-        let _ = self.queue.Signal(&self.fence, self.value);
++        let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
+     }
+ 
+     #[inline]
+@@ -1105,9 +1105,9 @@ impl State {
+         // Reset of an allocator the GPU was still in). So: until the fence says so, or 5 s.
+         let t0 = std::time::Instant::now();
+         loop {
+-            let _ = self.fence.SetEventOnCompletion(target, self.event);
++            let _ = super::call_stats::cs!(FenceSetEvent, self.fence.SetEventOnCompletion(target, self.event));
+             let left = 5000u64.saturating_sub(t0.elapsed().as_millis() as u64).max(1) as u32;
+-            windows::Win32::System::Threading::WaitForSingleObject(self.event, left);
++            super::call_stats::cs!(EventWait, windows::Win32::System::Threading::WaitForSingleObject(self.event, left));
+             if super::real::fence_completed(&self.fence) >= target {
+                 return;
+             }
+@@ -1226,7 +1226,7 @@ impl State {
+                 .ok()?;
+             let r = r?;
+             let mut p = std::ptr::null_mut();
+-            r.Map(0, None, Some(&mut p)).ok()?;
++            super::call_stats::cs!(Map, r.Map(0, None, Some(&mut p))).ok()?;
+             self.staging = Some((r, p as *mut u8));
+         }
+         self.staging.as_ref().map(|&(_, p)| p)
+@@ -1253,11 +1253,11 @@ impl State {
+             }
+             let Some(r) = r else { return false };
+             let mut p = std::ptr::null_mut();
+-            if r.Map(0, None, Some(&mut p)).is_err() {
++            if super::call_stats::cs!(Map, r.Map(0, None, Some(&mut p))).is_err() {
+                 return false;
+             }
+             std::ptr::write_bytes(p as *mut u8, 0, ZERO_BUF);
+-            r.Unmap(0, None);
++            super::call_stats::cs!(Unmap, r.Unmap(0, None));
+             self.zero_buf = Some(r);
+         }
+         true
+@@ -1280,7 +1280,7 @@ impl State {
+                 .ok()?;
+             let r = r?;
+             let mut p = std::ptr::null_mut();
+-            r.Map(0, None, Some(&mut p)).ok()?;
++            super::call_stats::cs!(Map, r.Map(0, None, Some(&mut p))).ok()?;
+             self.readback = Some((r, p as *mut u8));
+         }
+         self.readback.clone()
+@@ -1385,7 +1385,7 @@ impl State {
+                 let _ = self.rb_list.Reset(&self.rb_alloc, None);
+                 crate::hle::d3d12x::gpu_profile::own_list_begin(self.rb_list.as_raw());
+             }
+-            self.rb_list.CopyBufferRegion(rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
++            super::call_stats::cs!(RecCopyBuffer, self.rb_list.CopyBufferRegion(rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64));
+             parts.push((cur, used, chunk));
+             used += chunk;
+             cur += chunk;
+@@ -1423,7 +1423,7 @@ impl State {
+             .ok()?;
+         let buf = r?;
+         let mut p: *mut c_void = std::ptr::null_mut();
+-        buf.Map(0, None, Some(&mut p)).ok()?;
++        super::call_stats::cs!(Map, buf.Map(0, None, Some(&mut p))).ok()?;
+         Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new(), fences: None })
+     }
+ 
+@@ -1533,7 +1533,7 @@ impl State {
+             let mut off = 0usize;
+             for (wi, cur, chunk) in batch {
+                 let (base, res) = (self.windows[wi].0, self.windows[wi].1.clone());
+-                job.list.CopyBufferRegion(&job.buf, off as u64, &res, (cur - base) as u64, chunk as u64);
++                super::call_stats::cs!(RecCopyBuffer, job.list.CopyBufferRegion(&job.buf, off as u64, &res, (cur - base) as u64, chunk as u64));
+                 job.copies.push((cur, off, chunk));
+                 off += chunk;
+             }
+@@ -1553,7 +1553,7 @@ impl State {
+                     self.rbq_value
+                 }
+             };
+-            let _ = q.Signal(&done, done_v);
++            let _ = super::call_stats::cs!(QueueSignal, q.Signal(&done, done_v));
+             job.rb_v = rb_v;
+             job.done_v = done_v;
+             job.fences = title.clone().map(|t| (t, done.clone()));
+@@ -1590,7 +1590,7 @@ impl State {
+                 let b = self.windows[wi].0;
+                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+                 let chunk = (n - done).min(ZERO_BUF).min(to_win_end);
+-                list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64);
++                super::call_stats::cs!(RecCopyBuffer, list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64));
+                 done += chunk;
+             }
+         }
+@@ -1652,7 +1652,7 @@ impl State {
+                 let dst_off = (aligned as usize) % STAGING;
+                 jobs.push((cur, dst_off, chunk));
+                 let staging_res = &self.staging.as_ref().unwrap().0;
+-                self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
++                super::call_stats::cs!(RecCopyBuffer, self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64));
+                 self.ring_write = aligned + chunk as u64;
+                 done += chunk;
+             }
+@@ -1869,8 +1869,8 @@ impl State {
+             // this queue's own fence and copy queue (`rb_queues`)
+             let key = queue.as_raw() as usize;
+             if let Some((q, title, v)) = s.rb_queue_for(key) {
+-                if queue.Signal(&title, v).is_ok() {
+-                    let _ = q.Wait(&title, v);
++                if super::call_stats::cs!(QueueSignal, queue.Signal(&title, v)).is_ok() {
++                    let _ = super::call_stats::cs!(QueueWait, q.Wait(&title, v));
+                 }
+                 s.readback_async(&merged, Some(key), v);
+                 start_readback_thread();
+@@ -1879,17 +1879,17 @@ impl State {
+         }
+         s.rb_value += 1;
+         let v = s.rb_value;
+-        let signalled = queue.Signal(&s.rb_fence, v).is_ok();
++        let signalled = super::call_stats::cs!(QueueSignal, queue.Signal(&s.rb_fence, v)).is_ok();
+         if let Some((q, _)) = s.rbq.clone() {
+             if signalled {
+-                let _ = q.Wait(&s.rb_fence, v);
++                let _ = super::call_stats::cs!(QueueWait, q.Wait(&s.rb_fence, v));
+             }
+             s.readback_async(&merged, None, v);
+             start_readback_thread();
+             return Vec::new();
+         }
+         if signalled {
+-            let _ = s.queue.Wait(&s.rb_fence, v);
++            let _ = super::call_stats::cs!(QueueWait, s.queue.Wait(&s.rb_fence, v));
+             super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
+         }
+         merged
+@@ -2103,7 +2103,7 @@ impl State {
+         if ok {
+             for (q, fence, val) in self.queue_fences.values_mut() {
+                 let next = *val + 1;
+-                if q.Signal(&*fence, next).is_ok() {
++                if super::call_stats::cs!(QueueSignal, q.Signal(&*fence, next)).is_ok() {
+                     *val = next;
+                     marks.push((fence.clone(), next));
+                 } else {
+@@ -2422,7 +2422,7 @@ unsafe fn before_execute_inner(queue: &ID3D12CommandQueue, dirty: &[usize], page
+     s.scratch_runs = dirty_runs;
+     let q = queue.as_raw() as usize;
+     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
+-        let _ = queue.Wait(&s.fence, s.value);
++        let _ = super::call_stats::cs!(QueueWait, queue.Wait(&s.fence, s.value));
+         super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
+         s.waited.insert(q, s.value);
+     }
+@@ -2552,7 +2552,7 @@ static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+ 
+ /// `STATE`, with the buffers released while it was held let go first.
+ fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
+-    let mut g = STATE.lock().unwrap();
++    let mut g = super::call_stats::lock(&STATE, super::call_stats::C::LockState);
+     forget_released(&mut g);
+     g
+ }
+diff --git a/crates/xcl/src/hle/d3d12x/title_textures.rs b/crates/xcl/src/hle/d3d12x/title_textures.rs
+index 787f1b5f..d7c04cd2 100644
+--- a/crates/xcl/src/hle/d3d12x/title_textures.rs
++++ b/crates/xcl/src/hle/d3d12x/title_textures.rs
+@@ -379,7 +379,7 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
+ 
+ /// Number of textures kept in title memory and uploads done so far.
+ pub fn counts() -> (usize, u64) {
+-    (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
++    (super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.len(), UPLOADS.load(Ordering::Relaxed))
+ }
+ 
+ /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
+@@ -454,7 +454,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize,
+         seq: 0,
+     };
+     let to_unmap = {
+-        let mut t = TEXTURES.lock().unwrap();
++        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         let (delta, unmap_ptrs) = t.insert(res as usize, e);
+         adjust_pending(delta);
+         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+@@ -479,7 +479,7 @@ fn mirror_source(va: usize) -> usize {
+     }
+     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+-    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
++    let mapped = unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) } != 0 && m.State == MEM_COMMIT;
+     if mapped { va } else { src }
+ }
+ 
+@@ -530,7 +530,7 @@ fn recheck_gpu_view_sources() {
+     }
+     let mut changed = false;
+     // (the shadowed textures too: one comes back when the texture over it goes)
+-    let mut g = TEXTURES.lock().unwrap();
++    let mut g = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+     let t = &mut *g;
+     if all {
+         for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
+@@ -591,7 +591,7 @@ pub fn note_gpu_write(res: usize) {
+     }
+     let mut marked = false;
+     {
+-        let mut t = TEXTURES.lock().unwrap();
++        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         if let Some(e) = t.get_mut(res) {
+             if !e.gpu_written {
+                 e.gpu_written = true;
+@@ -619,7 +619,7 @@ static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+ 
+ /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
+ pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
+-    TEXTURES.lock().unwrap().overlapping(va, len)
++    super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).overlapping(va, len)
+ }
+ 
+ /// A GPU-owned placement (render target / depth / UAV) now occupies `[va, va + len)`: retire
+@@ -635,7 +635,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
+         .filter(|&g| g != va && mirror_source(g) == va)
+         .collect();
+     let (retired, to_unmap) = {
+-        let mut t = TEXTURES.lock().unwrap();
++        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         let (mut delta, mut retired, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
+         if src != va {
+             let (d2, r2, u2) = t.retire_range(src, src.saturating_add(len));
+@@ -666,7 +666,7 @@ pub fn forget(res: usize) {
+     LAST_CONTENT.lock().unwrap().remove(&res);
+     STREAM_RECHECK.lock().unwrap().remove(&res);
+     let (removed, to_remap) = {
+-        let mut t = TEXTURES.lock().unwrap();
++        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         let (removed, delta, remap_ptrs) = t.remove(res);
+         adjust_pending(delta);
+         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+@@ -676,7 +676,7 @@ pub fn forget(res: usize) {
+         unsafe {
+             super::vram::remap_if_unmapped(r);
+             // (lazy levels: one the GPU wrote is not uploaded again, so all of it has pages)
+-            if super::vram::level_pages() && TEXTURES.lock().unwrap().by_res.get(&(r.as_raw() as usize)).is_some_and(|e| e.gpu_written) {
++            if super::vram::level_pages() && super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.get(&(r.as_raw() as usize)).is_some_and(|e| e.gpu_written) {
+                 super::vram::map_levels(r, None);
+             }
+         }
+@@ -688,7 +688,7 @@ pub fn forget(res: usize) {
+ 
+ /// The title-memory address of a texture kept in step with it.
+ pub fn address(res: usize) -> Option<usize> {
+-    let t = TEXTURES.lock().unwrap();
++    let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+     t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.va)
+ }
+ 
+@@ -696,7 +696,7 @@ pub fn address(res: usize) -> Option<usize> {
+ /// read from – 0: an unmapped page, not uploaded yet, written by the title's GPU work, its
+ /// tiles unmapped, shadowed by a newer texture at its range).
+ pub fn probe_state(res: usize) -> Option<(usize, usize, bool, bool, bool, bool)> {
+-    let t = TEXTURES.lock().unwrap();
++    let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+     let (e, shadowed) = match t.by_res.get(&res) {
+         Some(e) => (e, false),
+         None => (t.shadowed.get(&res)?, true),
+@@ -717,7 +717,7 @@ pub fn under_sources(runs: &[(usize, usize)]) -> (usize, usize, usize) {
+     let mut spans: Vec<(usize, usize)> = Vec::new();
+     let mut n = 0;
+     {
+-        let t = TEXTURES.lock().unwrap();
++        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         for (&(va, res), &end) in t.by_va.iter() {
+             let Some(e) = t.by_res.get(&res) else { continue };
+             if e.gpu_written {
+@@ -765,7 +765,7 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
+         return;
+     }
+     let kept: Vec<Transition> = {
+-        let t = TEXTURES.lock().unwrap();
++        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         transitions.iter().filter(|(r, _, _)| t.by_res.contains_key(r) || t.shadowed.contains_key(r)).copied().collect()
+     };
+     if !kept.is_empty() {
+@@ -817,7 +817,7 @@ pub fn submitted(lists: &[*mut c_void]) {
+     }
+     // page budget: a texture the title uses is recent
+     super::vram::touch(notes.iter().map(|&(res, _, _)| res));
+-    let mut t = TEXTURES.lock().unwrap();
++    let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+     for (res, sub, after) in notes {
+         if let Some(e) = t.get_mut(res) {
+             let n = subresource_count(&e.tex);
+@@ -975,7 +975,7 @@ fn revive_named(named: Vec<usize>) {
+     // a reference each while they are mapped (taken under the lock `forget` takes), and where
+     // its bytes are read from
+     let live: Vec<(ID3D12Resource, Source, usize)> = {
+-        let t = TEXTURES.lock().unwrap();
++        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         named
+             .iter()
+             .filter_map(|&res| {
+@@ -1001,7 +1001,7 @@ fn revive_named(named: Vec<usize>) {
+     for &res in &revived {
+         forget_content(res);
+     }
+-    let mut t = TEXTURES.lock().unwrap();
++    let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+     for res in revived {
+         if let Some(e) = t.get_mut(res) {
+             if !e.pending && !e.gpu_written {
+@@ -1065,7 +1065,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
+     // write-watched regions) only when the set of textures, tiles, or reservations changed.
+     let mut regions = u.watch_regions();
+     regions.extend(crate::hle::kernelx::graphics_reservations());
+-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
++    let mut wanted: Vec<(usize, usize)> = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
+     wanted.extend(super::sparse::mapped_ranges());
+     // lab: every page of a tiled shadow window is watched (a first write maps its tile)
+     wanted.extend(super::sparse::lazy_range());
+@@ -1102,15 +1102,15 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
+         return;
+     }
+     let t0 = std::time::Instant::now();
+-    let _refresh = REFRESH.lock().unwrap();
++    let _refresh = super::call_stats::lock(&REFRESH, super::call_stats::C::LockRefresh);
+     super::submit_cost::lock_wait(t0.elapsed());
+     // with the lock: the look before this one is done, and its uploads are submitted
+-    let covered = super::look_join::covered(lists);
++    let covered = super::call_stats::cs!(LookJoin, super::look_join::covered(lists));
+     let look = !(covered && super::look_join::joins());
+     let t1 = std::time::Instant::now();
+     let took = own_work(|| refresh_once(queue, look));
+     super::submit_cost::refresh(t1.elapsed());
+-    super::look_join::submit_done(covered, took);
++    super::call_stats::cs!(LookJoin, super::look_join::submit_done(covered, took));
+ }
+ 
+ /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
+@@ -1122,7 +1122,7 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
+     let mut at = base;
+     while at < end {
+         let mut n = buf.len();
+-        if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
++        if super::call_stats::cs!(GetWriteWatch, GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page)) != 0 {
+             break;
+         }
+         dirty.extend(buf[..n].iter().map(|&p| p as usize));
+@@ -1328,13 +1328,14 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
+     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
+         return None;
+     }
+-    recheck_gpu_view_sources();
++    super::call_stats::cs!(RecheckViewSources, recheck_gpu_view_sources());
+     let watch_t0 = std::time::Instant::now();
+     let mut page = 0x1000u32;
+     if look {
+         super::look_join::look_begins();
+     }
+-    let ranges = cached_watch_ranges(u);
++    let ranges = super::call_stats::cs!(WatchRanges, cached_watch_ranges(u));
++    let cs_look = super::call_stats::time(super::call_stats::C::Look);
+     let dirty_len = DIRTY_BUF.with(|dcell| {
+         let mut dirty = dcell.borrow_mut();
+         dirty.clear();
+@@ -1356,6 +1357,8 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
+                 }
+             }
+         });
++        drop(cs_look);
++        let _cs = super::call_stats::time(super::call_stats::C::SortDirty);
+         dirty.sort_unstable();
+         dirty.dedup();
+         dirty.len()
+@@ -1370,7 +1373,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
+         // data reach the address at all, and is the texture still kept in step?)
+         static LOOKS: AtomicU64 = AtomicU64::new(0);
+         if LOOKS.fetch_add(1, Ordering::Relaxed) % 600 == 599 {
+-            let t = TEXTURES.lock().unwrap();
++            let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+             // 16 samples of 4 KiB over the whole texture (GFX10 keeps the small levels first,
+             // level 0 last)
+             let content = |e: &Entry| -> usize {
+@@ -1392,29 +1395,30 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
+     }
+     // page budget: textures in use by their T#; evicted ones are mapped again (before the
+     // queue waits for the mappings) and uploaded below
+-    look_at_view_heaps();
++    super::call_stats::cs!(ViewHeaps, look_at_view_heaps());
+     // the title's own memory: what the CPU wrote goes to its video memory first
+     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+         DIRTY_BUF.with(|dcell| {
+             let dirty = dcell.borrow();
+-            super::sparse::before_execute(q, &dirty, page as usize);
+-            super::vram::before_execute(q);
++            super::call_stats::cs!(SparseBeforeExecute, super::sparse::before_execute(q, &dirty, page as usize));
++            super::call_stats::cs!(VramBeforeExecute, super::vram::before_execute(q));
+         });
+     }
+     let recheck_frame = {
+         let (p, b) = super::present::counters();
+         p.max(b)
+     };
+-    recheck_streamed_unwatched(&ranges, recheck_frame);
++    super::call_stats::cs!(RecheckStreamed, recheck_streamed_unwatched(&ranges, recheck_frame));
+     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+         return took;
+     }
+     // textures made since the last submit and those with a written page; a reference each
+     // while they are uploaded
+     let t_filter = std::time::Instant::now();
++    let cs_filter = super::call_stats::time(super::call_stats::C::Filter);
+     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+         let dirty = dcell.borrow();
+-        let mut t = TEXTURES.lock().unwrap();
++        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         t.by_res
+             .iter_mut()
+             .filter(|(_, e)| {
+@@ -1445,7 +1449,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
+             if !super::vram::is_evicted(key) {
+                 return true;
+             }
+-            let back = super::vram::revive(r);
++            let back = super::call_stats::cs!(Revive, super::vram::revive(r));
+             if back {
+                 forget_content(key);
+             }
+@@ -1453,10 +1457,11 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
+         });
+     }
+     super::vram::touch(todo.iter().map(|(r, _)| r.as_raw() as usize));
+-    seed_stream_recheck(&todo, &ranges, recheck_frame);
++    super::call_stats::cs!(SeedRecheck, seed_stream_recheck(&todo, &ranges, recheck_frame));
++    drop(cs_filter);
+     super::submit_cost::filter(t_filter.elapsed());
+     let t_textures = std::time::Instant::now();
+-    upload_all(todo);
++    super::call_stats::cs!(UploadAll, upload_all(todo));
+     super::submit_cost::textures(t_textures.elapsed());
+     took
+ }
+@@ -1632,7 +1637,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64)
+     let mut check = Vec::with_capacity(due.len());
+     let mut prune = Vec::new();
+     {
+-        let t = TEXTURES.lock().unwrap();
++        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+         for (res, prev_fp) in due {
+             match t.by_res.get(&res) {
+                 Some(e) if e.gpu_written => prune.push(res),
+@@ -1688,7 +1693,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64)
+     if !changed.is_empty() {
+         let mut queued = 0u64;
+         {
+-            let mut t = TEXTURES.lock().unwrap();
++            let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+             for res in changed {
+                 if let Some(e) = t.by_res.get_mut(&res) {
+                     if !e.gpu_written && !e.pending {
+@@ -1852,7 +1857,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
+         }
+         g.push(res);
+     }
+-    let Some((device, va, src, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.va, e.src.clone(), Arc::clone(&e.tex), e.gpu_written)) else { return };
++    let Some((device, va, src, tex, gpu_written)) = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.get(&res).map(|e| (e.device, e.va, e.src.clone(), Arc::clone(&e.tex), e.gpu_written)) else { return };
+     let d = device as *mut c_void;
+     let r = res as *mut c_void;
+     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
+@@ -1896,18 +1901,18 @@ pub unsafe fn probe_gpu_content(res: usize) {
+         list.ResourceBarrier(&[barrier(srv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
++        super::call_stats::cs!(RecCopyTexture, list.CopyTextureRegion(&dst, 0, 0, 0, &src, None));
+         list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
+         list.Close().map_err(|e| e.to_string())?;
+         queue.ExecuteCommandLists(&[Some(list.cast().map_err(|e| e.to_string())?)]);
+         texture::wait(dev, &queue)?;
+         let mut p: *mut c_void = std::ptr::null_mut();
+-        rb.Map(0, None, Some(&mut p)).map_err(|e| e.to_string())?;
++        super::call_stats::cs!(Map, rb.Map(0, None, Some(&mut p))).map_err(|e| e.to_string())?;
+         let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+         for y in 0..rows as usize {
+             out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+         }
+-        rb.Unmap(0, None);
++        super::call_stats::cs!(Unmap, rb.Unmap(0, None));
+         Ok(out)
+     });
+     let cpu = subresources_of(&src, &tex).into_iter().next().map(|s| s.data).unwrap_or_default();
+@@ -1997,7 +2002,7 @@ pub(super) unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize)
+             return;
+         }
+         let mut read = 0usize;
+-        if ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read) != 0 {
++        if super::call_stats::cs!(ReadProcessMemory, ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read)) != 0 {
+             return;
+         }
+         let read = read.min(len);
+@@ -2027,6 +2032,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+ 
+ /// `read_committed` into `out` (zeroed).
+ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
++    let _cs = super::call_stats::time(super::call_stats::C::ReadCommitted);
+     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+     let len = out.len();
+     let Some(limit) = at.checked_add(len) else { return };
+@@ -2039,7 +2045,7 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
+     let mut p = at;
+     while p < limit {
+         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
++        if super::call_stats::cs!(VirtualQuery, VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 || m.RegionSize == 0 {
+             break;
+         }
+         let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
+diff --git a/crates/xcl/src/hle/d3d12x/vram.rs b/crates/xcl/src/hle/d3d12x/vram.rs
+index 9d9ef935..2baf663a 100644
+--- a/crates/xcl/src/hle/d3d12x/vram.rs
++++ b/crates/xcl/src/hle/d3d12x/vram.rs
+@@ -970,7 +970,7 @@ impl Pages {
+                 let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; offsets.len()];
+                 let coord = D3D12_TILED_RESOURCE_COORDINATE { X: at as u32, ..Default::default() };
+                 let region = D3D12_TILE_REGION_SIZE { NumTiles: n as u32, UseBox: false.into(), ..Default::default() };
+-                self.queue.UpdateTileMappings(
++                super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
+                     &sc.over,
+                     1,
+                     Some(&coord),
+@@ -981,13 +981,13 @@ impl Pages {
+                     Some(offsets.as_ptr()),
+                     Some(counts.as_ptr()),
+                     D3D12_TILE_MAPPING_FLAG_NONE,
+-                );
++                ));
+                 at += n;
+             }
+             if alloc.Reset().is_err() || list.Reset(alloc, None).is_err() {
+                 return;
+             }
+-            list.CopyBufferRegion(&sc.over, 0, &sc.zeros, 0, (chunk.len() * PAGE) as u64);
++            super::call_stats::cs!(RecCopyBuffer, list.CopyBufferRegion(&sc.over, 0, &sc.zeros, 0, (chunk.len() * PAGE) as u64));
+             if list.Close().is_err() {
+                 return;
+             }
+@@ -995,7 +995,7 @@ impl Pages {
+             // (XCL's own work: the queue hook must not take it for the title's and refresh)
+             super::title_textures::own_work(|| self.queue.ExecuteCommandLists(&[Some(cl)]));
+             self.value += 1;
+-            let _ = self.queue.Signal(&self.fence, self.value);
++            let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
+             let busy = self.value;
+             if let Some(sc) = self.scrub.as_mut() {
+                 sc.lists[k].2 = busy;
+@@ -1064,7 +1064,7 @@ impl Pages {
+             }
+             let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
+             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
+-            self.queue.UpdateTileMappings(
++            super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
+                 res,
+                 1,
+                 Some(&coord),
+@@ -1075,7 +1075,7 @@ impl Pages {
+                 Some(self.scratch_offsets.as_ptr()),
+                 Some(self.scratch_counts.as_ptr()),
+                 D3D12_TILE_MAPPING_FLAG_NONE,
+-            );
++            ));
+         }
+     }
+ 
+@@ -1087,7 +1087,7 @@ impl Pages {
+         }
+         self.map_tiles(res, sub, tiles);
+         self.value += 1;
+-        let _ = self.queue.Signal(&self.fence, self.value);
++        let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
+         super::real::removed_probe("vram: after map");
+     }
+ 
+@@ -1100,7 +1100,7 @@ impl Pages {
+         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
+         let flag = D3D12_TILE_RANGE_FLAG_NULL;
+-        self.queue.UpdateTileMappings(
++        super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
+             res,
+             1,
+             Some(&coord),
+@@ -1111,7 +1111,7 @@ impl Pages {
+             None,
+             Some(&total),
+             D3D12_TILE_MAPPING_FLAG_NONE,
+-        );
++        ));
+     }
+ 
+     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
+@@ -1122,7 +1122,7 @@ impl Pages {
+         }
+         self.unmap_tiles(res, total);
+         self.value += 1;
+-        let _ = self.queue.Signal(&self.fence, self.value);
++        let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
+     }
+ 
+     /// Zero recycled `tiles` on `self.queue` before they are mapped to a new resource.
+@@ -1143,7 +1143,7 @@ impl Pages {
+                 (slot.alloc.clone(), slot.list.clone(), slot.fence_val, z.scratch_buf.clone(), z.zero_buf.clone())
+             };
+             if fence_val > 0 && self.fence.GetCompletedValue() < fence_val {
+-                let _ = self.fence.SetEventOnCompletion(fence_val, windows::Win32::Foundation::HANDLE::default());
++                let _ = super::call_stats::cs!(FenceSetEvent, self.fence.SetEventOnCompletion(fence_val, windows::Win32::Foundation::HANDLE::default()));
+             }
+             if alloc.Reset().is_err() || list.Reset(&alloc, None).is_err() {
+                 continue;
+@@ -1152,7 +1152,7 @@ impl Pages {
+             let mut done = 0usize;
+             while done < chunk.len() {
+                 let n = (chunk.len() - done).min(ZERO_BUF_TILES);
+-                list.CopyBufferRegion(&scratch_buf, (done * PAGE) as u64, &zero_buf, 0, (n * PAGE) as u64);
++                super::call_stats::cs!(RecCopyBuffer, list.CopyBufferRegion(&scratch_buf, (done * PAGE) as u64, &zero_buf, 0, (n * PAGE) as u64));
+                 done += n;
+             }
+             if list.Close().is_err() {
+@@ -1164,7 +1164,7 @@ impl Pages {
+             });
+             self.unmap_tiles(&scratch_buf, chunk.len() as u32);
+             self.value += 1;
+-            let _ = self.queue.Signal(&self.fence, self.value);
++            let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
+             let z = self.zeroer.as_mut().unwrap();
+             z.slots[z.next_slot].fence_val = self.value;
+             z.next_slot = (z.next_slot + 1) % z.slots.len();
+@@ -1535,7 +1535,7 @@ fn canonical_va(va: usize) -> usize {
+     }
+     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+-    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
++    let mapped = unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) } != 0 && m.State == MEM_COMMIT;
+     if mapped { va } else { src }
+ }
+ 
+@@ -1942,7 +1942,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+         if let Some(Some(pages)) = g.get_mut(&dev_key) {
+             let key = queue.as_raw() as usize;
+             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+-                let _ = queue.Wait(&pages.fence, pages.value);
++                let _ = super::call_stats::cs!(QueueWait, queue.Wait(&pages.fence, pages.value));
+                 super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
+                 pages.waited.insert(key, pages.value);
+             }
+diff --git a/crates/xcl/src/hle/d3d12x/watch_trap.rs b/crates/xcl/src/hle/d3d12x/watch_trap.rs
+index 5471c748..cceb7f2e 100644
+--- a/crates/xcl/src/hle/d3d12x/watch_trap.rs
++++ b/crates/xcl/src/hle/d3d12x/watch_trap.rs
+@@ -92,7 +92,7 @@ fn install() {
+ 
+ unsafe fn protect(a: usize, n: usize, p: u32) -> bool {
+     let mut old = 0u32;
+-    VirtualProtect(a as *const c_void, n, p, &mut old) != 0
++    super::call_stats::cs!(VirtualProtect, VirtualProtect(a as *const c_void, n, p, &mut old)) != 0
+ }
+ 
+ /// Give a read-only span its protection back. A part with pages decommitted since then cannot
+@@ -106,7 +106,7 @@ unsafe fn thaw(c: &Cold) {
+         let mut at = a;
+         while at < end {
+             let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-            if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
++            if super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 {
+                 break;
+             }
+             let next = (m.BaseAddress as usize + m.RegionSize).min(end);
+@@ -142,7 +142,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+         // another thread gave the span back after this write faulted: go on if it may write now
+         drop(cold);
+         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-        let now = VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
++        let now = super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) != 0
+             && m.State == MEM_COMMIT
+             && matches!(m.Protect & !MODIFIERS, PAGE_READWRITE | 0x40);
+         return if now && was_ours(at) { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH };
+@@ -178,7 +178,7 @@ pub fn guard_free(a: usize, n: usize) -> Guard {
+     let mut at = a;
+     loop {
+         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+-        if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.AllocationBase as usize != a {
++        if unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) } == 0 || m.AllocationBase as usize != a {
+             break;
+         }
+         at = m.BaseAddress as usize + m.RegionSize;
+@@ -309,7 +309,7 @@ unsafe fn overlapped_status(ov: usize) -> Option<usize> {
+     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+     let (mut v, mut done) = (0usize, 0usize);
+-    (ReadProcessMemory(GetCurrentProcess(), ov as *const c_void, &mut v as *mut usize as *mut c_void, 8, &mut done) != 0 && done == 8).then_some(v)
++    (super::call_stats::cs!(ReadProcessMemory, ReadProcessMemory(GetCurrentProcess(), ov as *const c_void, &mut v as *mut usize as *mut c_void, 8, &mut done)) != 0 && done == 8).then_some(v)
+ }
+ 
+ /// The committed parts of `[a, a + n)` if all of them are plain read-write (modifiers kept),
+@@ -323,7 +323,7 @@ unsafe fn writable_parts(a: usize, n: usize) -> Option<Vec<(usize, usize, u32)>>
+     let mut parts = Vec::new();
+     while at < end {
+         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+-        if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
++        if super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 {
+             return None;
+         }
+         let next = (m.BaseAddress as usize + m.RegionSize).min(end);
+diff --git a/crates/xcl/src/host.rs b/crates/xcl/src/host.rs
+index e2665eda..336c7ed6 100644
+--- a/crates/xcl/src/host.rs
++++ b/crates/xcl/src/host.rs
+@@ -321,6 +321,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
+             }
+         });
+     }
++    // lab: `XCL_THREAD_SAMPLE=<from s>,<period ms>,<count>` – every thread's CPU and stacks, to a file (`thread_sample`)
++    crate::thread_sample::start_from_env();
+     // lab: `XCL_SAMPLE=<from s>,<seconds>[,<ms>]` – a sampling profile of every thread (`eh::sample_profile`)
+     if let Ok(v) = std::env::var("XCL_SAMPLE") {
+         let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+diff --git a/crates/xcl/src/lib.rs b/crates/xcl/src/lib.rs
+index b6bc0d2e..3790d421 100644
+--- a/crates/xcl/src/lib.rs
++++ b/crates/xcl/src/lib.rs
+@@ -32,6 +32,7 @@ pub mod shaders;
+ mod source_hash;
+ pub mod state;
+ pub mod stubs;
++pub mod thread_sample;
+ pub mod tls;
+ pub mod util;
+ pub mod vfs;
+diff --git a/crates/xcl/src/thread_sample.rs b/crates/xcl/src/thread_sample.rs
+new file mode 100644
+index 00000000..7257d909
+--- /dev/null
++++ b/crates/xcl/src/thread_sample.rs
+@@ -0,0 +1,757 @@
++//! lab: `XCL_THREAD_SAMPLE=<from s>,<period ms>,<count>` (+ `XCL_THREAD_SAMPLE_FILE=<path>`) –
++//! where the CPU time of every thread goes, without a debugger, ETW or elevation. Off unless set.
++//!
++//! From log time `<from>`, every `<period>` ms (`<count>` times) a thread of its own takes, for
++//! every other thread of the process: its cycle time since the previous sample
++//! (`QueryThreadCycleTime`: the CPU it used, exact), and – when it ran since then – its registers
++//! and the top of its stack, with the thread stopped only for that (`SuspendThread`,
++//! `GetThreadContext`, a copy of at most 16 KiB of stack, `ResumeThread`). The frames are unwound
++//! afterwards, thread running again, from that copy (`RtlVirtualUnwind` with the stack registers
++//! moved into the copy, a step leaving the copy ends the walk): RIP and up to 7 return addresses.
++//! A thread whose cycle time did not move and whose last RIP was in ntdll / win32u (a wait) is not
++//! stopped: it did not run, so its stack is the one of its last sample (written as "unchanged").
++//!
++//! Everything goes to a binary file (`XCL_THREAD_SAMPLE_FILE`, else `xcl-thread-sample.bin` in the
++//! temp dir), not the log; S/tools/thrprof.py reads it (modules, xcl.exe's PDB, waits). Format,
++//! little-endian (`Out` writes it, `read` in the tests reads it back):
++//!   header  `XCLTSMP1`, u32 version, u32 period ms, f64 from, u32 count, u32 pid, f64 uptime,
++//!           u64 tsc, i64 qpc, i64 qpc frequency
++//!   'M'     u64 base, u64 size, u8 kind (0 other, 1 XCL's own exe, 2 an image XCL mapped), u16 n, name
++//!   'T'     u32 tid, u64 start address, u16 n, name (when first seen, and when the name changes)
++//!   'S'     u32 index, f64 uptime, u64 tsc, u16 entries; each: u32 tid, u8 state (0 stopped and
++//!           read, 1 unchanged, 2 failed), u8 frames, u64 cycles since its previous entry, frames x u64
++//!   'E'     u32 samples, u32 threads, u64 stops, u64 unchanged, u64 failed, u64 sampler tsc,
++//!           u64 longest stop tsc, u64 stops tsc, u64 late, u64 tsc, i64 qpc, f64 uptime
++//! The log gets one line at the start and one with the counts at the end.
++
++use std::collections::HashMap;
++use std::ffi::c_void;
++use std::io::Write;
++
++pub(crate) const MAGIC: &[u8; 8] = b"XCLTSMP1";
++pub(crate) const VERSION: u32 = 1;
++/// RIP + return addresses kept a sample
++const FRAMES: usize = 8;
++/// stack copied while a thread stands
++const COPY_BYTES: usize = 16 << 10;
++/// a thread is stopped at least once every this many samples, unchanged or not
++const MAX_UNCHANGED: u32 = 20;
++/// samples between two looks at the thread list / at the thread names / at the modules
++const REFRESH_THREADS: u32 = 100;
++const REFRESH_NAMES: u32 = 200;
++const REFRESH_MODULES: u32 = 2000;
++
++pub(crate) const STOPPED: u8 = 0;
++pub(crate) const UNCHANGED: u8 = 1;
++pub(crate) const FAILED: u8 = 2;
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct Config {
++    pub from: f64,
++    pub period_ms: u32,
++    pub count: u32,
++}
++
++/// `<from s>,<period ms>,<count>`: all three, period 1..=1000 ms, count >= 1.
++pub(crate) fn parse(v: &str) -> Option<Config> {
++    let f: Vec<&str> = v.split(',').map(str::trim).collect();
++    if f.len() != 3 {
++        return None;
++    }
++    let from = f[0].parse::<f64>().ok().filter(|x| x.is_finite() && *x >= 0.0)?;
++    let period_ms = f[1].parse::<u32>().ok().filter(|p| (1..=1000).contains(p))?;
++    let count = f[2].parse::<u32>().ok().filter(|c| *c >= 1)?;
++    Some(Config { from, period_ms, count })
++}
++
++/// The binary file's writer (any `Write`: a file in the title, a Vec in the tests).
++pub(crate) struct Out<W: Write> {
++    w: W,
++    pub ok: bool,
++}
++
++impl<W: Write> Out<W> {
++    pub fn new(w: W) -> Self {
++        Out { w, ok: true }
++    }
++    fn put(&mut self, b: &[u8]) {
++        if self.ok && self.w.write_all(b).is_err() {
++            self.ok = false;
++        }
++    }
++    fn name(&mut self, s: &str) {
++        let b = s.as_bytes();
++        let n = b.len().min(u16::MAX as usize);
++        self.put(&(n as u16).to_le_bytes());
++        self.put(&b[..n]);
++    }
++    #[allow(clippy::too_many_arguments)]
++    pub fn header(&mut self, c: &Config, pid: u32, uptime: f64, tsc: u64, qpc: i64, qpf: i64) {
++        self.put(MAGIC);
++        self.put(&VERSION.to_le_bytes());
++        self.put(&c.period_ms.to_le_bytes());
++        self.put(&c.from.to_le_bytes());
++        self.put(&c.count.to_le_bytes());
++        self.put(&pid.to_le_bytes());
++        self.put(&uptime.to_le_bytes());
++        self.put(&tsc.to_le_bytes());
++        self.put(&qpc.to_le_bytes());
++        self.put(&qpf.to_le_bytes());
++    }
++    pub fn module(&mut self, base: u64, size: u64, kind: u8, name: &str) {
++        self.put(b"M");
++        self.put(&base.to_le_bytes());
++        self.put(&size.to_le_bytes());
++        self.put(&[kind]);
++        self.name(name);
++    }
++    pub fn thread(&mut self, tid: u32, start: u64, name: &str) {
++        self.put(b"T");
++        self.put(&tid.to_le_bytes());
++        self.put(&start.to_le_bytes());
++        self.name(name);
++    }
++    pub fn sample(&mut self, index: u32, uptime: f64, tsc: u64, entries: u16) {
++        self.put(b"S");
++        self.put(&index.to_le_bytes());
++        self.put(&uptime.to_le_bytes());
++        self.put(&tsc.to_le_bytes());
++        self.put(&entries.to_le_bytes());
++    }
++    pub fn entry(&mut self, tid: u32, state: u8, cycles: u64, frames: &[u64]) {
++        let n = frames.len().min(u8::MAX as usize);
++        self.put(&tid.to_le_bytes());
++        self.put(&[state, n as u8]);
++        self.put(&cycles.to_le_bytes());
++        for f in &frames[..n] {
++            self.put(&f.to_le_bytes());
++        }
++    }
++    pub fn end(&mut self, s: &Stats, tsc: u64, qpc: i64, uptime: f64) {
++        self.put(b"E");
++        self.put(&s.samples.to_le_bytes());
++        self.put(&s.threads.to_le_bytes());
++        for v in [s.stops, s.unchanged, s.failed, s.sampler_tsc, s.longest_stop_tsc, s.stops_tsc, s.late, tsc] {
++            self.put(&v.to_le_bytes());
++        }
++        self.put(&qpc.to_le_bytes());
++        self.put(&uptime.to_le_bytes());
++    }
++    pub fn flush(&mut self) {
++        if self.ok && self.w.flush().is_err() {
++            self.ok = false;
++        }
++    }
++}
++
++/// The counts of a sampling.
++#[derive(Default, Clone, Debug, PartialEq)]
++pub(crate) struct Stats {
++    pub samples: u32,
++    pub threads: u32,
++    pub stops: u64,
++    pub unchanged: u64,
++    pub failed: u64,
++    pub sampler_tsc: u64,
++    pub longest_stop_tsc: u64,
++    pub stops_tsc: u64,
++    pub late: u64,
++}
++
++/// x64 CONTEXT's 16 integer registers, in register-number order (Rax, Rcx, Rdx, Rbx, Rsp, Rbp,
++/// Rsi, Rdi, R8..R15: the CONTEXT keeps them in that order, one u64 after the other).
++fn regs(c: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> *mut u64 {
++    std::ptr::addr_of_mut!(c.Rax)
++}
++
++/// Registers pointing into the original stack span [lo, lo + len) point into the copy at `copy`.
++unsafe fn rebase(c: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, lo: u64, len: u64, copy: u64) {
++    let r = regs(c);
++    for i in 0..16 {
++        let v = *r.add(i);
++        if v >= lo && v < lo + len {
++            *r.add(i) = v - lo + copy;
++        }
++    }
++}
++
++/// RIP and the return addresses of up to `max - 1` frames, unwound from `c` whose stack
++/// registers were moved into the copy [copy, copy + len). A step that would read outside the copy
++/// ends the walk (`lo`: the original address of the copy's first byte).
++unsafe fn walk(c: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, lo: u64, copy: u64, len: u64, max: usize, out: &mut Vec<u64>) {
++    use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER};
++    let inside = |v: u64, bytes: u64| v >= copy && v + bytes <= copy + len;
++    while out.len() < max {
++        let rip = c.Rip;
++        if rip < 0x10000 {
++            break;
++        }
++        out.push(rip);
++        if out.len() == max || !inside(c.Rsp, 8) {
++            break;
++        }
++        let mut base = 0u64;
++        let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
++        if f.is_null() {
++            // no unwind data (a leaf, or code made at run time): the return address at RSP
++            c.Rip = (c.Rsp as *const u64).read_unaligned();
++            c.Rsp += 8;
++            continue;
++        }
++        // a frame register (UNWIND_INFO byte 3, low nibble) must point into the copy too (an odd
++        // address is an entry that points at another one: not read)
++        let ua = (*f).Anonymous.UnwindInfoAddress;
++        if ua & 1 == 0 {
++            let fr = (*((base + ua as u64) as *const u8).add(3) & 0xF) as usize;
++            if fr != 0 && !inside(*regs(c).add(fr), 8) {
++                break;
++            }
++        }
++        let mut data = std::ptr::null_mut();
++        let mut frame = 0u64;
++        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, c, &mut data, &mut frame, std::ptr::null_mut());
++        // registers restored from the copy hold original stack addresses
++        rebase(c, lo, len, copy);
++    }
++}
++
++#[link(name = "kernel32")]
++extern "system" {
++    fn QueryThreadCycleTime(thread: *mut c_void, cycles: *mut u64) -> i32;
++}
++
++/// [base, base + SizeOfImage) of a loaded module (0, 0: none).
++unsafe fn image_span(base: usize) -> (u64, u64) {
++    if base == 0 {
++        return (0, 0);
++    }
++    let pe = base + (base as *const u8).add(0x3C).cast::<u32>().read_unaligned() as usize;
++    // PE signature (4) + file header (20) + SizeOfImage's offset in the optional header (56)
++    let size = (pe as *const u8).add(0x18 + 56).cast::<u32>().read_unaligned();
++    (base as u64, size as u64)
++}
++
++unsafe fn module_span(name: &str) -> (u64, u64) {
++    let w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
++    image_span(windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(w.as_ptr()) as usize)
++}
++
++fn tsc() -> u64 {
++    unsafe { core::arch::x86_64::_rdtsc() }
++}
++
++fn qpc() -> i64 {
++    let mut v = 0i64;
++    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v) };
++    v
++}
++
++struct Thread {
++    h: *mut c_void,
++    name: String,
++    cycles: u64,
++    /// the last stop's RIP was in a wait (ntdll / win32u)
++    waiting: bool,
++    unchanged_in_row: u32,
++    alive: bool,
++}
++
++/// The modules: the loader's (toolhelp) and the images XCL mapped; each base once.
++unsafe fn write_modules<W: Write>(out: &mut Out<W>, seen: &mut std::collections::HashSet<u64>) {
++    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
++    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE};
++    let own = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) as u64;
++    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
++    if snap != INVALID_HANDLE_VALUE {
++        let mut me: MODULEENTRY32W = std::mem::zeroed();
++        me.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
++        let mut ok = Module32FirstW(snap, &mut me) != 0;
++        while ok {
++            let base = me.modBaseAddr as u64;
++            if seen.insert(base) {
++                // the full path: S/tools/thrprof.py reads the DLLs' export tables from it
++                let n = me.szExePath.iter().position(|&c| c == 0).unwrap_or(me.szExePath.len());
++                out.module(base, me.modBaseSize as u64, u8::from(base == own), &String::from_utf16_lossy(&me.szExePath[..n]));
++            }
++            ok = Module32NextW(snap, &mut me) != 0;
++        }
++        CloseHandle(snap);
++    }
++    for m in crate::modules::mapped_modules() {
++        if seen.insert(m.base as u64) {
++            out.module(m.base as u64, m.size as u64, 2, &m.name);
++        }
++    }
++}
++
++/// The thread's start address (NtQueryInformationThread, ThreadQuerySetWin32StartAddress).
++unsafe fn start_address(h: *mut c_void) -> u64 {
++    type F = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32;
++    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    let f = *F.get_or_init(|| {
++        let ntdll: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
++        let m = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(ntdll.as_ptr());
++        windows_sys::Win32::System::LibraryLoader::GetProcAddress(m, c"NtQueryInformationThread".as_ptr().cast()).map_or(0, |p| p as usize)
++    });
++    if f == 0 {
++        return 0;
++    }
++    let mut a = 0u64;
++    let st = std::mem::transmute::<usize, F>(f)(h, 9, (&mut a as *mut u64).cast(), 8, std::ptr::null_mut());
++    if st >= 0 {
++        a
++    } else {
++        0
++    }
++}
++
++/// The ids of the other threads of this process.
++unsafe fn thread_ids(me: u32) -> Vec<u32> {
++    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
++    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
++    let pid = windows_sys::Win32::System::Threading::GetCurrentProcessId();
++    let mut out = Vec::new();
++    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++    if snap == INVALID_HANDLE_VALUE {
++        return out;
++    }
++    let mut te: THREADENTRY32 = std::mem::zeroed();
++    te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
++    let mut ok = Thread32First(snap, &mut te) != 0;
++    while ok {
++        if te.th32OwnerProcessID == pid && te.th32ThreadID != me {
++            out.push(te.th32ThreadID);
++        }
++        ok = Thread32Next(snap, &mut te) != 0;
++    }
++    CloseHandle(snap);
++    out
++}
++
++/// Run the sampling of `c` on this thread into `out` (from log time `c.from`); the counts.
++pub(crate) fn run<W: Write>(c: Config, out: &mut Out<W>) -> Stats {
++    use windows_sys::Win32::Foundation::CloseHandle;
++    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64};
++    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
++    use windows_sys::Win32::System::Threading::{
++        GetCurrentProcessId, GetCurrentThreadId, GetExitCodeThread, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
++    };
++    let left = c.from - crate::log::uptime();
++    if left > 0.0 {
++        std::thread::sleep(std::time::Duration::from_secs_f64(left));
++    }
++    let mut st = Stats::default();
++    unsafe {
++        let me = GetCurrentThreadId();
++        let mut qpf = 0i64;
++        windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut qpf);
++        out.header(&c, GetCurrentProcessId(), crate::log::uptime(), tsc(), qpc(), qpf);
++        let mut modules = std::collections::HashSet::new();
++        write_modules(out, &mut modules);
++        let waits = [module_span("ntdll.dll"), module_span("win32u.dll")];
++        let in_wait = |rip: u64| waits.iter().any(|&(b, n)| rip >= b && rip < b + n);
++        let mut threads: HashMap<u32, Thread> = HashMap::new();
++        let mut ids: Vec<u32> = Vec::new();
++        let mut copy = vec![0u64; COPY_BYTES / 8];
++        let mut frames: Vec<u64> = Vec::with_capacity(FRAMES);
++        let mut rows: Vec<(u32, u8, u64, [u64; FRAMES], u8)> = Vec::new();
++        let period = std::time::Duration::from_millis(c.period_ms as u64);
++        let mut t0 = std::time::Instant::now();
++        for i in 0..c.count {
++            // on time: the i-th sample at t0 + i periods; more than a period late, from now on
++            let due = t0 + period * i;
++            let now = std::time::Instant::now();
++            if now < due {
++                std::thread::sleep(due - now);
++            } else if now - due > period {
++                st.late += 1;
++                t0 = now - period * i;
++            }
++            let pass = tsc();
++            if i % REFRESH_THREADS == 0 {
++                ids = thread_ids(me);
++                for &tid in &ids {
++                    if threads.contains_key(&tid) {
++                        continue;
++                    }
++                    let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid);
++                    if h.is_null() {
++                        continue;
++                    }
++                    let name = crate::eh::thread_name(h);
++                    out.thread(tid, start_address(h), &name);
++                    let mut cy = 0u64;
++                    QueryThreadCycleTime(h, &mut cy);
++                    threads.insert(tid, Thread { h, name, cycles: cy, waiting: false, unchanged_in_row: 0, alive: true });
++                }
++                st.threads = threads.len() as u32;
++            }
++            if i % REFRESH_NAMES == REFRESH_NAMES - 1 {
++                for (&tid, t) in threads.iter_mut().filter(|t| t.1.alive) {
++                    let name = crate::eh::thread_name(t.h);
++                    if name != t.name {
++                        out.thread(tid, start_address(t.h), &name);
++                        t.name = name;
++                    }
++                }
++            }
++            if i % REFRESH_MODULES == REFRESH_MODULES - 1 {
++                write_modules(out, &mut modules);
++            }
++            rows.clear();
++            for &tid in &ids {
++                let Some(t) = threads.get_mut(&tid) else { continue };
++                if !t.alive {
++                    continue;
++                }
++                let mut cy = 0u64;
++                let have_cy = QueryThreadCycleTime(t.h, &mut cy) != 0;
++                let ran = cy.wrapping_sub(t.cycles);
++                if have_cy && ran == 0 && t.waiting && t.unchanged_in_row < MAX_UNCHANGED {
++                    t.unchanged_in_row += 1;
++                    st.unchanged += 1;
++                    rows.push((tid, UNCHANGED, 0, [0; FRAMES], 0));
++                    continue;
++                }
++                #[repr(align(16))]
++                struct Aligned(CONTEXT);
++                let mut ctx: Aligned = std::mem::zeroed();
++                ctx.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
++                let (mut lo, mut len) = (0u64, 0u64);
++                // stopped only for its registers and the copy of its stack top: no lock, no heap
++                let s0 = tsc();
++                let got = SuspendThread(t.h) != u32::MAX && {
++                    let ok = GetThreadContext(t.h, &mut ctx.0) != 0;
++                    if ok {
++                        let sp = ctx.0.Rsp & !7;
++                        let mut q: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
++                        if sp != 0
++                            && VirtualQuery(sp as *const c_void, &mut q, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) != 0
++                            && q.State == MEM_COMMIT
++                            && q.Protect & 0x104 == 0x4
++                        {
++                            let end = q.BaseAddress as u64 + q.RegionSize as u64;
++                            len = (end - sp).min(COPY_BYTES as u64);
++                            lo = sp;
++                            std::ptr::copy_nonoverlapping(sp as *const u8, copy.as_mut_ptr().cast::<u8>(), len as usize);
++                        }
++                    }
++                    ResumeThread(t.h);
++                    ok
++                };
++                let stop = tsc().wrapping_sub(s0);
++                if !got {
++                    st.failed += 1;
++                    let mut code = 0u32;
++                    if GetExitCodeThread(t.h, &mut code) != 0 && code != 259 {
++                        t.alive = false;
++                    }
++                    rows.push((tid, FAILED, if have_cy { ran } else { 0 }, [0; FRAMES], 0));
++                    continue;
++                }
++                st.stops += 1;
++                st.stops_tsc += stop;
++                st.longest_stop_tsc = st.longest_stop_tsc.max(stop);
++                frames.clear();
++                let rip = ctx.0.Rip;
++                if len >= 8 {
++                    let base = copy.as_ptr() as u64;
++                    rebase(&mut ctx.0, lo, len, base);
++                    walk(&mut ctx.0, lo, base, len, FRAMES, &mut frames);
++                } else {
++                    frames.push(rip);
++                }
++                t.waiting = in_wait(rip);
++                t.unchanged_in_row = 0;
++                if have_cy {
++                    t.cycles = cy;
++                }
++                let mut f = [0u64; FRAMES];
++                f[..frames.len()].copy_from_slice(&frames);
++                rows.push((tid, STOPPED, if have_cy { ran } else { 0 }, f, frames.len() as u8));
++            }
++            out.sample(i, crate::log::uptime(), pass, rows.len() as u16);
++            for (tid, state, cy, f, n) in &rows {
++                out.entry(*tid, *state, *cy, &f[..*n as usize]);
++            }
++            st.samples += 1;
++            st.sampler_tsc += tsc().wrapping_sub(pass);
++            if i % 200 == 199 {
++                out.flush();
++            }
++            if !out.ok {
++                break;
++            }
++        }
++        write_modules(out, &mut modules);
++        out.end(&st, tsc(), qpc(), crate::log::uptime());
++        out.flush();
++        for t in threads.values() {
++            CloseHandle(t.h);
++        }
++    }
++    st
++}
++
++/// `XCL_THREAD_SAMPLE` set: the sampler's thread.
++pub fn start_from_env() {
++    let Ok(v) = std::env::var("XCL_THREAD_SAMPLE") else { return };
++    let Some(c) = parse(&v) else {
++        crate::xlog_warn!("thread sample: XCL_THREAD_SAMPLE={v} is not <from s>,<period ms>,<count>: off");
++        return;
++    };
++    let file = std::env::var_os("XCL_THREAD_SAMPLE_FILE").map_or_else(|| std::env::temp_dir().join("xcl-thread-sample.bin"), std::path::PathBuf::from);
++    let _ = std::thread::Builder::new().name("xcl-thread-sample".into()).spawn(move || {
++        crate::xlog_info!("thread sample: from {} s every {} ms, {} samples, to {}", c.from, c.period_ms, c.count, file.display());
++        let f = match std::fs::File::create(&file) {
++            Ok(f) => f,
++            Err(e) => {
++                crate::xlog_warn!("thread sample: cannot create {}: {e}", file.display());
++                return;
++            }
++        };
++        unsafe {
++            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
++            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++        }
++        let mut out = Out::new(std::io::BufWriter::with_capacity(1 << 20, f));
++        let t0 = (crate::log::uptime(), tsc());
++        let s = run(c, &mut out);
++        let t1 = (crate::log::uptime(), tsc());
++        let hz = (t1.1 - t0.1) as f64 / (t1.0 - t0.0).max(1e-9);
++        let us = |t: u64| t as f64 * 1e6 / hz.max(1.0);
++        crate::xlog_info!(
++            "thread sample: done: {} samples, {} threads, {} stops (mean {:.1} us, longest {:.0} us), {} unchanged, {} failed, {} late; sampler {:.0} us a sample; {} ({})",
++            s.samples,
++            s.threads,
++            s.stops,
++            us(s.stops_tsc) / s.stops.max(1) as f64,
++            us(s.longest_stop_tsc),
++            s.unchanged,
++            s.failed,
++            s.late,
++            us(s.sampler_tsc) / s.samples.max(1) as f64,
++            file.display(),
++            if out.ok { "ok" } else { "WRITE FAILED" }
++        );
++    });
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// What the file holds, read back (the reader S/tools/thrprof.py has, in Rust).
++    #[derive(Debug, Default)]
++    struct File {
++        period_ms: u32,
++        count: u32,
++        modules: Vec<(u64, u64, u8, String)>,
++        threads: Vec<(u32, u64, String)>,
++        samples: Vec<(u32, f64, u64, Vec<(u32, u8, u64, Vec<u64>)>)>,
++        end: Option<(u32, u32, Vec<u64>)>,
++    }
++
++    struct Reader<'a> {
++        b: &'a [u8],
++        p: usize,
++    }
++
++    impl<'a> Reader<'a> {
++        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
++            let s = self.b.get(self.p..self.p + n)?;
++            self.p += n;
++            Some(s)
++        }
++    }
++
++    fn read(b: &[u8]) -> Option<File> {
++        let mut r = Reader { b, p: 0 };
++        let mut take = |n: usize| r.take(n);
++        macro_rules! u {
++            ($t:ty) => {
++                <$t>::from_le_bytes(take(std::mem::size_of::<$t>())?.try_into().ok()?)
++            };
++        }
++        if take(8)? != MAGIC || u!(u32) != VERSION {
++            return None;
++        }
++        let mut f = File { period_ms: u!(u32), ..Default::default() };
++        let _from = u!(f64);
++        f.count = u!(u32);
++        let (_pid, _up, _tsc, _qpc, _qpf) = (u!(u32), u!(f64), u!(u64), u!(i64), u!(i64));
++        loop {
++            let Some(tag) = take(1) else { break };
++            match tag[0] {
++                b'M' => {
++                    let (base, size, kind) = (u!(u64), u!(u64), take(1)?[0]);
++                    let n = u!(u16) as usize;
++                    f.modules.push((base, size, kind, String::from_utf8_lossy(take(n)?).into_owned()));
++                }
++                b'T' => {
++                    let (tid, start) = (u!(u32), u!(u64));
++                    let n = u!(u16) as usize;
++                    f.threads.push((tid, start, String::from_utf8_lossy(take(n)?).into_owned()));
++                }
++                b'S' => {
++                    let (i, up, t, n) = (u!(u32), u!(f64), u!(u64), u!(u16));
++                    let mut es = Vec::new();
++                    for _ in 0..n {
++                        let tid = u!(u32);
++                        let (state, nf) = (take(1)?[0], take(1)?[0]);
++                        let cy = u!(u64);
++                        let fr = (0..nf).map(|_| Some(u!(u64))).collect::<Option<Vec<u64>>>()?;
++                        es.push((tid, state, cy, fr));
++                    }
++                    f.samples.push((i, up, t, es));
++                }
++                b'E' => {
++                    let (s, t) = (u!(u32), u!(u32));
++                    let v = (0..8).map(|_| Some(u!(u64))).collect::<Option<Vec<u64>>>()?;
++                    let (_q, _u) = (u!(i64), u!(f64));
++                    f.end = Some((s, t, v));
++                }
++                _ => return None,
++            }
++        }
++        Some(f)
++    }
++
++    #[test]
++    fn the_switch_takes_a_start_a_period_and_a_count() {
++        assert_eq!(parse("360,5,12000"), Some(Config { from: 360.0, period_ms: 5, count: 12000 }));
++        assert_eq!(parse(" 0.5 , 1 , 1 "), Some(Config { from: 0.5, period_ms: 1, count: 1 }));
++        assert_eq!(parse("360,5"), None);
++        assert_eq!(parse("360,5,12000,1"), None);
++        assert_eq!(parse("360,0,10"), None);
++        assert_eq!(parse("360,1001,10"), None);
++        assert_eq!(parse("360,5,0"), None);
++        assert_eq!(parse("-1,5,10"), None);
++        assert_eq!(parse("x,5,10"), None);
++        assert_eq!(parse(""), None);
++    }
++
++    #[test]
++    fn the_file_reads_back_record_by_record() {
++        let mut out = Out::new(Vec::new());
++        let c = Config { from: 12.5, period_ms: 5, count: 2 };
++        out.header(&c, 77, 12.6, 1000, 2000, 10_000_000);
++        out.module(0x1_4000_0000, 0x10_0000, 1, "xcl.exe");
++        out.module(0x7ff8_0000_0000, 0x20_0000, 0, "ntdll.dll");
++        out.thread(42, 0x1_4000_1234, "submit");
++        out.thread(43, 0, "");
++        out.sample(0, 12.7, 5000, 2);
++        out.entry(42, STOPPED, 123_456, &[0x1_4000_2000, 0x1_4000_3000]);
++        out.entry(43, UNCHANGED, 0, &[]);
++        out.sample(1, 12.71, 6000, 1);
++        out.entry(43, FAILED, 9, &[]);
++        let s = Stats { samples: 2, threads: 2, stops: 1, unchanged: 1, failed: 1, sampler_tsc: 10, longest_stop_tsc: 3, stops_tsc: 3, late: 0 };
++        out.end(&s, 7000, 3000, 12.8);
++        out.flush();
++        assert!(out.ok);
++        let f = read(&out.w).expect("the file parses");
++        assert_eq!((f.period_ms, f.count), (5, 2));
++        assert_eq!(f.modules[0], (0x1_4000_0000, 0x10_0000, 1, "xcl.exe".into()));
++        assert_eq!(f.threads, vec![(42, 0x1_4000_1234, "submit".into()), (43, 0, String::new())]);
++        assert_eq!(f.samples.len(), 2);
++        assert_eq!(f.samples[0].3[0], (42, STOPPED, 123_456, vec![0x1_4000_2000, 0x1_4000_3000]));
++        assert_eq!(f.samples[0].3[1], (43, UNCHANGED, 0, vec![]));
++        assert_eq!(f.samples[1].3, vec![(43, FAILED, 9, vec![])]);
++        assert_eq!(f.end, Some((2, 2, vec![1, 1, 1, 10, 3, 3, 0, 7000])));
++        // a truncated file stops at its last whole record
++        assert!(read(&out.w[..out.w.len() - 3]).is_none());
++    }
++
++    #[inline(never)]
++    fn spin(stop: &std::sync::atomic::AtomicBool) -> u64 {
++        let mut x = 0u64;
++        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
++            x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
++        }
++        x
++    }
++
++    /// This process sampled: a spinning thread is stopped and found running in this binary with
++    /// its caller unwound, its cycle time moving; a thread blocked in a wait is found in ntdll
++    /// and then left unchanged; the sampler's own thread is never in the file.
++    /// `XCL_THREAD_SAMPLE_TEST_OUT=<path>` keeps the file (for S/tools/thrprof.py).
++    #[test]
++    fn a_sampling_of_this_process_finds_the_spinning_and_the_waiting_thread() {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        use std::sync::Arc;
++        let stop = Arc::new(AtomicBool::new(false));
++        let s2 = stop.clone();
++        let spinner = std::thread::Builder::new().name("ts-spinner".into()).spawn(move || spin(&s2)).unwrap();
++        let (tx, rx) = std::sync::mpsc::channel::<()>();
++        let waiter = std::thread::Builder::new().name("ts-waiter".into()).spawn(move || rx.recv().ok()).unwrap();
++        // Rust names its threads with SetThreadDescription; wait until both are running
++        std::thread::sleep(std::time::Duration::from_millis(50));
++        let (sp_id, wt_id) = unsafe {
++            use std::os::windows::io::AsRawHandle;
++            let id = |h: *mut c_void| windows_sys::Win32::System::Threading::GetThreadId(h);
++            (id(spinner.as_raw_handle()), id(waiter.as_raw_handle()))
++        };
++        let mut out = Out::new(Vec::new());
++        let c = Config { from: 0.0, period_ms: 2, count: 150 };
++        let (me, st) = std::thread::scope(|s| {
++            s.spawn(|| (unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, run(c, &mut out))).join().unwrap()
++        });
++        stop.store(true, Ordering::Relaxed);
++        drop(tx);
++        spinner.join().unwrap();
++        waiter.join().unwrap();
++        assert!(out.ok);
++        if let Some(p) = std::env::var_os("XCL_THREAD_SAMPLE_TEST_OUT") {
++            std::fs::write(p, &out.w).unwrap();
++        }
++        let f = read(&out.w).expect("the file parses");
++        eprintln!("thread sample test: {st:?}; {} threads, {} modules", f.threads.len(), f.modules.len());
++        assert_eq!(f.samples.len(), 150);
++        assert_eq!(st.samples, 150);
++        assert!(f.end.is_some());
++        let own = f.modules.iter().find(|m| m.2 == 1).expect("the test binary is a kind 1 module").clone();
++        let ntdll = f.modules.iter().find(|m| m.3.to_ascii_lowercase().ends_with("\\ntdll.dll")).expect("ntdll is listed").clone();
++        let inside = |a: u64, m: &(u64, u64, u8, String)| a >= m.0 && a < m.0 + m.1;
++        assert!(f.threads.iter().any(|t| t.0 == sp_id && t.2 == "ts-spinner"), "the spinner's name");
++        assert!(f.threads.iter().all(|t| t.0 != me), "the sampler is not sampled");
++        let mut spin_stopped = 0;
++        let mut spin_in_own = 0;
++        let mut spin_with_caller = 0;
++        let mut spin_cycles = 0u64;
++        let (mut wait_stopped, mut wait_in_ntdll, mut wait_unchanged) = (0, 0, 0);
++        for (_, _, _, es) in &f.samples {
++            assert!(es.iter().all(|e| e.0 != me));
++            for e in es {
++                if e.0 == sp_id {
++                    spin_cycles += e.2;
++                    if e.1 == STOPPED {
++                        spin_stopped += 1;
++                        spin_in_own += usize::from(inside(e.3[0], &own));
++                        spin_with_caller += usize::from(e.3.len() >= 2 && inside(e.3[1], &own));
++                    }
++                }
++                if e.0 == wt_id {
++                    match e.1 {
++                        STOPPED => {
++                            wait_stopped += 1;
++                            wait_in_ntdll += usize::from(inside(e.3[0], &ntdll));
++                        }
++                        UNCHANGED => wait_unchanged += 1,
++                        _ => {}
++                    }
++                }
++            }
++        }
++        eprintln!(
++            "spinner: {spin_stopped} stopped, {spin_in_own} in this binary, {spin_with_caller} with a caller, {spin_cycles} cycles; waiter: {wait_stopped} stopped ({wait_in_ntdll} in ntdll), {wait_unchanged} unchanged"
++        );
++        // the spinner runs all along: stopped at every sample (its cycles move), in spin()
++        assert!(spin_stopped >= 140, "the spinner was stopped at nearly every sample");
++        assert!(spin_in_own * 10 >= spin_stopped * 9, "the spinner's RIP is in this binary");
++        assert!(spin_with_caller * 10 >= spin_stopped * 9, "its caller was unwound");
++        assert!(spin_cycles > 0, "its cycle time moved");
++        // the waiter: in ntdll when stopped, and mostly left unchanged
++        assert!(wait_stopped >= 1 && wait_in_ntdll == wait_stopped, "the waiter waits in ntdll");
++        assert!(wait_unchanged >= 100, "a thread that does not run is not stopped again");
++    }
++}
+-- 
+2.46.0.windows.1
+

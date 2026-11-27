@@ -1,0 +1,115 @@
+From fcf2dfc41ddc3a98241b97f90b051441da3d071d Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:46:03 +0100
+Subject: [PATCH 08/14] Lab: XCL_FENCE_FAST=1 - fence_completed tells an
+ adopted fence without a VirtualQuery
+
+fence_completed asked is_adopted, which checks that the object is
+readable (VirtualQuery and the working set) before reading its vtable
+pointer. The fence is a live object the caller holds, so the pointer
+is readable: with the switch, the vtable alone says whether it is
+adopted. PROF1: ~133 000 calls a frame, most from the workers and
+late_release::drain_known. Off by default; real.rs only.
+
+Test: the same values for an adopted and a plain WARP fence, switch on
+and off (timings printed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/real.rs   | 36 ++++++++++++++++++++++++++++-
+ crates/xcl/src/hle/d3d12x/sparse.rs | 27 ++++++++++++++++++++++
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 3098129e..afb5ee30 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -8420,7 +8420,10 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+     const PC_GET_COMPLETED_VALUE: usize = 8;
+     let _cs = super::call_stats::time(super::call_stats::C::FenceCompleted);
+     let p = fence.as_raw();
+-    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
++    // lab XCL_FENCE_FAST=1: `fence` is a live object, so its vtable pointer is readable: whether
++    // it is adopted without `is_adopted`'s VirtualQuery (PROF1: ~133 000 calls a frame)
++    let adopted = if fence_fast() { is_ext(*(p as *const usize)) } else { is_adopted(p) };
++    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if adopted {
+         std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
+     } else {
+         std::mem::transmute(*(*(p as *const *const usize)).add(PC_GET_COMPLETED_VALUE))
+@@ -8428,6 +8431,37 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+     f(p)
+ }
+ 
++/// lab `XCL_FENCE_FAST=1` (off by default): 0 not read yet, 1 off, 2 on
++static FENCE_FAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
++
++/// lab `XCL_FENCE_FAST=1`: `fence_completed` tells an adopted fence by its vtable alone.
++fn fence_fast() -> bool {
++    match FENCE_FAST.load(Ordering::Relaxed) {
++        0 => {
++            let on = std::env::var("XCL_FENCE_FAST").is_ok_and(|v| v == "1");
++            FENCE_FAST.store(if on { 2 } else { 1 }, Ordering::Relaxed);
++            if on {
++                crate::xlog_info!("lab XCL_FENCE_FAST=1: fence_completed tells an adopted fence by its vtable, without a VirtualQuery");
++            }
++            on
++        }
++        v => v == 2,
++    }
++}
++
++/// tests: the switch as `on` says (None: read from the environment again)
++#[cfg(test)]
++pub(super) fn set_fence_fast(on: Option<bool>) {
++    FENCE_FAST.store(
++        match on {
++            None => 0,
++            Some(false) => 1,
++            Some(true) => 2,
++        },
++        Ordering::Relaxed,
++    );
++}
++
+ /// lab `XCL_FENCE_DIRECT=1` (off by default): 0 not read yet, 1 off, 2 on
+ static FENCE_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+ 
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index 092169fe..4cc7726e 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -4170,4 +4170,31 @@ mod tests {
+         assert!(!on_inside, "on: an address in a lazy buffer takes the state (to map it)");
+         assert!(!off_outside, "off: every address of the envelope takes the state, as before");
+     }
++
++    /// lab `XCL_FENCE_FAST=1`: `fence_completed` reads the same value of an adopted and of a
++    /// plain fence with the switch on and off.
++    #[test]
++    fn a_fast_fence_completed_reads_the_same_values() {
++        use crate::hle::d3d12x::real;
++        unsafe {
++            let dev = lab_device();
++            let plain: ID3D12Fence = dev.CreateFence(3, D3D12_FENCE_FLAG_NONE).expect("fence");
++            let adopted: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
++            adopted.Signal(11).expect("CPU signal");
++            real::adopt(adopted.as_raw(), real::Kind::Fence);
++            let _restore = LabRestore(|| real::set_fence_fast(None), 0);
++            let mut took = [std::time::Duration::ZERO; 2];
++            for (i, on) in [false, true].into_iter().enumerate() {
++                real::set_fence_fast(Some(on));
++                assert_eq!(real::fence_completed(&plain), 3, "plain fence, switch {on}");
++                assert_eq!(real::fence_completed(&adopted), 11, "adopted fence, switch {on}");
++                let t = std::time::Instant::now();
++                for _ in 0..20_000 {
++                    std::hint::black_box(real::fence_completed(&adopted));
++                }
++                took[i] = t.elapsed();
++            }
++            println!("fence_completed x 20000 on an adopted fence: off {:?}, on {:?}", took[0], took[1]);
++        }
++    }
+ }
+-- 
+2.46.0.windows.1
+

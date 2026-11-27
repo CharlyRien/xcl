@@ -1,0 +1,43 @@
+From d97cbeed17cb9e6acfc15e5ad9978b39fde2bf47 Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 08:08:08 +0100
+Subject: [PATCH 09/14] Lab: seen_addresses_pass_once - addresses that do not
+ share a slot
+
+The test expected 0x10_0000_0100 to be skipped the second time, but
+0x10_0001_0000 maps to the same slot (16) of the 64-entry set and had
+evicted it, so it passed again: the set is lossy by design. The first
+case now uses addresses of slots 0, 4 and 8; a second case checks the
+eviction (the evicted address passes again). No code change: the
+failure was the test's, in both runs (switches unset and on).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/sparse.rs | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index 4cc7726e..b8dd1882 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -4113,9 +4113,15 @@ mod tests {
+     #[test]
+     fn seen_addresses_pass_once() {
+         let mut seen = SeenAddrs::new();
+-        let addrs = [0x10_0000_0000usize, 0x10_0000_0100, 0x10_0000_0000, 0x10_0001_0000, 0x10_0000_0100, 0x10_0000_0000];
++        // (slots 0, 4 and 8: no two of these share a slot)
++        let addrs = [0x10_0000_0000usize, 0x10_0000_0040, 0x10_0000_0000, 0x10_0000_0080, 0x10_0000_0040, 0x10_0000_0000];
+         let passed: Vec<usize> = addrs.iter().copied().filter(|&a| seen.first(a)).collect();
+-        assert_eq!(passed, vec![0x10_0000_0000, 0x10_0000_0100, 0x10_0001_0000]);
++        assert_eq!(passed, vec![0x10_0000_0000, 0x10_0000_0040, 0x10_0000_0080]);
++        // two addresses of one slot (16): the second evicts the first, which then passes again (lossy by design: a second
++        // use_range of an address finds nothing left to map)
++        let mut seen = SeenAddrs::new();
++        let passed: Vec<usize> = [0x10_0000_0100usize, 0x10_0001_0000, 0x10_0000_0100].into_iter().filter(|&a| seen.first(a)).collect();
++        assert_eq!(passed, vec![0x10_0000_0100, 0x10_0001_0000, 0x10_0000_0100]);
+         let mut seen = SeenAddrs::new();
+         let mut x = 7u64;
+         let mut firsts = std::collections::HashSet::new();
+-- 
+2.46.0.windows.1
+

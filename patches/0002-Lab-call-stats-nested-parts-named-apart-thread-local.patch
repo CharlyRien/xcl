@@ -1,0 +1,70 @@
+From e10e6f44cb7a5bb9b0c5578d306e03e64b66ee8f Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 06:33:26 +0100
+Subject: [PATCH 02/14] Lab: call stats - nested parts named apart,
+ thread-locals safe at thread exit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/call_stats.rs | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/call_stats.rs b/crates/xcl/src/hle/d3d12x/call_stats.rs
+index bd068f4f..81f57c2b 100644
+--- a/crates/xcl/src/hle/d3d12x/call_stats.rs
++++ b/crates/xcl/src/hle/d3d12x/call_stats.rs
+@@ -50,7 +50,7 @@ kinds! {
+     RecCopyTexture = "XCL CopyTextureRegion recorded",
+     OwnExecute = "ECL of XCL's own lists (hook)",
+     TitleExecute = "ECL of the title (hook)",
+-    DriverExecute = "ECL driver call (title)",
++    DriverExecute = "waits: ECL driver call (title)",
+     // locks
+     LockState = "lock sparse STATE",
+     LockTextures = "lock TEXTURES",
+@@ -62,8 +62,8 @@ kinds! {
+     NoteQueueForLists = "hook: note_queue_for_lists",
+     GpuProfileNoteQueue = "hook: gpu_profile::note_queue",
+     ExecuteWithWaits = "hook: execute_with_waits_on (all)",
+-    WaitAllOn = "hook: wait_all_on",
+-    NoteResubmits = "hook: alloc_pool::note_resubmits",
++    WaitAllOn = "waits: wait_all_on",
++    NoteResubmits = "waits: alloc_pool::note_resubmits",
+     CopyScratchSubmitted = "after: copy_scratch_submitted",
+     AllocPoolExecuted = "after: alloc_pool::executed",
+     SignalWrite64Fences = "after: signal_write64_fences",
+@@ -99,7 +99,6 @@ macro_rules! cs {
+ }
+ pub(crate) use cs;
+ 
+-
+ /// [calls, ns] of every kind: all threads, and inside a title submit
+ static ALL: [[AtomicU64; 2]; N] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; N];
+ static IN_SUBMIT: [[AtomicU64; 2]; N] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; N];
+@@ -156,7 +155,7 @@ pub(crate) fn add(c: C, d: Duration) {
+     let i = c as usize;
+     ALL[i][0].fetch_add(1, Ordering::Relaxed);
+     ALL[i][1].fetch_add(ns, Ordering::Relaxed);
+-    if SUBMIT.with(|s| s.get()) {
++    if SUBMIT.try_with(|s| s.get()).unwrap_or(false) {
+         IN_SUBMIT[i][0].fetch_add(1, Ordering::Relaxed);
+         IN_SUBMIT[i][1].fetch_add(ns, Ordering::Relaxed);
+     }
+@@ -212,12 +211,12 @@ pub(crate) struct InSubmit(bool);
+ impl Drop for InSubmit {
+     fn drop(&mut self) {
+         let was = self.0;
+-        SUBMIT.with(|s| s.set(was));
++        let _ = SUBMIT.try_with(|s| s.set(was));
+     }
+ }
+ 
+ pub(crate) fn in_submit() -> InSubmit {
+-    InSubmit(SUBMIT.with(|s| s.replace(true)))
++    InSubmit(SUBMIT.try_with(|s| s.replace(true)).unwrap_or(false))
+ }
+ 
+ /// [all calls, all ns, in-submit calls, in-submit ns] of every kind.
+-- 
+2.46.0.windows.1
+

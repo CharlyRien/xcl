@@ -1,0 +1,36 @@
+From b62a259ee164166a71bf7723628e7d7bffc9b6db Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 06:38:05 +0100
+Subject: [PATCH 03/14] Lab: call stats test locks the Mutex behind its Arc
+ explicitly
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/call_stats.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/call_stats.rs b/crates/xcl/src/hle/d3d12x/call_stats.rs
+index 81f57c2b..84a962dd 100644
+--- a/crates/xcl/src/hle/d3d12x/call_stats.rs
++++ b/crates/xcl/src/hle/d3d12x/call_stats.rs
+@@ -279,7 +279,7 @@ mod tests {
+         assert!(d[1] >= 15_000_000 && d[3] >= 5_000_000 && d[3] < d[1], "{d:?}");
+         // a lock got at once: a call and no time; one held by another thread: the wait
+         let m = std::sync::Arc::new(Mutex::new(0u32));
+-        drop(lock(&m, C::LockTextures));
++        drop(lock(&*m, C::LockTextures));
+         let m2 = m.clone();
+         let (tx, rx) = std::sync::mpsc::channel();
+         let h = std::thread::spawn(move || {
+@@ -288,7 +288,7 @@ mod tests {
+             std::thread::sleep(Duration::from_millis(30));
+         });
+         rx.recv().unwrap();
+-        *lock(&m, C::LockTextures) += 1;
++        *lock(&*m, C::LockTextures) += 1;
+         h.join().unwrap();
+         let d = delta(&s0, &snapshot(), C::LockTextures);
+         assert_eq!(d[0], 2);
+-- 
+2.46.0.windows.1
+

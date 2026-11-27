@@ -1,0 +1,244 @@
+From 193c039d77232d7da8804ce8b7c0786d0a25e937 Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:13:03 +0100
+Subject: [PATCH 11/14] Lab: XCL_FENCE_DIRECT=2 - XCL's fence probes land
+ finished copies back, without a spin or a wait
+
+With XCL_FENCE_DIRECT=1 XCL's own fence probes (alloc_pool
+note_resubmits / in_flight / allocator_in_flight, sparse
+drain_quarantined, list_x internal waits, vram) skipped the title
+hook, and with it the hook's settle of copies back. ~480 of the ~490
+GetCompletedValue calls a frame were those probes, note_resubmits once
+per chunk inside every title submit: they were what put the GPU's
+copies into title memory in the CPU's view before the next submit's
+look and texture uploads. Without them only the readback thread (one
+try_lock every 500 us, refused while the state is busy) and the
+title's own ~10 fence calls a frame landed them. FIX2 (v1 + the filter
+index) showed isolated green texels; FIX3 (the same without v1) none.
+
+XCL_FENCE_DIRECT=2 keeps v1's direct read and then calls
+sparse::land_finished_nowait: with copies back pending, one try_lock
+of the sparse state and drain_readbacks(Drain::Finished). No spin, no
+wait: a copy still running is left to the next probe, the title's
+fence calls or the readback thread (the hook waited for one whose
+title work was done). Unset and =1 behave as before.
+
+Test: an adopted fence's probe, after a GPU copy into title memory and
+its copy back finished, finds the bytes in the CPU's view with the
+switch unset (the hook) and with v2; v1 printed only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/real.rs   | 72 ++++++++++++++---------
+ crates/xcl/src/hle/d3d12x/sparse.rs | 90 +++++++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+), 27 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index afb5ee30..dfc677e3 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -8462,50 +8462,68 @@ pub(super) fn set_fence_fast(on: Option<bool>) {
+     );
+ }
+ 
+-/// lab `XCL_FENCE_DIRECT=1` (off by default): 0 not read yet, 1 off, 2 on
++/// lab `XCL_FENCE_DIRECT=1|2` (off by default): 0 not read yet, 1 off, 2 v1, 3 v2
+ static FENCE_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+ 
+-/// lab `XCL_FENCE_DIRECT=1`: XCL's own probes of a fence (`probe_completed`) read the PC's
+-/// value (`fence_completed`), not the title's hooked GetCompletedValue.
+-pub(super) fn fence_direct() -> bool {
++/// lab `XCL_FENCE_DIRECT`: how XCL's own probes of a fence (`probe_completed`) read it. 0 (unset):
++/// the COM call, as before. 1 (v1): the PC's value (`fence_completed`), not the title's hooked
++/// GetCompletedValue. 2 (v2): the PC's value, then the copies back the GPU has finished land
++/// (`sparse::land_finished_nowait`: one try of the sparse lock, no spin, no wait).
++pub(super) fn fence_direct_mode() -> u8 {
+     match FENCE_DIRECT.load(Ordering::Relaxed) {
+         0 => {
+-            let on = std::env::var("XCL_FENCE_DIRECT").is_ok_and(|v| v == "1");
+-            FENCE_DIRECT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+-            if on {
++            let mode = match std::env::var("XCL_FENCE_DIRECT").as_deref() {
++                Ok("1") => 1,
++                Ok("2") => 2,
++                _ => 0,
++            };
++            FENCE_DIRECT.store(mode + 1, Ordering::Relaxed);
++            if mode == 1 {
+                 crate::xlog_info!("lab XCL_FENCE_DIRECT=1: XCL's own fence probes read the PC's value, without the title hook's settle of copies back");
++            } else if mode == 2 {
++                crate::xlog_info!("lab XCL_FENCE_DIRECT=2: XCL's own fence probes read the PC's value and land the copies back the GPU finished, with one try of the sparse lock and no wait");
+             }
+-            on
++            mode
+         }
+-        v => v == 2,
++        v => v - 1,
+     }
+ }
+ 
+-/// tests: the switch as `on` says (None: read from the environment again)
++/// Whether XCL's own probes bypass the title's hook (`XCL_FENCE_DIRECT` 1 or 2)
++pub(super) fn fence_direct() -> bool {
++    fence_direct_mode() != 0
++}
++
++/// tests: the switch as `on` says (None: read from the environment again; Some(true): v1)
+ #[cfg(test)]
+ pub(super) fn set_fence_direct(on: Option<bool>) {
+-    FENCE_DIRECT.store(
+-        match on {
+-            None => 0,
+-            Some(false) => 1,
+-            Some(true) => 2,
+-        },
+-        Ordering::Relaxed,
+-    );
++    set_fence_direct_mode(on.map(|v| if v { 1 } else { 0 }));
++}
++
++/// tests: the mode (0 off, 1 v1, 2 v2; None: read from the environment again)
++#[cfg(test)]
++pub(super) fn set_fence_direct_mode(mode: Option<u8>) {
++    FENCE_DIRECT.store(mode.map_or(0, |m| m + 1), Ordering::Relaxed);
+ }
+ 
+ /// The completed value of `fence` for one of XCL's own probes (alloc_pool, sparse quarantine,
+ /// list_x internal waits, vram): the COM call as before (on an adopted fence that is the title's
+-/// hook, `fence_get_completed_value`), or with `XCL_FENCE_DIRECT=1` the PC's value. The hook
+-/// adds `sparse::settle_readbacks_try`, which spins ~2 ms for the sparse state's lock while
+-/// another thread holds it, and always does when its own caller holds it (`drain_quarantined`).
+-/// The value read is the same; what the probe leaves out is an early landing of copies back,
+-/// which the title's own fence calls, `fence_wait_fired` and the readback thread still do.
++/// hook, `fence_get_completed_value`), or with `XCL_FENCE_DIRECT` the PC's value. The hook adds
++/// `sparse::settle_readbacks_try`, which spins ~2 ms for the sparse state's lock while another
++/// thread holds it, and always does when its own caller holds it (`drain_quarantined`). The
++/// value read is the same. v1 leaves out the hook's landing of copies back: with ~480 probes a
++/// frame, that landing was what put the GPU's writes into the CPU's view before the next look
++/// (FIX2: isolated green texels with v1, none without it in FIX3). v2 keeps the landing of the
++/// finished copies, without the spin and without the hook's wait for a copy still running.
+ pub(super) unsafe fn probe_completed(fence: &ID3D12Fence) -> u64 {
+-    if fence_direct() {
+-        fence_completed(fence)
+-    } else {
+-        fence.GetCompletedValue()
++    match fence_direct_mode() {
++        0 => fence.GetCompletedValue(),
++        1 => fence_completed(fence),
++        _ => {
++            let v = fence_completed(fence);
++            super::sparse::land_finished_nowait();
++            v
++        }
+     }
+ }
+ 
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index b8dd1882..138c172a 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -1999,6 +1999,32 @@ pub unsafe fn settle_readbacks_try() {
+     }
+ }
+ 
++/// lab `XCL_FENCE_DIRECT=2`: at one of XCL's own fence probes (`real::probe_completed`), what the
++/// title hook's settle did there, without its spin and its wait: with copies back pending and the
++/// state free, those the GPU has finished land now (`Drain::Finished`). One `try_lock`: nothing when
++/// another thread or the caller itself holds the state (`drain_quarantined`); never a wait for a
++/// copy still running (the hook waited for one whose title work was done: the next probe, the
++/// title's own fence calls or the readback thread land it).
++pub unsafe fn land_finished_nowait() {
++    if RB_PENDING.load(Ordering::Acquire) == 0 {
++        return;
++    }
++    let Ok(mut g) = STATE.try_lock() else { return };
++    let Some(s) = g.as_mut() else { return };
++    let before = s.rb_jobs.len();
++    s.drain_readbacks(Drain::Finished);
++    let landed = before - s.rb_jobs.len();
++    if landed > 0 {
++        let k = PROBE_LANDINGS.fetch_add(1, Ordering::Relaxed) + 1;
++        if k <= 4 || k.is_power_of_two() {
++            crate::xlog_info!("lab XCL_FENCE_DIRECT=2: probe landing #{k}: {landed} copies back landed");
++        }
++    }
++}
++
++/// lab `XCL_FENCE_DIRECT=2`: fence probes that landed copies back
++static PROBE_LANDINGS: AtomicU64 = AtomicU64::new(0);
++
+ /// The thread that moves finished copies back into the title's memory, so it sees what its
+ /// lists wrote without submitting again (started with the first copy back).
+ fn start_readback_thread() {
+@@ -4203,4 +4229,68 @@ mod tests {
+             println!("fence_completed x 20000 on an adopted fence: off {:?}, on {:?}", took[0], took[1]);
+         }
+     }
++
++    /// lab `XCL_FENCE_DIRECT=2`: a GPU write into title memory whose copy back has finished is in
++    /// the CPU's view after one of XCL's own fence probes, as with the title hook's settle (switch
++    /// unset): what a texture upload from that memory at the next look reads. v1 left it to the
++    /// readback thread (printed, not asserted: that thread may land it meanwhile).
++    #[test]
++    fn a_v2_fence_probe_lands_finished_copies_back_as_the_hook_did() {
++        use crate::hle::d3d12x::real;
++        use windows_sys::Win32::System::Memory::MEM_RELEASE;
++        unsafe {
++            let (base, mut s) = test_state_with_reserved(1);
++            assert!(s.rbq.is_some(), "copies back run on their own queue (asynchronously)");
++            assert!(!VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
++            s.commit_range(base, TILE);
++            let dev = s.dev.clone();
++            let reserved = s.windows[0].1.clone();
++            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
++            // XCL's probe goes to an adopted fence (the title's hook on it), as alloc_pool's do in the game
++            let probe: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("probe fence");
++            real::adopt(probe.as_raw(), real::Kind::Fence);
++            let pending_before = RB_PENDING.load(Ordering::Acquire);
++            let _restore = LabRestore(|| real::set_fence_direct_mode(None), 0);
++            let prev = STATE.lock().unwrap_or_else(|e| e.into_inner()).take();
++            let mut landed = Vec::new();
++            for (round, mode) in [0u8, 2, 1].into_iter().enumerate() {
++                let tag = 0x5100_0000 | ((round as u32) << 16);
++                let up = lab_upload(&dev, 64, |i| tag | i);
++                std::ptr::write_bytes(base as *mut u8, 0, 256);
++                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
++                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
++                list.CopyBufferRegion(&reserved, 0, &up, 0, 256);
++                list.Close().expect("close");
++                title.Wait(&s.fence, s.value).expect("wait for the tile mapping");
++                title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
++                s.after_execute(&title, &[(base, 256)]);
++                // the title's work and its copy back are done on the GPU; nothing landed yet
++                let (done, done_v) = {
++                    let j = s.rb_jobs.back().expect("a copy back pending");
++                    (s.rb_job_fences(j).expect("its fences").1, j.done_v)
++                };
++                assert!(wait_fence(&done, done_v), "the copy back finishes");
++                assert_eq!(*(base as *const u32), 0, "round {round}: nothing lands before a probe");
++                *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
++                real::set_fence_direct_mode(Some(mode));
++                let c0 = PROBE_LANDINGS.load(Ordering::Relaxed);
++                let _ = real::probe_completed(&probe);
++                if mode == 2 {
++                    println!("v2 probe landings: {}", PROBE_LANDINGS.load(Ordering::Relaxed) - c0);
++                }
++                s = STATE.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the state back");
++                let ok = (0..64u32).all(|i| *(base as *const u32).add(i as usize) == tag | i);
++                landed.push(ok);
++                // (what is left lands before the next round)
++                s.drain_readbacks(Drain::Finished);
++            }
++            *STATE.lock().unwrap_or_else(|e| e.into_inner()) = prev;
++            println!("copy back landed by a probe: switch unset (hook) {}, v2 {}, v1 {} (v1: only if the readback thread got there)", landed[0], landed[1], landed[2]);
++            assert!(landed[0], "switch unset: the title hook's settle lands the finished copy back");
++            assert!(landed[1], "v2: the probe lands the finished copy back, as the hook did");
++            assert_eq!(RB_PENDING.load(Ordering::Acquire), pending_before, "every copy back landed in the end");
++            drop(s);
++            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
++        }
++    }
+ }
+-- 
+2.46.0.windows.1
+

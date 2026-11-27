@@ -1,0 +1,250 @@
+From 6190bb7de3ccc6c90e21e66f38c504124cdb5d33 Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:38:41 +0100
+Subject: [PATCH 05/14] Lab: XCL_FENCE_DIRECT=1 - XCL's own fence probes skip
+ the title's GetCompletedValue hook
+
+alloc_pool (note_resubmits, in_flight, allocator_in_flight), sparse
+drain_quarantined, list_x note_internal_wait / internal_waits_summary
+and vram (scrub, zeroer, retire sweep) asked their adopted fences
+through the COM call, which is the title's hook: it settles copies
+back, trying the sparse state's lock for ~2 ms. drain_quarantined and
+note_internal_wait do so with that lock held, so the try always failed.
+
+real::probe_completed is the COM call as before, or with the lab switch
+the PC's value (real::fence_completed). Off by default. The value read
+is the same; copies back still land from the title's own fence calls,
+fence_wait_fired and the readback thread.
+
+Test: an adopted WARP fence with a copy back pending and the state held
+reads the same value both ways; off takes the hook's >= 2 ms, on < 1 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/alloc_pool.rs |  6 +--
+ crates/xcl/src/hle/d3d12x/list_x.rs     |  4 +-
+ crates/xcl/src/hle/d3d12x/real.rs       | 47 ++++++++++++++++++++
+ crates/xcl/src/hle/d3d12x/sparse.rs     | 59 ++++++++++++++++++++++++-
+ crates/xcl/src/hle/d3d12x/vram.rs       |  6 +--
+ 5 files changed, 113 insertions(+), 9 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/alloc_pool.rs b/crates/xcl/src/hle/d3d12x/alloc_pool.rs
+index 94f13b2d..a4b89603 100644
+--- a/crates/xcl/src/hle/d3d12x/alloc_pool.rs
++++ b/crates/xcl/src/hle/d3d12x/alloc_pool.rs
+@@ -171,7 +171,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
+     for &l in lists {
+         let l = l as usize;
+         let Some(last) = s.last_submit.get(&l) else { continue };
+-        if last.fence.GetCompletedValue() >= last.value {
++        if super::real::probe_completed(&last.fence) >= last.value {
+             continue;
+         }
+         let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
+@@ -194,7 +194,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
+ /// submitted again before that; `title_list` records the title's next recording elsewhere).
+ pub fn in_flight(list: usize) -> bool {
+     let g = STATE.lock().unwrap();
+-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
++    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::probe_completed(&l.fence) } < l.value)
+ }
+ 
+ /// `lists` were just submitted to `queue`.
+@@ -235,7 +235,7 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
+     let g = STATE.lock().unwrap();
+     let Some(s) = g.as_ref() else { return false };
+     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
+-    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
++    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| super::real::probe_completed(f) < *v));
+     busy
+ }
+ 
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index 7b0d13b9..5df5fa38 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -1281,7 +1281,7 @@ static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex:
+ pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D12Fence, value: u64) {
+     let mut g = INTERNAL_WAITS.lock().unwrap();
+     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
+-    waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
++    waits.retain(|w| unsafe { super::real::probe_completed(&w.fence) } < w.value);
+     waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
+ }
+ 
+@@ -1293,7 +1293,7 @@ fn internal_waits_summary() -> String {
+             .flat_map(|m| m.iter())
+             .flat_map(|(&q, waits)| waits.iter().map(move |w| (q, w)))
+             .filter_map(|(q, w)| {
+-                let done = unsafe { w.fence.GetCompletedValue() };
++                let done = unsafe { super::real::probe_completed(&w.fence) };
+                 (done < w.value).then(|| (q, format!("{} >= {:#x} (done {done:#x}, {} ms)", w.what, w.value, w.at.elapsed().as_millis())))
+             })
+             .collect()
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 0794c02e..3fdaa5f8 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -8416,6 +8416,53 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+     f(p)
+ }
+ 
++/// lab `XCL_FENCE_DIRECT=1` (off by default): 0 not read yet, 1 off, 2 on
++static FENCE_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
++
++/// lab `XCL_FENCE_DIRECT=1`: XCL's own probes of a fence (`probe_completed`) read the PC's
++/// value (`fence_completed`), not the title's hooked GetCompletedValue.
++pub(super) fn fence_direct() -> bool {
++    match FENCE_DIRECT.load(Ordering::Relaxed) {
++        0 => {
++            let on = std::env::var("XCL_FENCE_DIRECT").is_ok_and(|v| v == "1");
++            FENCE_DIRECT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
++            if on {
++                crate::xlog_info!("lab XCL_FENCE_DIRECT=1: XCL's own fence probes read the PC's value, without the title hook's settle of copies back");
++            }
++            on
++        }
++        v => v == 2,
++    }
++}
++
++/// tests: the switch as `on` says (None: read from the environment again)
++#[cfg(test)]
++pub(super) fn set_fence_direct(on: Option<bool>) {
++    FENCE_DIRECT.store(
++        match on {
++            None => 0,
++            Some(false) => 1,
++            Some(true) => 2,
++        },
++        Ordering::Relaxed,
++    );
++}
++
++/// The completed value of `fence` for one of XCL's own probes (alloc_pool, sparse quarantine,
++/// list_x internal waits, vram): the COM call as before (on an adopted fence that is the title's
++/// hook, `fence_get_completed_value`), or with `XCL_FENCE_DIRECT=1` the PC's value. The hook
++/// adds `sparse::settle_readbacks_try`, which spins ~2 ms for the sparse state's lock while
++/// another thread holds it, and always does when its own caller holds it (`drain_quarantined`).
++/// The value read is the same; what the probe leaves out is an early landing of copies back,
++/// which the title's own fence calls, `fence_wait_fired` and the readback thread still do.
++pub(super) unsafe fn probe_completed(fence: &ID3D12Fence) -> u64 {
++    if fence_direct() {
++        fence_completed(fence)
++    } else {
++        fence.GetCompletedValue()
++    }
++}
++
+ /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
+ /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
+ unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index 2f601913..5406fd33 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -2118,7 +2118,7 @@ impl State {
+     unsafe fn drain_quarantined(&mut self) -> bool {
+         let mut freed = false;
+         while let Some(front) = self.quarantined.front() {
+-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v));
++            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| super::real::probe_completed(f) >= *v));
+             if !ready {
+                 break;
+             }
+@@ -3588,4 +3588,61 @@ mod tests {
+             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+         }
+     }
++
++    /// A D3D12 device for the lab switch tests (WARP if there is no GPU).
++    unsafe fn lab_device() -> ID3D12Device {
++        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
++        use windows::Win32::Graphics::Dxgi::*;
++        let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
++        let mut dev: Option<ID3D12Device> = None;
++        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
++            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
++            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
++        }
++        dev.expect("D3D12 device")
++    }
++
++    /// Puts a lab switch back to "read from the environment" and `RB_PENDING` back, also when
++    /// a test panics.
++    struct LabRestore(fn(), usize);
++
++    impl Drop for LabRestore {
++        fn drop(&mut self) {
++            (self.0)();
++            RB_PENDING.fetch_sub(self.1, Ordering::Release);
++        }
++    }
++
++    /// lab `XCL_FENCE_DIRECT=1`: XCL's own probe of an adopted fence reads the same value with
++    /// the switch on and off. Off it is the COM call, the title's hook: with copies back pending
++    /// and the sparse state held (here by this thread, as `drain_quarantined` holds it), the hook
++    /// tries the lock for ~2 ms. On it reads the PC's value and does not wait for that lock.
++    #[test]
++    fn a_direct_fence_probe_reads_the_same_value_without_the_hooks_wait() {
++        use crate::hle::d3d12x::real;
++        unsafe {
++            let dev = lab_device();
++            let fence: ID3D12Fence = dev.CreateFence(5, D3D12_FENCE_FLAG_NONE).expect("fence");
++            fence.Signal(9).expect("CPU signal");
++            real::adopt(fence.as_raw(), real::Kind::Fence);
++            assert!(real::is_adopted(fence.as_raw()), "the fence is adopted (the title's hooks)");
++            RB_PENDING.fetch_add(1, Ordering::Release);
++            let _restore = LabRestore(|| real::set_fence_direct(None), 1);
++            let held = STATE.lock().unwrap_or_else(|e| e.into_inner());
++            real::set_fence_direct(Some(false));
++            let t = std::time::Instant::now();
++            let off = real::probe_completed(&fence);
++            let took_off = t.elapsed();
++            real::set_fence_direct(Some(true));
++            let t = std::time::Instant::now();
++            let on = real::probe_completed(&fence);
++            let took_on = t.elapsed();
++            drop(held);
++            assert_eq!((off, on), (9, 9), "the same completed value, switch off and on");
++            assert_eq!(fence.GetCompletedValue(), 9, "the COM call agrees");
++            assert!(took_off >= std::time::Duration::from_millis(2), "off: the probe is the title's hook, which tries the lock ~2 ms ({took_off:?})");
++            assert!(took_on < std::time::Duration::from_millis(1), "on: the probe does not wait for the sparse state's lock ({took_on:?})");
++            println!("fence probe with the state held and a copy back pending: off {took_off:?}, on {took_on:?}");
++        }
++    }
+ }
+diff --git a/crates/xcl/src/hle/d3d12x/vram.rs b/crates/xcl/src/hle/d3d12x/vram.rs
+index 2baf663a..351d39d4 100644
+--- a/crates/xcl/src/hle/d3d12x/vram.rs
++++ b/crates/xcl/src/hle/d3d12x/vram.rs
+@@ -934,7 +934,7 @@ impl Pages {
+         sorted.sort_unstable();
+         for chunk in sorted.chunks(SCRUB_TILES) {
+             // a list whose last copy has run, or a new one
+-            let done = self.fence.GetCompletedValue();
++            let done = super::real::probe_completed(&self.fence);
+             let Some(sc) = self.scrub.as_mut() else { return };
+             let k = match sc.lists.iter().position(|l| l.2 <= done) {
+                 Some(k) => k,
+@@ -1142,7 +1142,7 @@ impl Pages {
+                 let slot = &z.slots[z.next_slot];
+                 (slot.alloc.clone(), slot.list.clone(), slot.fence_val, z.scratch_buf.clone(), z.zero_buf.clone())
+             };
+-            if fence_val > 0 && self.fence.GetCompletedValue() < fence_val {
++            if fence_val > 0 && super::real::probe_completed(&self.fence) < fence_val {
+                 let _ = super::call_stats::cs!(FenceSetEvent, self.fence.SetEventOnCompletion(fence_val, windows::Win32::Foundation::HANDLE::default()));
+             }
+             if alloc.Reset().is_err() || list.Reset(&alloc, None).is_err() {
+@@ -1916,7 +1916,7 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
+         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
+         let before = rq.batches.len();
+         let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
+-        let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
++        let (done, pruned) = rq.sweep_with(&live_keys, |f| super::real::probe_completed(f));
+         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
+         (immediate, done, pruned)
+     };
+-- 
+2.46.0.windows.1
+
