@@ -1,0 +1,138 @@
+From d49b7db13a154006ccb2bb08dd39923839080624 Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:06:16 +0100
+Subject: [PATCH 28/29] Lab: XCL_RT_WATCH counts DispatchX calls with flag 0x20
+ (thread dimensions), not those without 0x8000
+
+0x8000 is the wave32 bit of the dispatch initiator; USE_THREAD_DIMENSIONS is 0x20 (VIctory#2750,
+XCL PR #2610). The counters line now names, per builder record, the DispatchX calls whose x counts
+threads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/rt_watch.rs | 34 +++++++++++++--------------
+ 1 file changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/rt_watch.rs b/crates/xcl/src/hle/d3d12x/rt_watch.rs
+index 867aeb19..438ef3f7 100644
+--- a/crates/xcl/src/hle/d3d12x/rt_watch.rs
++++ b/crates/xcl/src/hle/d3d12x/rt_watch.rs
+@@ -17,8 +17,8 @@
+ //! * for the records of `XCL_RT_WATCH_RECORDS` (a file, one record hash first on each line: the
+ //!   builder's programs): pipelines created, dispatches launched, put off to the submit (counted
+ //!   again when recorded there), without a translated pipeline (skipped), failed; put-off
+-//!   dispatches dropped (any pipeline); their DispatchX calls: how many, how many without flag
+-//!   0x8000 (with it missing, x may count threads, not groups: XCL launches x groups either way),
++//!   dispatches dropped (any pipeline); their DispatchX calls: how many, how many with flag 0x20
++//!   (thread dimensions: x counts threads; XCL launches x groups unless `XCL_DISPATCHX_FLAGS=1`),
+ //!   the largest x and the flags seen.
+ //!
+ //! Record hashes are XCL's (`fnv64` of the console shader container); the source names no
+@@ -38,8 +38,8 @@ const MOST_TARGETS: usize = 32;
+ const PEEKS: usize = 12;
+ /// bytes of a writer's target compared
+ const TARGET_BYTES: usize = 16;
+-/// the DispatchX flag whose absence is counted
+-const FLAG_8000: u32 = 0x8000;
++/// the DispatchX flag counted: USE_THREAD_DIMENSIONS (0x8000 is the wave32 bit)
++const FLAG_THREADS: u32 = 0x20;
+ 
+ /// The period of `XCL_RT_WATCH`: frames, at least 30 (`None`: off).
+ pub fn period_of(value: &str) -> Option<u64> {
+@@ -105,7 +105,7 @@ pub struct Counts {
+     pub untranslated: u64,
+     pub failed: u64,
+     pub dx_calls: u64,
+-    pub dx_without_8000: u64,
++    pub dx_threads: u64,
+     pub dx_max_x: u32,
+     /// the flags of the first DispatchX calls, up to 4 distinct ones (0 = none)
+     pub dx_flags: [u32; 4],
+@@ -123,11 +123,11 @@ impl Counts {
+ 
+     pub fn add_dispatch_x(&mut self, x: u32, flags: u32) {
+         self.dx_calls += 1;
+-        if flags & FLAG_8000 == 0 {
+-            self.dx_without_8000 += 1;
++        if flags & FLAG_THREADS != 0 {
++            self.dx_threads += 1;
+         }
+         self.dx_max_x = self.dx_max_x.max(x);
+-        // (flags 0 cannot be told from an empty slot: kept as seen through dx_without_8000)
++        // (flags 0 cannot be told from an empty slot: such calls count in dx_calls only)
+         if flags != 0 && !self.dx_flags.contains(&flags) {
+             if let Some(slot) = self.dx_flags.iter_mut().find(|f| **f == 0) {
+                 *slot = flags;
+@@ -138,7 +138,7 @@ impl Counts {
+ 
+ /// The counters line of the builder's records: totals, records seen, records whose dispatches
+ /// never launched, up to 8 records with dispatches that did not launch, and the DispatchX
+-/// calls without flag 0x8000 by record.
++/// calls with thread dimensions (flag 0x20) by record.
+ pub fn counts_line(records: &BTreeMap<u64, Counts>, wanted: usize, dropped: u64) -> String {
+     let mut t = Counts::default();
+     for c in records.values() {
+@@ -148,7 +148,7 @@ pub fn counts_line(records: &BTreeMap<u64, Counts>, wanted: usize, dropped: u64)
+         t.untranslated += c.untranslated;
+         t.failed += c.failed;
+         t.dx_calls += c.dx_calls;
+-        t.dx_without_8000 += c.dx_without_8000;
++        t.dx_threads += c.dx_threads;
+     }
+     let made = records.values().filter(|c| c.pipelines > 0).count();
+     let dispatched = records.values().filter(|c| c.launched + c.put_off + c.untranslated + c.failed > 0).count();
+@@ -161,14 +161,14 @@ pub fn counts_line(records: &BTreeMap<u64, Counts>, wanted: usize, dropped: u64)
+         .collect();
+     let dx: Vec<String> = records
+         .iter()
+-        .filter(|(_, c)| c.dx_without_8000 > 0)
++        .filter(|(_, c)| c.dx_threads > 0)
+         .map(|(h, c)| {
+             let flags: Vec<String> = c.dx_flags.iter().filter(|&&f| f != 0).map(|f| format!("{f:#x}")).collect();
+-            format!("{h:016x} {}/{} max x {} flags [{}]", c.dx_without_8000, c.dx_calls, c.dx_max_x, flags.join(" "))
++            format!("{h:016x} {}/{} max x {} flags [{}]", c.dx_threads, c.dx_calls, c.dx_max_x, flags.join(" "))
+         })
+         .collect();
+     format!(
+-        "builder records: {made} of {wanted} with a pipeline ({} pipelines), {dispatched} dispatched; dispatches launched {}, put off {}, without a translated pipeline {}, failed {}; put-off dispatches dropped (any pipeline) {dropped}; records never launched: [{}]; records with skips (launched/put off/untranslated/failed): [{}]; DispatchX {} calls, {} without flag 0x8000 (record without/calls, largest x, flags): [{}]",
++        "builder records: {made} of {wanted} with a pipeline ({} pipelines), {dispatched} dispatched; dispatches launched {}, put off {}, without a translated pipeline {}, failed {}; put-off dispatches dropped (any pipeline) {dropped}; records never launched: [{}]; records with skips (launched/put off/untranslated/failed): [{}]; DispatchX {} calls, {} with flag 0x20 (thread counts) (record with/calls, largest x, flags): [{}]",
+         t.pipelines,
+         t.launched,
+         t.put_off,
+@@ -177,7 +177,7 @@ pub fn counts_line(records: &BTreeMap<u64, Counts>, wanted: usize, dropped: u64)
+         never.join(" "),
+         bad.join("; "),
+         t.dx_calls,
+-        t.dx_without_8000,
++        t.dx_threads,
+         dx.join("; ")
+     )
+ }
+@@ -440,13 +440,13 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn rt_watch_counts_line_names_records_that_never_launched_and_dispatch_x_without_the_flag() {
++    fn rt_watch_counts_line_names_records_that_never_launched_and_dispatch_x_with_thread_counts() {
+         let mut m = BTreeMap::new();
+         let mut a = Counts { pipelines: 1, ..Default::default() };
+         a.add(Outcome::Launched);
+         a.add(Outcome::PutOff);
+         a.add(Outcome::Launched);
+-        a.add_dispatch_x(5, 0x8020);
++        a.add_dispatch_x(5, 0x8000);
+         let mut b = Counts { pipelines: 1, ..Default::default() };
+         b.add(Outcome::Untranslated);
+         b.add(Outcome::Failed);
+@@ -461,7 +461,7 @@ mod tests {
+         assert!(l.starts_with("builder records: 3 of 52 with a pipeline (3 pipelines), 2 dispatched; dispatches launched 2, put off 1, without a translated pipeline 1, failed 1; put-off dispatches dropped (any pipeline) 4;"), "{l}");
+         assert!(l.contains("records never launched: [2222222222222222]"), "{l}");
+         assert!(l.contains("records with skips (launched/put off/untranslated/failed): [2222222222222222 0/0/1/1]"), "{l}");
+-        assert!(l.ends_with("DispatchX 4 calls, 2 without flag 0x8000 (record without/calls, largest x, flags): [2222222222222222 2/3 max x 1038 flags [0x20 0x8020]]"), "{l}");
++        assert!(l.ends_with("DispatchX 4 calls, 3 with flag 0x20 (thread counts) (record with/calls, largest x, flags): [2222222222222222 3/3 max x 1038 flags [0x20 0x8020]]"), "{l}");
+     }
+ 
+     #[test]
+-- 
+2.46.0.windows.1
+

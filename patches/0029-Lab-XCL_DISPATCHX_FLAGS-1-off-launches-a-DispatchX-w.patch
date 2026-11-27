@@ -1,0 +1,252 @@
+From f3caae0990ec4c06ac904b627b03347137f275af Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:06:16 +0100
+Subject: [PATCH 29/29] Lab: XCL_DISPATCHX_FLAGS=1 (off) launches a DispatchX
+ with thread dimensions as whole groups
+
+With flag 0x20 (USE_THREAD_DIMENSIONS) x, y, z are thread counts: the console launches
+ceil(count / numthreads) groups and leaves the lanes past the count out of EXEC. XCL dropped the
+flags and launched the counts as groups (32-64 times the groups the builder's passes want). With
+the switch, DispatchX passes its flags on (a put-off dispatch keeps them) and the counts become
+whole groups of the program's console numthreads (kept per pipeline from the console CS); a
+pipeline whose group shape is not known is not launched. The lanes past the count in the last
+group still run: masking them needs the translator (PR #3015) and is not here.
+
+Host side of XCL PR #2610 (KDenKC, GPL-3.0-or-later: dispatch_groups, pso_threads, the deferred
+flags), behind a switch; numthreads kept in a map of its own instead of widening PSO_USER_SGPRS.
+Not in TRANSLATOR_SOURCES (recomp/pso.rs, bind.rs, list_x.rs, real.rs).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/gpu/recomp/pso.rs    | 14 +++++
+ crates/xcl/src/hle/d3d12x/bind.rs   | 80 ++++++++++++++++++++++++++++-
+ crates/xcl/src/hle/d3d12x/list_x.rs |  8 +--
+ crates/xcl/src/hle/d3d12x/real.rs   | 21 ++++++++
+ 4 files changed, 119 insertions(+), 4 deletions(-)
+
+diff --git a/crates/xcl/src/gpu/recomp/pso.rs b/crates/xcl/src/gpu/recomp/pso.rs
+index bd54e630..937ac53a 100644
+--- a/crates/xcl/src/gpu/recomp/pso.rs
++++ b/crates/xcl/src/gpu/recomp/pso.rs
+@@ -994,6 +994,20 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+     }
+ }
+ 
++/// The console's group shape (`numthreads`) of a console compute program (None: not one).
++/// lab `XCL_DISPATCHX_FLAGS` (bind.rs); after `compute_interface` of PR #2610 (KDenKC, GPL-3.0-or-later).
++pub fn compute_threads(blob: &[u8]) -> Option<[u32; 3]> {
++    if let Some(f) = fspx(blob) {
++        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).threads);
++    }
++    let sh = xbox::parse(blob)?;
++    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
++    match interface(blob, &sh, f)? {
++        Mode::Compute(cs) => Some(cs.threads),
++        _ => None,
++    }
++}
++
+ /// The HLSL and profile a console program compiles from at pipeline creation (for
+ /// `xcl shaders --export-hlsl`: compile-time investigations outside a title).
+ pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool) -> Result<(String, &'static str), String> {
+diff --git a/crates/xcl/src/hle/d3d12x/bind.rs b/crates/xcl/src/hle/d3d12x/bind.rs
+index 81ecd185..3d2efd15 100644
+--- a/crates/xcl/src/hle/d3d12x/bind.rs
++++ b/crates/xcl/src/hle/d3d12x/bind.rs
+@@ -2062,6 +2062,40 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso:
+ 
+ /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
+ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
++    dispatch_flags(this, x, y, z, 0);
++}
++
++/// lab `XCL_DISPATCHX_FLAGS=1` (off by default): `DispatchX` passes its flags on. Port of the host
++/// side of PR #2610 (KDenKC, GPL-3.0-or-later, `dispatch_groups`); the masking of the lanes past
++/// the count (#3015) needs the translator and is not here: the last group runs whole.
++pub(super) fn dispatchx_flags_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var("XCL_DISPATCHX_FLAGS").is_ok_and(|v| v.trim() == "1");
++        if on {
++            crate::xlog_info!("lab XCL_DISPATCHX_FLAGS=1: a DispatchX with thread dimensions (flag 0x20) launches whole groups of the program's numthreads (the last group runs whole)");
++        }
++        on
++    })
++}
++
++/// `DispatchX` flag `USE_THREAD_DIMENSIONS` (bit 5 of the dispatch initiator): x, y, z are thread
++/// counts; the console launches whole groups and leaves the lanes past the count out of EXEC.
++/// (0x8000 is the wave32 bit: nothing to do here.)
++const DISPATCH_THREAD_DIMENSIONS: u32 = 0x20;
++
++/// The groups a dispatch of `dims` with `flags` launches on a program of group shape `threads`
++/// (None: thread dimensions with a group shape not known - not launched).
++pub(super) fn dispatch_groups(threads: Option<[u32; 3]>, dims: [u32; 3], flags: u32) -> Option<[u32; 3]> {
++    if flags & DISPATCH_THREAD_DIMENSIONS == 0 {
++        return Some(dims);
++    }
++    let t = threads?.map(|t| t.max(1));
++    Some(std::array::from_fn(|k| dims[k].div_ceil(t[k])))
++}
++
++/// `Dispatch` / `DispatchX(x, y, z, flags)` (flags 0 unless `XCL_DISPATCHX_FLAGS=1`).
++pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+     super::targets::note_dispatch();
+     let pso = with(this, |s| s.pso);
+     // lab XCL_RT_WATCH: the record of a watched pipeline (None when off)
+@@ -2071,7 +2105,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
+             super::rt_watch::note_args(r, &layout.params, &args);
+         }
+     }
+-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
++    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
+         super::rt_watch::seen(watched, super::rt_watch::Outcome::PutOff);
+         return super::pso_async::need_by_submit(pso);
+     }
+@@ -2088,6 +2122,31 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
+         count(DISPATCHES_SKIPPED);
+         return;
+     }
++    // (the group shape only looked up for thread dimensions: no lock on the plain path)
++    let threads = if flags & DISPATCH_THREAD_DIMENSIONS != 0 { super::real::pso_threads(pso) } else { None };
++    let Some([x, y, z]) = dispatch_groups(threads, [x, y, z], flags) else {
++        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
++            crate::xlog_warn!("D3D12.X: DispatchX of {x}x{y}x{z} threads (flags {flags:#x}) with a pipeline whose group shape is not known ({pso:#x}) skipped");
++        }
++        count(DISPATCHES_SKIPPED);
++        super::rt_watch::seen(watched, super::rt_watch::Outcome::Failed);
++        return;
++    };
++    if flags & DISPATCH_THREAD_DIMENSIONS != 0 {
++        // each flags value once: what the title passes, and what it launches
++        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
++        let first = {
++            let mut g = SEEN.lock().unwrap();
++            !g.contains(&flags) && {
++                g.push(flags);
++                true
++            }
++        };
++        if first {
++            crate::xlog_info!("lab XCL_DISPATCHX_FLAGS=1: DispatchX with flags {flags:#x} on {pso:#x}: launched as {x}x{y}x{z} groups of {threads:?}");
++        }
++    }
+     match translated_dispatch(this, list, pso, x, y, z) {
+         Ok(()) => {
+             count(DISPATCHES);
+@@ -3048,6 +3107,25 @@ mod tests {
+     use super::*;
+     use std::sync::atomic::AtomicUsize;
+ 
++    /// lab XCL_DISPATCHX_FLAGS: a `DispatchX` with thread dimensions (0x20) launches whole groups of
++    /// the program's numthreads; without the flag the counts are groups (cases of PR #2610's test,
++    /// KDenKC, GPL-3.0-or-later, and of VIctory#2750's controls).
++    #[test]
++    fn dispatch_x_thread_dimensions_become_whole_groups() {
++        let g64 = Some([64, 1, 1]);
++        assert_eq!(dispatch_groups(g64, [640, 1, 1], 0x20), Some([10, 1, 1]), "a whole last group");
++        assert_eq!(dispatch_groups(g64, [100, 1, 1], 0x20), Some([2, 1, 1]), "a cut-short last group runs whole");
++        assert_eq!(dispatch_groups(g64, [45, 1, 1], 0x20), Some([1, 1, 1]), "the title's 45 threads: one group, not 45");
++        assert_eq!(dispatch_groups(Some([32, 1, 1]), [82_606, 1, 1], 0x8020), Some([2_582, 1, 1]), "the wave32 bit changes nothing; under 65,535 groups");
++        assert_eq!(dispatch_groups(Some([8, 8, 1]), [20, 16, 3], 0x20), Some([3, 2, 3]));
++        assert_eq!(dispatch_groups(g64, [7, 2, 1], 0), Some([7, 2, 1]), "Dispatch: groups as they are");
++        assert_eq!(dispatch_groups(g64, [7, 2, 1], 0x8000), Some([7, 2, 1]), "the wave32 bit alone: groups");
++        assert_eq!(dispatch_groups(g64, [0, 1, 1], 0x20), Some([0, 1, 1]), "no threads, no groups");
++        assert_eq!(dispatch_groups(None, [100, 1, 1], 0x20), None, "thread dimensions, group shape not known: not launched");
++        assert_eq!(dispatch_groups(None, [100, 1, 1], 0), Some([100, 1, 1]));
++        assert_eq!(dispatch_groups(Some([0, 1, 1]), [5, 1, 1], 0x20), Some([5, 1, 1]), "a zero axis counts as 1");
++    }
++
+     /// The descriptor tables a draw binds are where its table arguments point (in unified
+     /// memory), constants and root buffers are not tables, and an unset table is none.
+     #[test]
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index 7d6176fd..29c5c3a7 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -698,7 +698,8 @@ struct ListState {
+ 
+ /// A `Dispatch` or a dispatching `ExecuteIndirect` put off to the submit, with its arguments.
+ pub(super) enum Deferred {
+-    Dispatch(u32, u32, u32),
++    /// x, y, z and `DispatchX`'s flags (0 for `Dispatch`; lab `XCL_DISPATCHX_FLAGS`)
++    Dispatch(u32, u32, u32, u32),
+     Indirect(usize, u32, usize, u64, usize, u64),
+ }
+ 
+@@ -2977,7 +2978,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
+             real::dispatch_chain::list_follows(last as usize, seg as usize);
+         }
+         match what {
+-            Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
++            Deferred::Dispatch(x, y, z, flags) => super::bind::dispatch_flags(seg, x, y, z, flags),
+             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
+         }
+         let ext = *(seg as *const usize);
+@@ -3350,7 +3351,8 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
+     if super::rt_watch::enabled() {
+         super::rt_watch::dispatch_x(super::bind::bound_pso(this), x, _flags);
+     }
+-    super::bind::dispatch(this, x, y, z);
++    // lab XCL_DISPATCHX_FLAGS=1: the flags reach the dispatch (else x, y, z are groups, as before)
++    super::bind::dispatch_flags(this, x, y, z, if super::bind::dispatchx_flags_on() { _flags } else { 0 });
+ }
+ 
+ /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 283dc0a5..911b7cba 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -2121,6 +2121,9 @@ fn forget_pso(pso: usize) {
+     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
+         m.remove(&pso);
+     }
++    if let Some(m) = PSO_THREADS.lock().unwrap().as_mut() {
++        m.remove(&pso);
++    }
+     super::device_x::forget_base(pso);
+     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
+     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
+@@ -4453,6 +4456,22 @@ pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
+     PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+ }
+ 
++/// lab `XCL_DISPATCHX_FLAGS`: the console's group shape (`numthreads`) of the console CS of a
++/// translated compute pipeline (after PR #2610's `pso_threads`, KDenKC, GPL-3.0-or-later)
++static PSO_THREADS: Mutex<Option<HashMap<usize, [u32; 3]>>> = Mutex::new(None);
++
++/// The console's group shape of a translated compute pipeline (None: not known).
++pub fn pso_threads(pso: usize) -> Option<[u32; 3]> {
++    let pso = super::pso_async::resolve(pso);
++    PSO_THREADS.lock().unwrap().as_ref()?.get(&pso).copied()
++}
++
++fn note_pso_threads(pso: usize, cs: &[u8]) {
++    if let Some(t) = crate::gpu::recomp::pso::compute_threads(cs) {
++        PSO_THREADS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, t);
++    }
++}
++
+ /// The root signature a translated pipeline state was created with.
+ pub fn pso_root_signature(pso: usize) -> Option<usize> {
+     let pso = super::pso_async::resolve(pso);
+@@ -4999,6 +5018,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const
+             if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+                 PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+             }
++            note_pso_threads(*ppv as usize, cs);
+             note_translated_compute(0, ppv);
+             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+             return Some(Ok(0));
+@@ -5038,6 +5058,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const
+     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+     }
++    note_pso_threads(*ppv as usize, cs);
+     note_translated_compute(hr, ppv);
+     crate::xlog_info!(
+         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+-- 
+2.46.0.windows.1
+

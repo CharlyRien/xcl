@@ -1,0 +1,41 @@
+From b36c0f1f4bf46c8f7e574132d0f62fba93409dee Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 15:31:55 +0100
+Subject: [PATCH 26/29] Lab: the memo test of view_mem counts the tile its memo
+ already held
+
+tiles_without_a_source_are_not_checked_again_while_fresh noted 200 001
+tiles in a memo that already held one, so the clear came at the last of
+them and the next note left 2 tiles, not 1: the test was wrong, not the
+memo (cleared past 200 000 tiles, as meant). The bound is now checked on
+a memo of its own: 200 001 tiles kept, the next note clears them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/view_mem.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/view_mem.rs b/crates/xcl/src/hle/d3d12x/view_mem.rs
+index 4d3d3b34..366fca9f 100644
+--- a/crates/xcl/src/hle/d3d12x/view_mem.rs
++++ b/crates/xcl/src/hle/d3d12x/view_mem.rs
+@@ -874,12 +874,15 @@ mod tests {
+         let mut r = Reach::new(0xD_0000_0000, MB, 8 * MB, usize::MAX);
+         assert!(!r.missing(0xD_0010_0000));
+         assert_eq!(r.reached(0xD_0011_0000), 0xD_0010_0000);
+-        // bounded: past 200 000 tiles it starts again
++        // bounded: past 200 000 tiles it starts again (a memo of its own: `m` holds a tile already)
++        let mut m = Misses::default();
+         for k in 0..200_001 {
+             m.note(k * TILE, now);
+         }
++        assert_eq!(m.0.len(), 200_001);
+         m.note(0xE_0000_0000, now);
+         assert_eq!(m.0.len(), 1);
++        assert!(!m.known(0, now, fresh));
+         assert!(m.known(0xE_0000_0000, now, fresh));
+     }
+ 
+-- 
+2.46.0.windows.1
+

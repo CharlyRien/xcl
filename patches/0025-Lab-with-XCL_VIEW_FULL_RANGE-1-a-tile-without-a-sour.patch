@@ -1,0 +1,200 @@
+From b60d611c28a59dc3f7e15f219a6df59a01a59a8c Mon Sep 17 00:00:00 2001
+From: CharlyRien <9572419+CharlyRien@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 15:13:03 +0100
+Subject: [PATCH 25/29] Lab: with XCL_VIEW_FULL_RANGE=1 a tile without a source
+ is not checked again while fresh
+
+A run with 64 MiB behind each root address (XCL_VIEW_ROOT_KB=65536) checked
+103 M tiles without a source (about 4.6 M with 1 MiB) and its pace fell
+apart: such a tile was looked up again at every range that named it, as
+nothing remembered a miss. With the switch a miss is kept (Misses, at most
+200 000 tiles, then cleared) and the tile not looked up again for
+XCL_VIEW_FRESH_MS, as a tile with a source is not checked again; a kept miss
+past the old bound ends a full range as a lookup would. Without the switch
+nothing changes.
+
+The stats line adds, atomics only: lookups without a source past the old
+bounds (where full ranges end, apart from "without a source"), misses not
+looked up again, the longest range in MB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/hle/d3d12x/view_mem.rs | 85 ++++++++++++++++++++++++---
+ 1 file changed, 78 insertions(+), 7 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/view_mem.rs b/crates/xcl/src/hle/d3d12x/view_mem.rs
+index eda8677b..4d3d3b34 100644
+--- a/crates/xcl/src/hle/d3d12x/view_mem.rs
++++ b/crates/xcl/src/hle/d3d12x/view_mem.rs
+@@ -20,7 +20,9 @@
+ //! (`real::outside_buffer_left`), else at a V#'s own size, else (a root, a V# over 16 MiB) at the
+ //! end of the run of tiles from its first one that have a source, at most `XCL_VIEW_FULL_MB`
+ //! (256 MiB; 0: no cap) for the pool's sake; never short of the old bounds unless an allocation
+-//! ends sooner. Which of those gave the size is counted in `stats`.
++//! ends sooner. Which of those gave the size is counted in `stats`. With the switch a tile found
++//! without a source is not checked again while fresh (`Misses`): a run with 64 MiB behind each
++//! root checked 100 M such tiles.
+ 
+ use std::collections::HashMap;
+ use std::ffi::c_void;
+@@ -68,6 +70,8 @@ struct State {
+     cap_tiles: usize,
+     /// (va, len, far) → when it was last looked at
+     recent: HashMap<(usize, usize, usize), std::time::Instant>,
++    /// lab (`XCL_VIEW_FULL_RANGE=1`): tiles found without a source
++    misses: Misses,
+ }
+ unsafe impl Send for State {}
+ 
+@@ -94,6 +98,28 @@ static SIZE_BY: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU6
+ static RECENT: AtomicU64 = AtomicU64::new(0);
+ static FRESH_TILES: AtomicU64 = AtomicU64::new(0);
+ static ROUNDS: AtomicU64 = AtomicU64::new(0);
++/// lab: tiles without a source found past the old bounds (where full ranges end), tiles without
++/// a source not checked again (`Misses`), the longest range looked at
++static PAST_MISS: AtomicU64 = AtomicU64::new(0);
++static MEMO: AtomicU64 = AtomicU64::new(0);
++static LONGEST: AtomicU64 = AtomicU64::new(0);
++
++/// lab (with the switch): tiles found without a source → when, not checked again while fresh
++#[derive(Default)]
++struct Misses(HashMap<usize, std::time::Instant>);
++
++impl Misses {
++    fn known(&self, tile: usize, now: std::time::Instant, fresh: std::time::Duration) -> bool {
++        self.0.get(&tile).is_some_and(|t| now.duration_since(*t) < fresh)
++    }
++
++    fn note(&mut self, tile: usize, now: std::time::Instant) {
++        if self.0.len() > 200_000 {
++            self.0.clear();
++        }
++        self.0.insert(tile, now);
++    }
++}
+ 
+ /// lab `XCL_VIEW_FULL_RANGE` when it is not set: turning the full ranges on by default is this line
+ const FULL_RANGE_BY_DEFAULT: bool = false;
+@@ -325,6 +351,7 @@ pub unsafe fn init(dev: &ID3D12Device, base: usize) -> Vec<(usize, usize)> {
+             staging_at: p as *mut u8,
+             cap_tiles: cap_mb << 4,
+             recent: HashMap::new(),
++            misses: Misses::default(),
+         })
+     })();
+     match made {
+@@ -448,7 +475,7 @@ unsafe fn ensure_range(va: usize, len: usize, far: usize, old: usize, root: bool
+     s.recent.insert((va, len, far), now);
+     let mut reach = Reach::new(va, len, far, hi);
+     let mut t = va & !(TILE - 1);
+-    let mut fresh_tiles = 0u64;
++    let (mut fresh_tiles, mut memo) = (0u64, 0u64);
+     // (tile, source, new)
+     let mut todo: Vec<(usize, usize, bool)> = Vec::new();
+     while reach.covers(t) {
+@@ -459,11 +486,23 @@ unsafe fn ensure_range(va: usize, len: usize, far: usize, old: usize, root: bool
+             fresh_tiles += 1;
+             continue;
+         }
++        if c.full && s.misses.known(tile, now, fresh) {
++            reach.missing(tile);
++            memo += 1;
++            continue;
++        }
+         let Some(src) = source(tile) else {
++            if c.full {
++                s.misses.note(tile, now);
++            }
+             // the first few say why (asked range, what the page maps show): a range past a
+             // buffer's end is expected here, a mapped page that cannot be read is not (lab: past
+-            // what was asked, a tile without a source ends a full range: not counted)
+-            if reach.missing(tile) && NO_SOURCE.fetch_add(1, Ordering::Relaxed) < 12 {
++            // what was asked, a tile without a source ends a full range: counted apart)
++            let inside = reach.missing(tile);
++            if !inside {
++                PAST_MISS.fetch_add(1, Ordering::Relaxed);
++            }
++            if inside && NO_SOURCE.fetch_add(1, Ordering::Relaxed) < 12 {
+                 use crate::hle::kernelx;
+                 crate::xlog_info!(
+                     "D3D12.X: view memory: no source for tile {tile:#x} of {va:#x}+{len:#x}: page mapping {:x?}, CPU view {:x?}, physical page here {}",
+@@ -499,12 +538,16 @@ unsafe fn ensure_range(va: usize, len: usize, far: usize, old: usize, root: bool
+         }
+     }
+     FRESH_TILES.fetch_add(fresh_tiles, Ordering::Relaxed);
++    if memo != 0 {
++        MEMO.fetch_add(memo, Ordering::Relaxed);
++    }
+     // lab counters: what a root without the switch left out, what the switch added
+     let reached = reach.reached(t);
+     let cut = root && {
+         let past = va.saturating_add(c.root).saturating_add(TILE - 1) & !(TILE - 1);
+-        past < hi && (s.tiles.get(&past).is_some_and(|k| now.duration_since(k.checked) < fresh) || source(past).is_some())
++        past < hi && (s.tiles.get(&past).is_some_and(|k| now.duration_since(k.checked) < fresh) || (!(c.full && s.misses.known(past, now, fresh)) && source(past).is_some()))
+     };
++    LONGEST.fetch_max((reached - va) as u64, Ordering::Relaxed);
+     count(root, cut, c.full, reach.why(reached, planned), reached.saturating_sub(va.saturating_add(old).min(hi)));
+     TILES.store(s.tiles.len() as u64, Ordering::Relaxed);
+     if todo.is_empty() {
+@@ -694,7 +737,7 @@ pub fn stats() -> String {
+     let c = cfg();
+     let by = |k: usize| SIZE_BY[k].load(Ordering::Relaxed);
+     format!(
+-        "view memory: {} MB in {tiles} tiles ({pools} pools), {} given back, {} tile uploads, {} tile checks, {} without a source; lab ranges: roots {} named, {} looked at, {} with a sourced tile past XCL_VIEW_ROOT_KB; {} V#s over 16 MiB; full range {}: {} MB past the old bounds, sizes from an allocation {}, the V# {}, sourced tiles {}, the cap {}; fresh (< {} ms): {} ranges and {} tiles not looked at again; pool full: {} rounds, {} tiles refused",
++        "view memory: {} MB in {tiles} tiles ({pools} pools), {} given back, {} tile uploads, {} tile checks, {} without a source; lab ranges: roots {} named, {} looked at, {} with a sourced tile past XCL_VIEW_ROOT_KB; {} V#s over 16 MiB; full range {}: {} MB past the old bounds, sizes from an allocation {}, the V# {}, sourced tiles {}, the cap {}; fresh (< {} ms): {} ranges and {} tiles not looked at again; pool full: {} rounds, {} tiles refused; without a source: {} tiles past the old bounds, {} not checked again (memo); longest range {} MB",
+         tiles >> 4,
+         EVICTED.load(Ordering::Relaxed),
+         UPLOADED.load(Ordering::Relaxed),
+@@ -714,7 +757,10 @@ pub fn stats() -> String {
+         RECENT.load(Ordering::Relaxed),
+         FRESH_TILES.load(Ordering::Relaxed),
+         ROUNDS.load(Ordering::Relaxed),
+-        FULL.load(Ordering::Relaxed)
++        FULL.load(Ordering::Relaxed),
++        PAST_MISS.load(Ordering::Relaxed),
++        MEMO.load(Ordering::Relaxed),
++        LONGEST.load(Ordering::Relaxed) >> 20
+     )
+ }
+ 
+@@ -813,6 +859,30 @@ mod tests {
+         assert_eq!(plan(&c, Named::Root, None), (4 * MB, 4 * MB, Why::Cap));
+     }
+ 
++    #[test]
++    fn tiles_without_a_source_are_not_checked_again_while_fresh() {
++        let fresh = std::time::Duration::from_millis(1000);
++        let now = std::time::Instant::now();
++        let mut m = Misses::default();
++        assert!(!m.known(0xD_0000_0000, now, fresh));
++        m.note(0xD_0000_0000, now);
++        assert!(m.known(0xD_0000_0000, now, fresh));
++        assert!(m.known(0xD_0000_0000, now + std::time::Duration::from_millis(999), fresh));
++        assert!(!m.known(0xD_0000_0000, now + fresh, fresh));
++        assert!(!m.known(0xD_0001_0000, now, fresh));
++        // a memo hit ends a full range as a check would
++        let mut r = Reach::new(0xD_0000_0000, MB, 8 * MB, usize::MAX);
++        assert!(!r.missing(0xD_0010_0000));
++        assert_eq!(r.reached(0xD_0011_0000), 0xD_0010_0000);
++        // bounded: past 200 000 tiles it starts again
++        for k in 0..200_001 {
++            m.note(k * TILE, now);
++        }
++        m.note(0xE_0000_0000, now);
++        assert_eq!(m.0.len(), 1);
++        assert!(m.known(0xE_0000_0000, now, fresh));
++    }
++
+     #[test]
+     fn view_range_counters_go_to_the_stats_line() {
+         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+@@ -831,5 +901,6 @@ mod tests {
+         assert!(line.contains(&format!(", {} with a sourced tile past XCL_VIEW_ROOT_KB; ", after.1)), "{line}");
+         assert!(line.contains(&format!(" MB past the old bounds, sizes from an allocation {}, the V# {}, sourced tiles {}, the cap {}; ", after.3, after.4, after.5, after.6)), "{line}");
+         assert!(line.contains(" pool full: ") && line.contains(" rounds, "), "{line}");
++        assert!(line.contains("; without a source: ") && line.contains(" not checked again (memo); longest range "), "{line}");
+     }
+ }
+-- 
+2.46.0.windows.1
+
