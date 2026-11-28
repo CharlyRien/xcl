@@ -570,6 +570,8 @@ fn heap_windows_select_every_heap_slot() {
             assert!(!t.hlsl.contains(&format!("xcl_w >= {windows}u")), "{windows} windows:\n{}", t.hlsl);
         }
     }
+    // the root-UAV form: a switch over the program's own 2 windows, nothing past them
     let t = super::translate(&code, &super::Options { mem_windows: 2, heap_windows: false, ..Default::default() }).unwrap();
-    assert!(!t.hlsl.contains(&format!("xcl_w >= {slots}u")), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("ResourceDescriptorHeap[") && t.hlsl.contains("case 1u: return mem1."), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("case 2u:"), "{}", t.hlsl);
 }

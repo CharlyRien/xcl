@@ -1794,7 +1794,9 @@ fn dispatch_with(
         let bound = bind_resources(dev, &list, &[], &[])?;
         // A PSO built by the backend's hook uses the runtime's window count: with heap windows
         // (`Options::heap_windows`) its accesses go to ResourceDescriptorHeap[MEM_HEAP_BASE + w],
-        // so every window slot is a raw view of `mem` (no textures here to share the heap with).
+        // so the root form's windows (MAX_WINDOWS, all `mem` below) are raw views of `mem` and the
+        // slots past them null views, as `console_heap::set_window_views` (no textures here to
+        // share the heap with).
         let win_count = crate::gpu::uma::MAX_HEAP_WINDOWS;
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -1808,7 +1810,11 @@ fn dispatch_with(
         for k in 0..win_count {
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
-            dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
+            if k < crate::gpu::uma::MAX_WINDOWS {
+                dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
+            } else {
+                dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(crate::gpu::uma::GRAIN as u64)), h);
+            }
         }
         for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();

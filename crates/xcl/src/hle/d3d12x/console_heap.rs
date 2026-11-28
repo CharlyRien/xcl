@@ -334,10 +334,10 @@ pub fn window_views_failed() -> bool {
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
 /// Active windows (`bytes > 0`) in wider layouts (8 / 16) must all have a valid buffer; unused
-/// trailing slots (`(0, 0)`) safely alias window 0's buffer. The slots past `windows`, up to
-/// `MAX_HEAP_WINDOWS`, get null UAVs: shaders with heap windows may select any of the 16
-/// (`recomp::emit::mem_accessors`, `dxil::lower_mem::heap_window_bound`), and a null view reads
-/// 0 and drops writes, as an address outside the windows did before (never window 0's bytes).
+/// trailing slots (`(0, 0)`) inside `windows` alias window 0's buffer, as before. The slots past
+/// `windows`, up to `MAX_HEAP_WINDOWS`, get null UAVs: shaders with heap windows may select any of
+/// the 16 (`recomp::emit::mem_accessors`, `dxil::lower_mem::heap_window_bound`), and a null view
+/// reads 0 and drops writes there, as an address past the program's windows did before.
 pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
     let count = windows.len().max(crate::gpu::uma::MAX_WINDOWS);
     let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|&(raw, bytes)| raw != 0 || bytes == 0);
