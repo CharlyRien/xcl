@@ -1358,4 +1358,178 @@ mod tests {
         assert!(!subresource_footprints_compatible(10, &fp(32, 32, 1), 42, &fp(32, 32, 1)), "8 Bpp vs 4 Bpp must be rejected");
         assert!(subresource_footprints_compatible(98, &fp(64, 64, 1), 3, &fp(16, 16, 1)), "BC7 64x64 == R32G32B32A32 16x16");
     }
+    /// On the GPU, through `create_placed_resource_x` as a retail title places its TAA history: an
+    /// R32_UINT UAV texture (linear: its 3600 KiB are the title's spacing) and its R9G9B9E5 view at
+    /// one address, the next pair one writer further on; the view's console layout (2, 64KB_D) is
+    /// longer than the spacing. (A) The two views share no tile (`reader_copy_bytes`), and after both
+    /// pairs' copies (`sync_title_writers`) each view holds its own writer's texels whole - with
+    /// shared tail tiles the second copy overwrote a corner of the first view. (B) A view placed
+    /// BEFORE its writer (64 KiB-aligned) is retired with its pages unmapped when the writer is
+    /// placed; its copy then lands only because `remap_reader` maps it again first.
+    #[test]
+    fn gpu_format_aliased_views_keep_their_tiles_and_take_their_copies() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::*;
+        const W: u32 = 1280;
+        const H: u32 = 720;
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return crate::gpu::recomp::runner::skip_test("tiled resources tier < 2");
+            }
+            let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP, ..Default::default() };
+            if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut fs as *mut _ as *mut c_void, std::mem::size_of_val(&fs) as u32).is_err() || fs.Support2.0 & D3D12_FORMAT_SUPPORT2_TILED.0 == 0 {
+                return crate::gpu::recomp::runner::skip_test("no reserved R9G9B9E5 textures");
+            }
+            let Some(uma) = crate::gpu::uma::get() else { return crate::gpu::recomp::runner::skip_test("no UMA") };
+            let Some(base) = uma.alloc(32 << 20, 0x1_0000).map(|p| p as usize) else { return crate::gpu::recomp::runner::skip_test("UMA alloc failed") };
+            real::adopt(dev.as_raw(), real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let console = |format: u32, layout: u32, flags: u32| {
+                let mut d = [0u8; 0x38];
+                d[0..4].copy_from_slice(&3u32.to_le_bytes());
+                d[0x10..0x18].copy_from_slice(&(W as u64).to_le_bytes());
+                d[0x18..0x1C].copy_from_slice(&H.to_le_bytes());
+                d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+                d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+                d[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+                d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+                d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
+                d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+                d
+            };
+            let (uav, view) = (console(42, 0x100, 0x30_0004), console(67, 2, 0));
+            let step = crate::hle::xg::Texture::new(&uav).unwrap().size() as usize;
+            let view_bytes = crate::hle::xg::Texture::new(&view).unwrap().size() as usize;
+            eprintln!("FORMAT-ALIAS-PAGES XG: R32_UINT writer {step} bytes, R9G9B9E5 view {view_bytes} bytes");
+            assert!(view_bytes > step, "XG's view no longer passes the next pair: this test's case is gone");
+            let place = |va: usize, d: &[u8; 0x38], state: u32| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, d.as_ptr(), state, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX at {va:#x}: {hr:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let paired = |w: &ID3D12Resource, r: &ID3D12Resource| {
+                TABLE.lock().unwrap().as_ref().is_some_and(|t| t.pairs.iter().any(|p| p.writer == w.as_raw() as usize && p.reader == r.as_raw() as usize))
+            };
+            let key = dev.as_raw() as usize;
+            let tiles = |r: &ID3D12Resource| {
+                super::super::vram::mapped_tiles_for(key, r.as_raw() as usize).map(|(own, extra)| own.into_iter().chain(extra).collect::<HashSet<_>>())
+            };
+            // (A) two pairs 4 KiB past a page, one writer apart; (B) a view, then its writer, 64 KiB-aligned
+            let a = base + 0x4000;
+            let w1 = place(a, &uav, 0x8);
+            let v1 = place(a, &view, 0);
+            let w2 = place(a + step, &uav, 0x8);
+            let v2 = place(a + step, &view, 0);
+            let c = base + (16 << 20);
+            let v3 = place(c, &view, 0);
+            let mapped_before = tiles(&v3).is_some();
+            let w3 = place(c, &uav, 0x8);
+            let v3_unmapped = tiles(&v3).is_none();
+            assert!(paired(&w1, &v1) && paired(&w2, &v2) && paired(&w3, &v3), "format_alias did not pair the views with their writers");
+            let shared = match (tiles(&v1), tiles(&v2)) {
+                (Some(t1), Some(t2)) => t1.intersection(&t2).count(),
+                _ => panic!("a view placed after its writer is not mapped"),
+            };
+            eprintln!("FORMAT-ALIAS-PAGES (A) tiles the first view shares with the next pair's: {shared}");
+            eprintln!("FORMAT-ALIAS-PAGES (B) view placed before its writer: mapped {mapped_before}, unmapped once the writer is placed: {v3_unmapped}");
+
+            // the writers' texels, distinct per writer and texel, through an upload buffer
+            let mut fp = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()];
+            let mut total = 0u64;
+            dev.GetCopyableFootprints(&w1.GetDesc(), 0, 1, 0, Some(fp.as_mut_ptr()), None, None, Some(&mut total));
+            let buffer = |heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, bytes: u64| {
+                let d = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 3 * total);
+            let readback = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, 3 * total);
+            let pitch = fp[0].Footprint.RowPitch as usize / 4;
+            let want = |k: usize, x: usize, y: usize| ((k as u32 + 1) << 28) | (y as u32) << 11 | x as u32;
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).unwrap();
+            for k in 0..3usize {
+                let up = std::slice::from_raw_parts_mut((p as *mut u32).add(k * total as usize / 4), pitch * H as usize);
+                for y in 0..H as usize {
+                    for x in 0..W as usize {
+                        up[y * pitch + x] = want(k, x, y);
+                    }
+                }
+            }
+            upload.Unmap(0, None);
+            let run = |record: &dyn Fn(*mut c_void)| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let raw = list.as_raw();
+                // (list_x's PC calls and format_alias's syncs work on a list XCL adopted and tracks)
+                if !real::is_adopted(raw) {
+                    real::adopt(raw, real::Kind::CommandList);
+                }
+                list_x::on_create(raw, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+                record(raw);
+                list.Close().unwrap();
+                super::super::title_textures::own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    crate::gpu::texture::wait(&dev, &queue).unwrap();
+                });
+            };
+            let at = |r: &ID3D12Resource, offset: u64| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: offset, ..fp[0] } } };
+            let sub0 = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            let writers = [&w1, &w2, &w3];
+            let views = [&v1, &v2, &v3];
+            // the writers written (left in UNORDERED_ACCESS, as a dispatch leaves them), then the
+            // title's syncs, pair by pair (the first pair's view copied before the second's)
+            run(&|l| {
+                for (k, w) in writers.iter().enumerate() {
+                    list_x::transition(l, w.as_raw() as usize, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                    let (d, s) = (sub0(w), at(&upload, k as u64 * total));
+                    list_x::pc_copy_texture_region(l, &d, 0, 0, 0, &s, std::ptr::null());
+                    std::mem::forget((d, s));
+                    list_x::transition(l, w.as_raw() as usize, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
+            });
+            run(&|l| {
+                for w in writers {
+                    sync_title_writers(l, &[(w.as_raw() as usize, STATE_UAV)]);
+                }
+            });
+            run(&|l| {
+                for (k, v) in views.iter().enumerate() {
+                    let (d, s) = (at(&readback, k as u64 * total), sub0(v));
+                    list_x::pc_copy_texture_region(l, &d, 0, 0, 0, &s, std::ptr::null());
+                    std::mem::forget((d, s));
+                }
+            });
+            readback.Map(0, None, Some(&mut p)).unwrap();
+            let mut same = [0usize; 3];
+            for (k, n) in same.iter_mut().enumerate() {
+                let got = std::slice::from_raw_parts((p as *const u32).add(k * total as usize / 4), pitch * H as usize);
+                *n = (0..H as usize).map(|y| (0..W as usize).filter(|&x| got[y * pitch + x] == want(k, x, y)).count()).sum();
+            }
+            readback.Unmap(0, None);
+            eprintln!("FORMAT-ALIAS-PAGES texels holding their writer's: first view {} / second view {} / view placed before its writer {} (of {} each)", same[0], same[1], same[2], W * H);
+            drop((v3, w3, v2, w2, v1, w1));
+            uma.free(base);
+            assert_eq!(shared, 0, "(A) the first view shares tiles with the next pair's view");
+            assert!(mapped_before && v3_unmapped, "(B) not the case: the view placed before its writer was not unmapped by it");
+            assert_eq!(same, [(W * H) as usize; 3], "a view does not hold its writer's texels whole");
+        }
+    }
 }
