@@ -41,6 +41,8 @@ const STAGING_TILES: usize = 128;
 struct Tile {
     sig: u64,
     checked: std::time::Instant,
+    /// (pool heap, tile in it)
+    slot: (u32, u32),
 }
 
 struct State {
@@ -56,6 +58,9 @@ struct State {
     base: usize,
     pools: Vec<ID3D12Heap>,
     next: u32,
+    /// pool tiles given back by `evict_stale`
+    free: Vec<(u32, u32)>,
+    evicted_at: Option<std::time::Instant>,
     tiles: HashMap<usize, Tile>,
     staging: ID3D12Resource,
     staging_at: *mut u8,
@@ -75,6 +80,7 @@ static TILES: AtomicU64 = AtomicU64::new(0);
 /// the windows were made (`init`): draws look for ranges in them
 static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static POOLS: AtomicU64 = AtomicU64::new(0);
+static EVICTED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// this thread holds `STATE` (`holding`)
@@ -162,6 +168,8 @@ pub unsafe fn init(dev: &ID3D12Device, base: usize) -> Vec<(usize, usize)> {
             base,
             pools: Vec::new(),
             next: POOL_TILES,
+            free: Vec::new(),
+            evicted_at: None,
             tiles: HashMap::new(),
             staging,
             staging_at: p as *mut u8,
@@ -197,8 +205,19 @@ fn source(va: usize) -> Option<usize> {
     crate::gpu::shader::readable(a, TILE).then_some(a)
 }
 
-/// A sampled signature of a page (a word every 256 bytes and its last one).
-unsafe fn signature(a: usize) -> u64 {
+/// A sampled signature of a page (a word every 256 bytes and its last one), read from a copy
+/// made without faulting: the title may decommit the page meanwhile (a run ended in memcpy here).
+unsafe fn signature(src: usize) -> u64 {
+    thread_local!(static COPY: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; TILE]));
+    COPY.with(|c| {
+        let mut c = c.borrow_mut();
+        c.fill(0);
+        super::title_textures::copy_committed_region(src, c.as_mut_ptr(), TILE);
+        signature_of(c.as_ptr() as usize)
+    })
+}
+
+unsafe fn signature_of(a: usize) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut o = 0;
     while o < TILE {
@@ -206,6 +225,33 @@ unsafe fn signature(a: usize) -> u64 {
         o += 256;
     }
     h ^ ((a + TILE - 8) as *const u64).read_unaligned()
+}
+
+/// The pool is full: tiles no draw has named for `STALE` give their pool tiles back (at most
+/// one round a second). A list recorded earlier and not run yet reads 0 or newer bytes there.
+unsafe fn evict_stale(s: &mut State, now: std::time::Instant) {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(6);
+    if s.evicted_at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1)) {
+        return;
+    }
+    s.evicted_at = Some(now);
+    let old: Vec<usize> = s.tiles.iter().filter(|(_, t)| t.slot.0 != u32::MAX && now.duration_since(t.checked) >= STALE).map(|(&a, _)| a).collect();
+    for &tile in &old {
+        let Some(t) = s.tiles.remove(&tile) else { continue };
+        let k = (tile - s.base) / WINDOW - FIRST;
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+        let (flag, count) = (D3D12_TILE_RANGE_FLAG_NULL, 1u32);
+        s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), None, 1, Some(&flag), None, Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+        s.free.push(t.slot);
+    }
+    s.recent.clear();
+    EVICTED.fetch_add(old.len() as u64, Ordering::Relaxed);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: view memory: the pool is full – {} tiles not named for {} s given back ({} kept; round {n})", old.len(), STALE.as_secs(), s.tiles.len());
+    }
 }
 
 /// Shaders may read `[va, va + len)`: the tiles there hold the title's bytes when this returns.
@@ -261,12 +307,15 @@ pub unsafe fn ensure(va: usize, len: usize) {
             }
             None => {
                 if s.tiles.len() >= s.cap_tiles {
+                    evict_stale(s, now);
+                }
+                if s.tiles.len() >= s.cap_tiles {
                     if FULL.fetch_add(1, Ordering::Relaxed) == 0 {
                         crate::xlog_warn!("D3D12.X: view memory: the pool is full ({} MB, XCL_VIEW_POOL_MB) – further ranges read 0", s.cap_tiles >> 4);
                     }
                     continue;
                 }
-                s.tiles.insert(tile, Tile { sig, checked: now });
+                s.tiles.insert(tile, Tile { sig, checked: now, slot: (u32::MAX, 0) });
                 todo.push((tile, src, true));
             }
         }
@@ -278,6 +327,17 @@ pub unsafe fn ensure(va: usize, len: usize) {
     // new tiles: a pool tile each, mapped under the window
     for &(tile, _, new) in &todo {
         if !new {
+            continue;
+        }
+        if let Some(slot) = s.free.pop() {
+            let k = (tile - s.base) / WINDOW - FIRST;
+            let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
+            let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+            let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, slot.1, 1u32);
+            s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), &s.pools[slot.0 as usize], 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+            if let Some(t) = s.tiles.get_mut(&tile) {
+                t.slot = slot;
+            }
             continue;
         }
         if s.next >= POOL_TILES {
@@ -303,6 +363,9 @@ pub unsafe fn ensure(va: usize, len: usize) {
         let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
         let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, s.next, 1u32);
         s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), s.pools.last().unwrap(), 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+        if let Some(t) = s.tiles.get_mut(&tile) {
+            t.slot = (s.pools.len() as u32 - 1, s.next);
+        }
         s.next += 1;
     }
     for batch in todo.chunks(STAGING_TILES) {
@@ -313,7 +376,8 @@ pub unsafe fn ensure(va: usize, len: usize) {
             if !s.tiles.contains_key(&tile) {
                 continue;
             }
-            std::ptr::copy_nonoverlapping(src as *const u8, s.staging_at.add(i * TILE), TILE);
+            std::ptr::write_bytes(s.staging_at.add(i * TILE), 0, TILE);
+            super::title_textures::copy_committed_region(src, s.staging_at.add(i * TILE), TILE);
             let k = (tile - s.base) / WINDOW - FIRST;
             s.list.CopyBufferRegion(&s.windows[k], ((tile - s.base) % WINDOW) as u64, &s.staging, (i * TILE) as u64, TILE as u64);
         }
