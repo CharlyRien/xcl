@@ -1046,6 +1046,7 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
         let used = std::mem::take(&mut t.used);
         let used_extra = std::mem::take(&mut t.used_extra);
         t.mapped = false;
+        UNMAP_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Some(l) = t.levels.as_mut() {
             LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
             l.groups.iter_mut().for_each(|g| g.3 = false);
@@ -1086,6 +1087,22 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.mapped = true;
     }
     true
+}
+
+/// The generation of the placed textures' mappings: moves each time one of them loses its tiles
+/// (`unmap_superseded`). A texture found mapped at generation `g` is still mapped while
+/// `unmap_gen() == g`, so a caller can skip looking at the pages until then
+/// (`format_alias::sync_pair`: a copy into a reader looked at them under `PAGES` each time).
+static UNMAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(super) fn unmap_gen() -> u64 {
+    UNMAP_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether `res` is on the shared pages with no tile mapped (None: not on the pages).
+pub(super) fn needs_tiles(res: usize) -> Option<bool> {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().find_map(|p| p.targets.get(&res)).map(|t| !t.mapped)
 }
 
 /// Placed texture `res`, whose tiles were unmapped because a placement overlapped its range

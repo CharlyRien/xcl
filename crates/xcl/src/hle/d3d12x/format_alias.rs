@@ -245,12 +245,15 @@ struct TrackedTex {
     /// Per-subresource PC states (only tracked for `Owner::TitlePlaced`).
     pc_states: Vec<u32>,
     is_writer: bool,
+    /// `XCL_FORMAT_ALIAS_REMAP`: the `vram::unmap_gen` this reader was last found with its tiles at
+    /// (0: never looked at)
+    checked_gen: u64,
 }
 
 impl TrackedTex {
     fn new(device: usize, va: usize, shape: TexShape, owner: Owner, initial_state: u32, is_writer: bool) -> Self {
         let n = if owner == Owner::TitlePlaced { shape.subresource_count().max(1) as usize } else { 0 };
-        Self { device, va, shape, owner, pc_states: vec![initial_state; n], is_writer }
+        Self { device, va, shape, owner, pc_states: vec![initial_state; n], is_writer, checked_gen: 0 }
     }
 
     fn uniform_state(&self) -> Option<u32> {
@@ -954,6 +957,30 @@ unsafe fn remap_reader(dev: &ID3D12Device, reader: &ID3D12Resource) {
     }
 }
 
+/// Whether a reader last found with its tiles at generation `checked` has to be looked at again
+/// at generation `gen` (a placed texture may have lost its tiles since).
+fn remap_check_due(checked: u64, gen: u64) -> bool {
+    checked != gen
+}
+
+/// `remap_reader` only when some placed texture lost its tiles since `reader` was last found with
+/// its own (`vram::unmap_gen`); then remembers the generation it is found mapped at. Without
+/// this every copy looked at the pages under `PAGES`; in a retail title's world (~1600 alias
+/// copies a second, our lab tree) that ran at 2.84 presents/s against 2.91 without the remap.
+unsafe fn remap_reader_if_due(dev: &ID3D12Device, reader_res: &ID3D12Resource, reader: usize, checked: u64) {
+    // (read before looking: an unmapping while we look moves it, and the next copy looks again)
+    let gen = super::vram::unmap_gen();
+    if !remap_on() || !remap_check_due(checked, gen) {
+        return;
+    }
+    remap_reader(dev, reader_res);
+    if super::vram::needs_tiles(reader) != Some(true) {
+        if let Some(t) = TABLE.lock().unwrap().as_mut().and_then(|t| t.by_res.get_mut(&reader)) {
+            t.checked_gen = gen;
+        }
+    }
+}
+
 unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE, pair: AliasPair, writer_state: u32) {
     let w_ptr = pair.writer as *mut c_void;
     let r_ptr = pair.reader as *mut c_void;
@@ -961,6 +988,7 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
         return;
     };
     let target_srv = if ty == D3D12_COMMAND_LIST_TYPE_DIRECT { STATE_SRV_ALL } else { STATE_SRV_NON_PIXEL };
+    let mut reader_checked: Option<u64> = None;
 
     // Determine reader's incoming state on this list.
     let (reader_before, reader_after) = match pair.reader_owner {
@@ -975,15 +1003,16 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
             (cur, target_srv)
         }
         Owner::TitlePlaced => {
-            let Some(st) = TABLE
+            let Some((st, checked)) = TABLE
                 .lock()
                 .unwrap()
                 .as_ref()
                 .and_then(|t| t.by_res.get(&pair.reader))
-                .and_then(TrackedTex::uniform_state)
+                .and_then(|r| r.uniform_state().map(|s| (s, r.checked_gen)))
             else {
                 return;
             };
+            reader_checked = Some(checked);
             // On a compute list, never emit transitions referencing DIRECT-only states
             // (`RENDER_TARGET`, `INDEX_BUFFER`, `VERTEX_AND_CONSTANT_BUFFER`, `DEPTH_*`, `PIXEL_SHADER_RESOURCE`).
             if !state_valid_on_list(ty, st) {
@@ -993,8 +1022,8 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
         }
         Owner::PlacedUav => return,
     };
-    if pair.reader_owner == Owner::TitlePlaced {
-        remap_reader(dev, reader_res);
+    if let Some(checked) = reader_checked {
+        remap_reader_if_due(dev, reader_res, pair.reader, checked);
     }
 
     if writer_state != D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32 {
@@ -1358,6 +1387,19 @@ mod tests {
         assert!(!subresource_footprints_compatible(10, &fp(32, 32, 1), 42, &fp(32, 32, 1)), "8 Bpp vs 4 Bpp must be rejected");
         assert!(subresource_footprints_compatible(98, &fp(64, 64, 1), 3, &fp(16, 16, 1)), "BC7 64x64 == R32G32B32A32 16x16");
     }
+    /// `XCL_FORMAT_ALIAS_REMAP`'s skip: a reader never looked at is due; once found with its tiles at
+    /// a generation it is not due again until the generation moves; a new tracked texture starts
+    /// never looked at.
+    #[test]
+    fn a_reader_is_looked_at_again_only_after_an_unmapping() {
+        assert!(remap_check_due(0, 1), "never looked at");
+        assert!(!remap_check_due(5, 5), "found mapped at this generation");
+        assert!(remap_check_due(5, 6), "some placed texture lost its tiles since");
+        let t = TrackedTex::new(1, 0x1_0000, shape(67, 64, 64, 1, 1), Owner::TitlePlaced, 0, false);
+        assert_eq!(t.checked_gen, 0);
+        assert!(super::super::vram::unmap_gen() >= 1, "generation 0 is never current");
+    }
+
     /// On the GPU, through `create_placed_resource_x` as a retail title places its TAA history: an
     /// R32_UINT UAV texture (linear: its 3600 KiB are the title's spacing) and its R9G9B9E5 view at
     /// one address, the next pair one writer further on; the view's console layout (2, 64KB_D) is
@@ -1525,11 +1567,28 @@ mod tests {
             }
             readback.Unmap(0, None);
             eprintln!("FORMAT-ALIAS-PAGES texels holding their writer's: first view {} / second view {} / view placed before its writer {} (of {} each)", same[0], same[1], same[2], W * H);
+            // (C) the first view's tiles lost once more (as a placement over it would) after it was
+            // found mapped: the generation moved, its next copy maps it again and lands
+            super::super::vram::unmap_superseded(&v1);
+            let lost = tiles(&v1).is_none();
+            run(&|l| sync_title_writers(l, &[(w1.as_raw() as usize, STATE_UAV)]));
+            run(&|l| {
+                let (d, s) = (at(&readback, 0), sub0(&v1));
+                list_x::pc_copy_texture_region(l, &d, 0, 0, 0, &s, std::ptr::null());
+                std::mem::forget((d, s));
+            });
+            readback.Map(0, None, Some(&mut p)).unwrap();
+            let got = std::slice::from_raw_parts(p as *const u32, pitch * H as usize);
+            let again: usize = (0..H as usize).map(|y| (0..W as usize).filter(|&x| got[y * pitch + x] == want(0, x, y)).count()).sum();
+            readback.Unmap(0, None);
+            eprintln!("FORMAT-ALIAS-PAGES (C) first view unmapped once more: {lost}; after its next copy {again} of {} texels hold its writer's", W * H);
             drop((v3, w3, v2, w2, v1, w1));
             uma.free(base);
             assert_eq!(shared, 0, "(A) the first view shares tiles with the next pair's view");
             assert!(mapped_before && v3_unmapped, "(B) not the case: the view placed before its writer was not unmapped by it");
             assert_eq!(same, [(W * H) as usize; 3], "a view does not hold its writer's texels whole");
+            assert!(lost, "(C) not the case: unmap_superseded left the first view mapped");
+            assert_eq!(again, (W * H) as usize, "(C) a view unmapped after it was found mapped is not looked at again");
         }
     }
 }
