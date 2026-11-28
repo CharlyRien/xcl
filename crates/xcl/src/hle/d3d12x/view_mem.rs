@@ -12,14 +12,19 @@
 //! addresses) and the tiles under them are copied from where the title's bytes are (`source`:
 //! the page the page-mapping method put there, else the CPU view behind the GPU view) on a
 //! queue of XCL's own, finished before `ensure` returns – so before the list being recorded
-//! can run. A tile is checked again (a sampled signature) at most once a second. GPU writes to
-//! these windows are not copied back.
+//! can run. A tile is checked again (a hash of the whole 64 KiB, read without faulting) at most
+//! once a second; its signature is only recorded once its upload is done, so a failed or
+//! unfinished upload is tried again. When the pool is full, tiles no draw has named for 6 s are
+//! given back; a tile whose page the title unmapped or released is mapped NULL again. GPU writes
+//! to these windows are not copied back.
 //!
 //! Locks: `STATE` is taken only by `ensure` and `init`, which are called with no other XCL lock
 //! held (`bind::bind_abi` before it takes its own, `real::open_uma`). Under it `source` takes
-//! kernelx's page-mapping, mirror and physical-page locks one at a time; nothing here takes the
-//! sparse windows' state (`sparse::lock_state` checks it in debug builds: `holding`). So the
-//! order is STATE -> kernelx, and no kernelx or sparse path calls back in here.
+//! kernelx's page-mapping, mirror and physical-page locks one at a time; a new pool's CreateHeap
+//! runs as XCL's own work (`title_textures::own_work`), so the adopted device's hook does not
+//! take it for a title heap. Nothing here takes the sparse windows' state (`sparse::lock_state`
+//! checks it in debug builds: `holding`). So the order is STATE -> kernelx, and no kernelx or
+//! sparse path calls back in here.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -39,7 +44,8 @@ const POOL_TILES: u32 = 1024;
 const STAGING_TILES: usize = 128;
 
 struct Tile {
-    sig: u64,
+    /// the signature of the bytes on the GPU; None: not uploaded yet
+    sig: Option<u64>,
     checked: std::time::Instant,
     /// (pool heap, tile in it)
     slot: (u32, u32),
@@ -64,6 +70,8 @@ struct State {
     tiles: HashMap<usize, Tile>,
     staging: ID3D12Resource,
     staging_at: *mut u8,
+    /// an upload the GPU may still run (its fence value): the allocator and staging wait for it
+    pending: Option<u64>,
     cap_tiles: usize,
     /// (va, len) → when it was last looked at
     recent: HashMap<(usize, usize), std::time::Instant>,
@@ -81,6 +89,7 @@ static TILES: AtomicU64 = AtomicU64::new(0);
 static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static POOLS: AtomicU64 = AtomicU64::new(0);
 static EVICTED: AtomicU64 = AtomicU64::new(0);
+static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// this thread holds `STATE` (`holding`)
@@ -101,7 +110,8 @@ impl Drop for Held {
     }
 }
 fn lock() -> Held {
-    let g = STATE.lock().unwrap();
+    // a panic under it (the lock-order assert in debug builds) must not take every draw down
+    let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     HOLDING.with(|h| h.set(true));
     Held(g)
 }
@@ -173,6 +183,7 @@ pub unsafe fn init(dev: &ID3D12Device, base: usize) -> Vec<(usize, usize)> {
             tiles: HashMap::new(),
             staging,
             staging_at: p as *mut u8,
+            pending: None,
             cap_tiles: cap_mb << 4,
             recent: HashMap::new(),
         })
@@ -205,8 +216,8 @@ fn source(va: usize) -> Option<usize> {
     crate::gpu::shader::readable(a, TILE).then_some(a)
 }
 
-/// A sampled signature of a page (a word every 256 bytes and its last one), read from a copy
-/// made without faulting: the title may decommit the page meanwhile (a run ended in memcpy here).
+/// The signature of a page (`signature_of`), read from a copy made without faulting: the title
+/// may decommit the page meanwhile (a run ended in memcpy here).
 unsafe fn signature(src: usize) -> u64 {
     thread_local!(static COPY: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; TILE]));
     COPY.with(|c| {
@@ -217,14 +228,18 @@ unsafe fn signature(src: usize) -> u64 {
     })
 }
 
+/// A hash of all 64 KiB of the tile at `a`: a write anywhere in the page changes it (a sample of
+/// one word in 32 missed most small writes, for good).
 unsafe fn signature_of(a: usize) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    let mut o = 0;
-    while o < TILE {
-        h = (h ^ ((a + o) as *const u64).read_unaligned()).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(17);
-        o += 256;
+    let words = std::slice::from_raw_parts(a as *const u64, TILE / 8);
+    // four lanes, then folded: the loop is bound by memory, not by the multiply chain
+    let mut h = [0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9];
+    for c in words.chunks_exact(4) {
+        for k in 0..4 {
+            h[k] = (h[k] ^ c[k]).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(29);
+        }
     }
-    h ^ ((a + TILE - 8) as *const u64).read_unaligned()
+    h.iter().fold(0x2545_f491_4f6c_dd1du64, |acc, &x| (acc ^ x).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(31))
 }
 
 /// The pool is full: tiles no draw has named for `STALE` give their pool tiles back (at most
@@ -254,7 +269,8 @@ unsafe fn evict_stale(s: &mut State, now: std::time::Instant) {
     }
 }
 
-/// Shaders may read `[va, va + len)`: the tiles there hold the title's bytes when this returns.
+/// Shaders may read `[va, va + len)`: the tiles there hold the title's bytes when this returns,
+/// unless the upload failed or is still running (then they are tried again at the next call).
 pub unsafe fn ensure(va: usize, len: usize) {
     let mut g = lock();
     let Some(s) = g.0.as_mut() else { return };
@@ -279,7 +295,7 @@ pub unsafe fn ensure(va: usize, len: usize) {
         let tile = t;
         t += TILE;
         let known = s.tiles.get(&tile);
-        if known.is_some_and(|k| now.duration_since(k.checked) < fresh) {
+        if known.is_some_and(|k| k.sig.is_some() && now.duration_since(k.checked) < fresh) {
             continue;
         }
         let Some(src) = source(tile) else {
@@ -294,16 +310,19 @@ pub unsafe fn ensure(va: usize, len: usize) {
                     kernelx::physical_page_at(tile)
                 );
             }
+            // a page the title unmapped or released: its old bytes must not stay readable
+            if s.tiles.contains_key(&tile) {
+                drop_tile(s, tile);
+            }
             continue;
         };
         CHECKED.fetch_add(1, Ordering::Relaxed);
         let sig = signature(src);
         match s.tiles.get_mut(&tile) {
-            Some(k) if k.sig == sig => k.checked = now,
+            Some(k) if k.sig == Some(sig) => k.checked = now,
             Some(k) => {
-                k.sig = sig;
                 k.checked = now;
-                todo.push((tile, src, false));
+                todo.push((tile, src, k.slot.0 == u32::MAX));
             }
             None => {
                 if s.tiles.len() >= s.cap_tiles {
@@ -315,7 +334,8 @@ pub unsafe fn ensure(va: usize, len: usize) {
                     }
                     continue;
                 }
-                s.tiles.insert(tile, Tile { sig, checked: now, slot: (u32::MAX, 0) });
+                // no signature until its bytes are on the GPU (`commit_batch`)
+                s.tiles.insert(tile, Tile { sig: None, checked: now, slot: (u32::MAX, 0) });
                 todo.push((tile, src, true));
             }
         }
@@ -330,14 +350,7 @@ pub unsafe fn ensure(va: usize, len: usize) {
             continue;
         }
         if let Some(slot) = s.free.pop() {
-            let k = (tile - s.base) / WINDOW - FIRST;
-            let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
-            let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
-            let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, slot.1, 1u32);
-            s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), &s.pools[slot.0 as usize], 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
-            if let Some(t) = s.tiles.get_mut(&tile) {
-                t.slot = slot;
-            }
+            map_tile(s, tile, slot);
             continue;
         }
         if s.next >= POOL_TILES {
@@ -348,7 +361,9 @@ pub unsafe fn ensure(va: usize, len: usize) {
                 Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
             };
             let mut heap: Option<ID3D12Heap> = None;
-            if s.dev.CreateHeap(&desc, &mut heap).is_err() || heap.is_none() {
+            // XCL's own heap: not one of the title's (the adopted device's CreateHeap hook)
+            let made = super::title_textures::own_work(|| s.dev.CreateHeap(&desc, &mut heap));
+            if made.is_err() || heap.is_none() {
                 crate::xlog_warn!("D3D12.X: view memory: no video memory for another pool");
                 s.cap_tiles = 0;
                 s.tiles.remove(&tile);
@@ -358,26 +373,31 @@ pub unsafe fn ensure(va: usize, len: usize) {
             POOLS.store(s.pools.len() as u64, Ordering::Relaxed);
             s.next = 0;
         }
-        let k = (tile - s.base) / WINDOW - FIRST;
-        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
-        let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
-        let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, s.next, 1u32);
-        s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), s.pools.last().unwrap(), 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
-        if let Some(t) = s.tiles.get_mut(&tile) {
-            t.slot = (s.pools.len() as u32 - 1, s.next);
-        }
+        let slot = (s.pools.len() as u32 - 1, s.next);
+        map_tile(s, tile, slot);
         s.next += 1;
+    }
+    // the previous upload must be done before its allocator and staging are used again
+    if let Some(v) = s.pending {
+        if crate::gpu::fence::wait(&s.fence, v, &s.dev, None, 5000).is_err() {
+            return;
+        }
+        s.pending = None;
     }
     for batch in todo.chunks(STAGING_TILES) {
         if s.alloc.Reset().is_err() || s.list.Reset(&s.alloc, None).is_err() {
             return;
         }
+        let mut sigs = Vec::with_capacity(batch.len());
         for (i, &(tile, src, _)) in batch.iter().enumerate() {
-            if !s.tiles.contains_key(&tile) {
+            if !s.tiles.get(&tile).is_some_and(|t| t.slot.0 != u32::MAX) {
                 continue;
             }
-            std::ptr::write_bytes(s.staging_at.add(i * TILE), 0, TILE);
-            super::title_textures::copy_committed_region(src, s.staging_at.add(i * TILE), TILE);
+            let at = s.staging_at.add(i * TILE);
+            std::ptr::write_bytes(at, 0, TILE);
+            super::title_textures::copy_committed_region(src, at, TILE);
+            // the signature of the bytes uploaded, not of a later read of the page
+            sigs.push((tile, signature_of(at as usize)));
             let k = (tile - s.base) / WINDOW - FIRST;
             s.list.CopyBufferRegion(&s.windows[k], ((tile - s.base) % WINDOW) as u64, &s.staging, (i * TILE) as u64, TILE as u64);
         }
@@ -388,16 +408,69 @@ pub unsafe fn ensure(va: usize, len: usize) {
         s.queue.ExecuteCommandLists(&[Some(cl)]);
         s.value += 1;
         if s.queue.Signal(&s.fence, s.value).is_err() {
+            // nothing tells when the copy ends: keep the allocator and staging out of use
+            s.pending = Some(u64::MAX);
             return;
         }
         if let Err(e) = crate::gpu::fence::wait(&s.fence, s.value, &s.dev, None, 5000) {
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: view memory: upload not finished: {e}");
+                crate::xlog_warn!("D3D12.X: view memory: upload not finished in 5 s, tried again later: {e}");
             }
+            s.pending = Some(s.value);
+            return;
         }
-        UPLOADED.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        UPLOADED.fetch_add(commit_batch(&mut s.tiles, &sigs, now) as u64, Ordering::Relaxed);
     }
+}
+
+/// An upload is done: its tiles hold the bytes whose signatures are `sigs`. Before that a tile
+/// has no signature (new) or its old one (changed), so a failed or unfinished upload is tried
+/// again at the next check. Returns the tiles committed.
+fn commit_batch(tiles: &mut HashMap<usize, Tile>, sigs: &[(usize, u64)], now: std::time::Instant) -> usize {
+    let mut n = 0;
+    for &(tile, sig) in sigs {
+        if let Some(t) = tiles.get_mut(&tile) {
+            t.sig = Some(sig);
+            t.checked = now;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Pool tile `slot` under `tile`'s window coordinate.
+unsafe fn map_tile(s: &mut State, tile: usize, slot: (u32, u32)) {
+    let k = (tile - s.base) / WINDOW - FIRST;
+    let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
+    let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+    let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, slot.1, 1u32);
+    s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), &s.pools[slot.0 as usize], 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+    if let Some(t) = s.tiles.get_mut(&tile) {
+        t.slot = slot;
+    }
+}
+
+/// `tile` no longer has a source (the title unmapped or released the page): mapped NULL (reads
+/// 0, as before it was ever named) and its pool tile given back.
+unsafe fn drop_tile(s: &mut State, tile: usize) {
+    let Some(t) = s.tiles.remove(&tile) else { return };
+    if t.slot.0 == u32::MAX {
+        return;
+    }
+    let k = (tile - s.base) / WINDOW - FIRST;
+    let coord = D3D12_TILED_RESOURCE_COORDINATE { X: ((tile - s.base) % WINDOW / TILE) as u32, ..Default::default() };
+    let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+    let (flag, count) = (D3D12_TILE_RANGE_FLAG_NULL, 1u32);
+    s.queue.UpdateTileMappings(&s.windows[k], 1, Some(&coord), Some(&region), None, 1, Some(&flag), None, Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+    s.free.push(t.slot);
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The shared heap could not take the windows (`console_heap::set_window_views` failed): the
+/// shaders do not read these slots, so draws stop asking for ranges.
+pub(super) fn disable() {
+    ON.store(false, Ordering::Release);
 }
 
 /// The ranges a draw with these root arguments can read outside the unified windows: its root
@@ -467,11 +540,13 @@ fn buffer_range(d: [u32; 4], lo: usize, hi: usize) -> Option<(usize, usize)> {
 pub fn stats() -> String {
     let (tiles, pools) = (TILES.load(Ordering::Relaxed), POOLS.load(Ordering::Relaxed));
     format!(
-        "view memory: {} MB in {tiles} tiles ({pools} pools), {} tile uploads, {} tile checks, {} without a source",
+        "view memory: {} MB in {tiles} tiles ({pools} pools), {} tile uploads, {} tile checks, {} without a source, {} given back (pool full), {} dropped (page gone)",
         tiles >> 4,
         UPLOADED.load(Ordering::Relaxed),
         CHECKED.load(Ordering::Relaxed),
-        NO_SOURCE.load(Ordering::Relaxed)
+        NO_SOURCE.load(Ordering::Relaxed),
+        EVICTED.load(Ordering::Relaxed),
+        DROPPED.load(Ordering::Relaxed)
     )
 }
 
@@ -522,16 +597,59 @@ mod tests {
         assert_eq!(buffer_range(d(0x14_0000_0000, 0, 0x100, 0), lo, hi), None, "past the last window");
     }
 
-    /// A page's signature sees a change in a sampled word and in its last word.
+    /// A page's signature sees a change of any byte (the review's case: a 64-byte record at 0x40),
+    /// read through the copy that does not fault.
     #[test]
-    fn the_signature_samples_the_page() {
-        let mut page = vec![0u8; TILE];
+    fn the_signature_sees_a_write_anywhere_in_the_page() {
+        let mut page = vec![0u64; TILE / 8];
         let a = page.as_mut_ptr() as usize;
         let s0 = unsafe { signature(a) };
-        page[256] = 1;
-        let s1 = unsafe { signature(a) };
-        page[TILE - 1] = 1;
-        let s2 = unsafe { signature(a) };
-        assert!(s0 != s1 && s1 != s2);
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(s0);
+        for byte in [0x40usize, 0x41, 0x7F, 0x100, 0x8000, TILE - 1] {
+            let p = unsafe { &mut *((a + byte) as *mut u8) };
+            *p ^= 0x5A;
+            assert!(seen.insert(unsafe { signature(a) }), "a write at {byte:#x} kept the signature");
+            *p ^= 0x5A;
+            assert_eq!(unsafe { signature(a) }, s0);
+        }
+        drop(page);
+    }
+
+    /// The cost of a tile's check, the review's question: one 64 KiB hash (printed with
+    /// --nocapture); a tile is checked at most once a second.
+    #[test]
+    fn a_tile_hash_costs_microseconds() {
+        let page: Vec<u64> = (0..TILE as u64 / 8).map(|k| k.wrapping_mul(0x9e37_79b9_7f4a_7c15)).collect();
+        let a = page.as_ptr() as usize;
+        let n = 2000;
+        let t = std::time::Instant::now();
+        let mut x = 0u64;
+        for _ in 0..n {
+            x ^= unsafe { signature_of(std::hint::black_box(a)) };
+        }
+        let per = t.elapsed() / n;
+        eprintln!("view memory: signature_of of a 64 KiB tile: {per:?} a tile ({x:#x})");
+        assert!(per < std::time::Duration::from_millis(5), "{per:?}");
+    }
+
+    /// A tile's signature is only recorded once its upload is done: an upload that failed or is
+    /// still running leaves it without one (new) or with its old one (changed), so the next check
+    /// uploads it again; a finished one records the uploaded bytes' signature.
+    #[test]
+    fn a_signature_is_recorded_only_after_its_upload() {
+        let now = std::time::Instant::now();
+        let mut tiles = HashMap::new();
+        tiles.insert(0x8_0000_0000usize, Tile { sig: None, checked: now, slot: (0, 0) });
+        tiles.insert(0x8_0001_0000usize, Tile { sig: Some(7), checked: now, slot: (0, 1) });
+        // the upload did not finish: nothing committed, so both are still to upload
+        assert_eq!(tiles[&0x8_0000_0000].sig, None);
+        assert_eq!(tiles[&0x8_0001_0000].sig, Some(7));
+        // it finished
+        let later = now + std::time::Duration::from_millis(5);
+        assert_eq!(commit_batch(&mut tiles, &[(0x8_0000_0000, 11), (0x8_0001_0000, 12), (0x8_0002_0000, 13)], later), 2);
+        assert_eq!((tiles[&0x8_0000_0000].sig, tiles[&0x8_0001_0000].sig), (Some(11), Some(12)));
+        assert_eq!(tiles[&0x8_0000_0000].checked, later);
+        assert!(!tiles.contains_key(&0x8_0002_0000), "a tile dropped meanwhile is not brought back");
     }
 }

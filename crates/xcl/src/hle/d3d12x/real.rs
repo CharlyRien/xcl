@@ -667,6 +667,8 @@ unsafe fn open_uma(device: &ID3D12Device, allow_driver_remap: bool) {
         }
         if super::console_heap::set_window_views(device, &views) {
             crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
+        } else {
+            super::view_mem::disable();
         }
     }
     *UMA_BUFFER.lock().unwrap() = bufs;
