@@ -275,9 +275,8 @@ pub unsafe fn ensure(va: usize, len: usize) {
     let mut g = lock();
     let Some(s) = g.0.as_mut() else { return };
     let (lo, hi) = (s.base + FIRST * WINDOW, s.base + END * WINDOW);
-    if va < lo || va >= hi || len == 0 {
-        return;
-    }
+    // the part of the range in the view windows (a range may start below window 4)
+    let Some((va, len)) = clip(va, len, lo, hi) else { return };
     let now = std::time::Instant::now();
     let fresh = std::time::Duration::from_millis(1000);
     if s.recent.get(&(va, len)).is_some_and(|t| now.duration_since(*t) < fresh) {
@@ -498,7 +497,7 @@ pub unsafe fn ensure_for_draw(layout: Option<&super::console_list::Layout>, args
             Param::Descriptor { at } => {
                 let (Some(l), Some(h)) = (word(at as usize), word(at as usize + 4)) else { continue };
                 let va = ((h as usize & 0xFFFF) << 32) | l as usize;
-                if va >= lo && va < hi {
+                if clip(va, root_bytes, lo, hi).is_some() {
                     ensure(va, root_bytes);
                 }
             }
@@ -528,12 +527,20 @@ pub unsafe fn ensure_for_draw(layout: Option<&super::console_list::Layout>, args
 /// descriptors have type bits in word 3's top two) or an address outside.
 fn buffer_range(d: [u32; 4], lo: usize, hi: usize) -> Option<(usize, usize)> {
     let va = ((d[1] as usize & 0xFFFF) << 32) | d[0] as usize;
-    if va < lo || va >= hi || d[3] >> 30 != 0 {
+    if d[3] >> 30 != 0 {
         return None;
     }
     let stride = (d[1] >> 16) as usize & 0x3FFF;
     let bytes = if stride == 0 { d[2] as usize } else { (d[2] as usize).saturating_mul(stride) };
-    Some((va, bytes.clamp(4, 16 << 20)))
+    clip(va, bytes.clamp(4, 16 << 20), lo, hi)
+}
+
+/// The part of `[va, va + len)` inside `[lo, hi)` (a buffer may start below the view windows
+/// and reach into them); None when they do not meet.
+fn clip(va: usize, len: usize, lo: usize, hi: usize) -> Option<(usize, usize)> {
+    let start = va.max(lo);
+    let end = va.saturating_add(len).min(hi);
+    (start < end).then(|| (start, end - start))
 }
 
 /// One line for the activity log.
@@ -595,6 +602,12 @@ mod tests {
         assert_eq!(buffer_range(d(0xD_FFFF_0000, 0, 0x100, 2 << 30), lo, hi), None, "an image descriptor");
         assert_eq!(buffer_range(d(0x7_FFFF_0000, 0, 0x100, 0), lo, hi), None, "in the unified block");
         assert_eq!(buffer_range(d(0x14_0000_0000, 0, 0x100, 0), lo, hi), None, "past the last window");
+        // a buffer that starts below window 4 and reaches into it: the part inside
+        assert_eq!(buffer_range(d(lo - 16, 0, 32, 0), lo, hi), Some((lo, 16)));
+        assert_eq!(buffer_range(d(lo - 32, 0, 32, 0), lo, hi), None, "ends where the windows start");
+        assert_eq!(buffer_range(d(hi - 16, 0, 32, 0), lo, hi), Some((hi - 16, 16)), "crosses the top");
+        assert_eq!(clip(usize::MAX - 8, 64, lo, hi), None);
+        assert_eq!(clip(lo, 0, lo, hi), None);
     }
 
     /// A page's signature sees a change of any byte (the review's case: a 64-byte record at 0x40),
