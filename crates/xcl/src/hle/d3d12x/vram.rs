@@ -1088,6 +1088,28 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     true
 }
 
+/// Placed texture `res`, whose tiles were unmapped because a placement overlapped its range
+/// (`unmap_superseded`), gets pages again - its own pages cut to the first `bytes` of its range,
+/// so that it shares none with the texture placed after it (`format_alias::remap_reader`).
+/// Returns its pages (own, extra) when it was mapped again; None when it was mapped already, is
+/// not on the pages, or could not be.
+pub(super) unsafe fn remap_superseded(res: &ID3D12Resource, bytes: u64) -> Option<(usize, usize)> {
+    let key = res.as_raw() as usize;
+    {
+        let mut g = PAGES.lock().unwrap();
+        let t = g.values_mut().flatten().find_map(|p| p.targets.get_mut(&key))?;
+        if t.mapped {
+            return None;
+        }
+        t.console_bytes = Some(t.console_bytes.map_or(bytes, |b| b.min(bytes)));
+    }
+    if !remap_if_unmapped(res) {
+        return None;
+    }
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().find_map(|p| p.targets.get(&key)).filter(|t| t.mapped).map(|t| (t.used.len(), t.used_extra.len()))
+}
+
 /// A resource released: its pages are no longer its.
 fn forget_pages(resource: usize) {
     let mut g = PAGES.lock().unwrap();

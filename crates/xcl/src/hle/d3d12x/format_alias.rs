@@ -919,6 +919,41 @@ unsafe fn copy_one_subresource_through_buffer(
     true
 }
 
+/// `XCL_FORMAT_ALIAS_REMAP` (on with format-alias syncing; `=0` turns it off): see `remap_reader`.
+fn remap_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled() && *ON.get_or_init(|| !std::env::var("XCL_FORMAT_ALIAS_REMAP").is_ok_and(|v| v.trim() == "0"))
+}
+
+static REMAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Before a copy into title reader `reader`: if its shared pages were unmapped (`vram::unmap_superseded`:
+/// a placement over its range retired or shadowed it in `title_textures` - a reader placed before
+/// its writer is retired when the writer is placed), it gets pages again, cut to the copy's size
+/// as `reader_copy_bytes` cuts them at creation. A copy into a reserved texture with no tile mapped
+/// lands nowhere and the reader reads zero: in a retail title the TAA read its history from two
+/// such views (zero in every frame, lit once mapped again). The title's queue waits for the
+/// mapping (`vram::before_execute`).
+unsafe fn remap_reader(dev: &ID3D12Device, reader: &ID3D12Resource) {
+    if !remap_on() {
+        return;
+    }
+    let d = reader.GetDesc();
+    let mut total = 0u64;
+    dev.GetCopyableFootprints(&d, 0, TexShape::from_pc_desc(&d).subresource_count(), 0, None, None, None, Some(&mut total));
+    if total == 0 || total == u64::MAX {
+        return;
+    }
+    let Some((own, extra)) = super::vram::remap_superseded(reader, total) else { return };
+    let n = REMAPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: format-aliased texture {:#x} had no tiles mapped (a placement over its range unmapped them): mapped again on {own} pages + {extra} of its own ({total} bytes) before its copy ({n} so far)",
+            reader.as_raw() as usize
+        );
+    }
+}
+
 unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIST_TYPE, pair: AliasPair, writer_state: u32) {
     let w_ptr = pair.writer as *mut c_void;
     let r_ptr = pair.reader as *mut c_void;
@@ -958,6 +993,9 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
         }
         Owner::PlacedUav => return,
     };
+    if pair.reader_owner == Owner::TitlePlaced {
+        remap_reader(dev, reader_res);
+    }
 
     if writer_state != D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32 {
         list_x::transition(list, pair.writer, D3D12_RESOURCE_STATES(writer_state as i32), D3D12_RESOURCE_STATE_COPY_SOURCE);
