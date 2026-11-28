@@ -488,6 +488,47 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_FORMAT_ALIAS").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// `XCL_FORMAT_ALIAS_TRIM` (on with format-alias syncing; `=0` turns it off): a reader's video-memory
+/// pages end where its writer's copy does (`reader_copy_bytes`).
+fn trim_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    enabled() && *ON.get_or_init(|| !std::env::var("XCL_FORMAT_ALIAS_TRIM").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// The bytes of a copy of every subresource of `pc_desc` (the device's footprints) when a title
+/// texture without flags described by it, about to be placed at `va`, will be the format-aliased
+/// reader of a GPU writer already tracked there (`AliasTable::insert` links them); None otherwise.
+/// `device_x` then gives the reader's shared 64 KiB pages that size instead of its console size:
+/// XG lays some readers out longer than their writer (a retail title's 1280x720 R9G9B9E5 view of a
+/// linear R32_UINT history texture: 3840 KiB in 64KB_D, the writer 3600 KiB), and the title places
+/// the next pair right after the writer, so the reader's last pages were the next reader's first
+/// ones and each pair's copy overwrote a corner of the other.
+pub(super) unsafe fn reader_copy_bytes(dev: *mut c_void, va: usize, pc_desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
+    if !trim_on() || pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || pc_desc.Flags.0 & (FLAG_RENDER_TARGET | FLAG_DEPTH_STENCIL | FLAG_UAV) as i32 != 0 {
+        return None;
+    }
+    let shape = TexShape::from_pc_desc(pc_desc);
+    format_element_bytes(shape.format)?;
+    let paired = {
+        let g = TABLE.lock().unwrap();
+        let t = g.as_ref()?;
+        t.by_va.get(&va).is_some_and(|list| {
+            list.iter().any(|r| {
+                t.by_res.get(r).is_some_and(|w| {
+                    w.device == dev as usize && w.is_writer && can_copy_through_buffer(&shape, &w.shape) && (w.owner == Owner::PlacedUav || needs_buffer_through(shape.format, w.shape.format))
+                })
+            })
+        })
+    };
+    if !paired {
+        return None;
+    }
+    let d = ID3D12Device::from_raw_borrowed(&dev)?;
+    let mut total = 0u64;
+    d.GetCopyableFootprints(pc_desc, 0, shape.subresource_count(), 0, None, None, None, Some(&mut total));
+    (total > 0 && total != u64::MAX).then_some(total)
+}
+
 unsafe fn create_internal_texture(dev: *mut c_void, pc_desc: &[u8; 0x38], initial_state: u32) -> Option<ID3D12Resource> {
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let mut out: *mut c_void = std::ptr::null_mut();

@@ -1140,6 +1140,12 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 return hr;
             }
         } else {
+            // the format-aliased reader of a GPU writer at this address (`format_alias`): its pages
+            // end where the writer's copy does (`XCL_FORMAT_ALIAS_TRIM`)
+            let console_bytes = match super::format_alias::reader_copy_bytes(this, va as usize, &pc) {
+                Some(b) => Some(console_bytes.map_or(b, |c| c.min(b))),
+                None => console_bytes,
+            };
             placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
